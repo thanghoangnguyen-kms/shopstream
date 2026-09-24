@@ -23,6 +23,9 @@ SKIP_DIRS = frozenset(
         ".pytest_cache",
         "node_modules",
         "target",
+        "dbt_packages",
+        "logs",
+        "__pycache__",
     }
 )
 COMPOSE_NAMES = ("compose.y*ml", "compose.*.y*ml", "docker-compose.y*ml", "docker-compose.*.y*ml")
@@ -89,3 +92,11 @@ def test_finds_profile_overrides(tmp_path: Path) -> None:
         "infra/compose.streaming.yaml",
     )
     assert len(unpinned_images(tmp_path)) == 1
+
+
+def test_skips_generated_directories(tmp_path: Path) -> None:
+    for generated in ("dbt_packages/some_pkg", "logs", "__pycache__"):
+        write_compose(
+            tmp_path, "services:\n  x:\n    image: x:1\n", f"{generated}/docker-compose.yml"
+        )
+    assert unpinned_images(tmp_path) == []
