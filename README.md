@@ -1,5 +1,7 @@
 # Shopstream
 
+[![ci](https://github.com/thanghoangnguyen-kms/shopstream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/thanghoangnguyen-kms/shopstream/actions/workflows/ci.yml)
+
 An enterprise-grade open lakehouse that runs on a 16 GB laptop, built in public over 23 weeks. Synthetic, deliberately messy e-commerce data will flow from Postgres CDC and a clickstream generator through Kafka into Apache Iceberg. dbt will model it into a Kimball gold layer, served through a semantic layer to an agent behind a guarded MCP server.
 
 The point is **proof, not components**. Every week ends with a test, CI gate or `just` command that turns a claim into evidence.
