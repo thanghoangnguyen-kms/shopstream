@@ -50,7 +50,8 @@ ADR_NAME = re.compile(r"adr-(\d{3})-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 SPEC_NAME = re.compile(r"(prd|trd|ref|guide|glossary)-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 FENCED_BLOCK = re.compile(
-    r"^(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^(?P=fence)[`~]*[ \t]*$", re.DOTALL | re.MULTILINE
+    r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$",
+    re.DOTALL | re.MULTILINE,
 )
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 MD_LINK = re.compile(r"\]\(([^)\s]+?\.mdx?)(?:#[^)]*)?\)")
@@ -271,6 +272,12 @@ informs: [../../adr/adr-000-record-decisions.md]
 ## Change Log
 [an example link, not a real one](missing.md)
 ````
+
+1. Check the build:
+
+   ```bash
+   echo "[not a link either](missing-too.md)"
+   ```
 """
 
 
