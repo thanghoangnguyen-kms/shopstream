@@ -55,6 +55,7 @@ FENCED_BLOCK = re.compile(
 )
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 MD_LINK = re.compile(r"\]\(([^)\s]+?\.mdx?)(?:#[^)]*)?\)")
+ROOT_MARKDOWN = ("README.md", "AGENTS.md")
 
 Check = Callable[[Path], list[str]]
 
@@ -195,7 +196,8 @@ def check_residue_headings(root: Path) -> list[str]:
 
 def check_relative_links(root: Path) -> list[str]:
     violations: list[str] = []
-    for path in markdown_files(root / "docs"):
+    root_files = [root / name for name in ROOT_MARKDOWN if (root / name).is_file()]
+    for path in markdown_files(root / "docs") + root_files:
         for match in MD_LINK.finditer(body(path)):
             href = match.group(1)
             if href.startswith(("http://", "https://", "mailto:")):
@@ -365,6 +367,11 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
         "spec-filenames",
         lambda r: (r / REF).rename(r / "docs/specs/platform/guide-thing.md"),
         "prefix guide- but type ref",
+    ),
+    (
+        "relative-links",
+        lambda r: (r / "README.md").write_text("See [gone](docs/gone.md).\n", encoding="utf-8"),
+        "docs/gone.md does not exist",
     ),
 ]
 
