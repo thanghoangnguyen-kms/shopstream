@@ -1,0 +1,32 @@
+name: pr-title
+
+# Separate from ci.yml on purpose. This check must re-run when the title is edited.
+# Putting `edited` on ci.yml would re-run or cancel lint/test/secrets on every title
+# edit, and a skipped required job counts as passing.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Check the title follows Conventional Commits
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_TITLE_RE: '^(feat|fix|docs|test|ci|build|chore|refactor|perf|revert)(\([a-z0-9-]+\))?!?: .+'
+        run: |
+          if [[ "$PR_TITLE" =~ $PR_TITLE_RE ]]; then
+            echo "PR title follows Conventional Commits."
+          else
+            echo "::error::PR title must match ${PR_TITLE_RE}, for example 'feat(docs): adapt docs-kit skills'."
+            exit 1
+          fi

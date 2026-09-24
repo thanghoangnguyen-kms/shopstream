@@ -1,0 +1,21 @@
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Pinned non-Python tools (installed by `just tools`)
+.tools/
+
+# dbt (from Week 10)
+target/
+dbt_packages/
+logs/
+
+# Local secrets and OS files
+.env
+.env.*
+!.env.example
+.DS_Store

@@ -1,0 +1,50 @@
+# Run by prek (drop-in compatible with pre-commit). Local hooks call the tools locked in
+# uv.lock through `uv run --frozen`. The one pin outside uv.lock is pre-commit-hooks,
+# kept current by Renovate's pre-commit manager.
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: [--maxkb=500]
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --fix
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --frozen ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: sqlfluff-lint
+        name: sqlfluff lint
+        entry: uv run --frozen sqlfluff lint
+        language: system
+        types: [sql]
+      - id: mypy
+        name: mypy --strict
+        entry: uv run --frozen mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: zizmor
+        name: zizmor (GitHub Actions)
+        entry: uv run --frozen zizmor --offline --no-progress .github/workflows
+        language: system
+        files: ^\.github/workflows/
+        pass_filenames: false
+      - id: gitleaks
+        name: gitleaks (staged changes)
+        entry: .tools/bin/gitleaks git --pre-commit --staged --redact --no-banner --verbose --config .gitleaks.toml
+        language: system
+        pass_filenames: false

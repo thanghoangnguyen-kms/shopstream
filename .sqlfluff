@@ -1,0 +1,6 @@
+[sqlfluff]
+dialect = duckdb
+# sqlfluff-templater-dbt needs dbt-core 1.x, which dbt 2.0 doesn't provide (AGENTS.md G11).
+# Week 10 decides between this jinja templater and dbt 2.0's `dbt lint`.
+templater = jinja
+max_line_length = 100

@@ -1,0 +1,157 @@
+# Shopstream — Canonical Frontmatter Schema
+# Version: 1.0 | Status: Active | Owner: platform
+# SSOT for frontmatter in docs/specs/ and docs/adr/. tests/test_docs_integrity.py reads
+# type_enum, status_lifecycle and owner_enum from this file, so a value added here is
+# legal everywhere at once. Adding a value is an "ask first" change (docs/CONTRIBUTING.md).
+
+required_fields:
+  - title # Human-readable document title
+  - type # One of type_enum
+  - status # One of status_lifecycle
+  - owner # One of owner_enum
+
+type_enum:
+  prd: "Product Requirements Document — WHAT a data product delivers to its consumers"
+  trd: "Technical Requirements Document — HOW a pipeline, job or service is built"
+  adr: "Architecture Decision Record — point-in-time binding decision, immutable after Accepted"
+  ref: "Reference — normative SSOT for data definitions, topology, or configuration (read-only authority)"
+  guide: "Guide — procedural how-to, runbook, or operational procedure"
+  glossary: "Glossary — business and technical term definitions, each linked to the doc that defines it"
+
+owner_enum:
+  platform: "Compose stack, storage, catalog, Kafka and CDC, bronze, Spark jobs, Airflow, observability, CI and supply chain"
+  analytics-eng: "dbt silver and gold, the Kimball model, reconciliation, the semantic layer and metric definitions"
+  governance: "Identity and authorization, retention and erasure policy, data contracts and PII classification, compliance mapping"
+
+status_lifecycle:
+  Draft:
+    description: "Work in progress — not ready for review"
+    transitions_to: [Proposed]
+  Proposed:
+    description: "Under review — open for comment and revision"
+    transitions_to: [Accepted, Rejected, Draft]
+  Accepted:
+    description: "Binding — implementation must comply"
+    transitions_to: [Deprecated, Superseded]
+  Active:
+    description: "In use — applies to ref, guide and glossary docs"
+    transitions_to: [Deprecated, Superseded]
+  Rejected:
+    description: "Considered and declined — kept so the reasoning isn't argued again (mainly ADRs)"
+    transitions_to: []
+  Deprecated:
+    description: "Sunset — kept for reference only; do not implement"
+    sunset_field: "ISO 8601 date for planned removal"
+    transitions_to: []
+  Superseded:
+    description: "Replaced by another document, which carries `supersedes:` pointing here"
+    transitions_to: []
+
+typed_relationship_keys:
+  implements:
+    description: "This doc implements the requirements in the listed PRD(s)"
+    value_type: "list of relative file paths, e.g. [../transform/prd-gold-order-marts.md]"
+    used_in: [trd, adr]
+  decided-by:
+    description: "This doc's design approach was ratified by the listed ADR(s)"
+    value_type: "list of relative file paths"
+    used_in: [trd, prd]
+  supersedes:
+    description: "This doc replaces the listed doc(s)"
+    value_type: "list of relative file paths"
+    used_in: [trd, prd, adr]
+  informs:
+    description: "This doc provides context or constraints to the listed doc(s)"
+    value_type: "list of relative file paths"
+    used_in: [adr, ref]
+  depends-on:
+    description: "This doc depends on the listed doc(s) being stable and correct"
+    value_type: "list of relative file paths"
+    used_in: [trd, guide, adr]
+  amends:
+    description: >-
+      This doc changes a specific clause of the listed Accepted doc(s) without replacing
+      them. Weaker than `supersedes`: the target stays authoritative for everything it
+      still asserts. Pairs with `amended-by` on the target.
+    value_type: "list of relative file paths"
+    used_in: [adr]
+  amended-by:
+    description: >-
+      A clause of this doc was changed in place by the listed doc(s). The inverse of
+      `amends`, carried on the amended doc so a reader arriving here sees it.
+    value_type: "list of relative file paths"
+    used_in: [adr, trd, prd, ref]
+
+optional_fields:
+  version:
+    description: "Semver string for PRD, TRD and REF docs"
+    example: "1.0.0"
+  created:
+    description: "ISO 8601 creation date"
+    example: "2026-09-24"
+  updated:
+    description: "ISO 8601 last-modified date"
+    example: "2026-09-24"
+  decision:
+    description: "One-line decision summary (ADRs only)"
+    used_in: [adr]
+  sunset:
+    description: "ISO 8601 planned removal date (Deprecated docs only)"
+    used_in: [adr, trd, prd]
+
+example_frontmatter:
+  prd: |
+    ---
+    title: "Gold Order Marts"
+    type: prd
+    status: Draft
+    owner: analytics-eng
+    version: 1.0.0
+    created: 2026-11-30
+    updated: 2026-11-30
+    decided-by:
+      - ../../adr/adr-001-version-matrix.md
+    ---
+  trd: |
+    ---
+    title: "CDC to Bronze — Pipeline Design"
+    type: trd
+    status: Draft
+    owner: platform
+    version: 1.0.0
+    created: 2026-11-09
+    updated: 2026-11-09
+    depends-on:
+      - ../platform/ref-architecture.md
+    ---
+  adr: |
+    ---
+    title: "ADR-000: Record architecture decisions"
+    type: adr
+    status: Accepted
+    owner: platform
+    decision: "Record every architecture decision as a MADR 4.0 ADR under docs/adr/ with docs-kit frontmatter"
+    created: 2026-09-24
+    updated: 2026-09-24
+    ---
+  ref: |
+    ---
+    title: "Shopstream: Reference Architecture"
+    type: ref
+    status: Proposed
+    owner: platform
+    version: 1.0.0
+    created: 2026-09-24
+    updated: 2026-09-24
+    ---
+  guide: |
+    ---
+    title: "Runbook: Kafka Broker Down"
+    type: guide
+    status: Active
+    owner: platform
+    created: 2026-11-02
+    updated: 2026-11-02
+    depends-on:
+      - ../platform/ref-architecture.md
+    ---

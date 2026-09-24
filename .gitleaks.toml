@@ -1,0 +1,14 @@
+title = "shopstream gitleaks config"
+
+# Keep every built-in gitleaks rule, then add Shopstream's own token format.
+[extend]
+useDefault = true
+
+# Shopstream service tokens: "shpst_" + 40 lowercase hex characters. GitHub push
+# protection doesn't know this format, so the Week 1 Prove step can show gitleaks
+# catching a planted token in CI instead of GitHub blocking the push first.
+[[rules]]
+id = "shopstream-token"
+description = "Shopstream service token"
+regex = '''\bshpst_[0-9a-f]{40}\b'''
+keywords = ["shpst_"]
