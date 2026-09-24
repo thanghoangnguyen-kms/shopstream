@@ -29,3 +29,8 @@ fmt:
 # Run every hook on every file (CI sets SKIP=gitleaks and runs secrets-scan instead)
 lint:
     uv run prek run --all-files
+
+# Create the next ADR from docs/tooling/adr-template.md: just adr-new "Title" [owner]
+[positional-arguments]
+adr-new title owner="platform":
+    uv run python scripts/new_adr.py "$1" --owner "$2"
