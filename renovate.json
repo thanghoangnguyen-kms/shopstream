@@ -1,0 +1,32 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:best-practices"],
+  "timezone": "Asia/Ho_Chi_Minh",
+  "schedule": ["* 0-5 * * 1"],
+  "minimumReleaseAge": "3 days",
+  "pre-commit": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "gitleaks, pinned in the justfile and installed by scripts/install_gitleaks.py",
+      "managerFilePatterns": ["/^justfile$/"],
+      "matchStrings": ["gitleaks_version := \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "gitleaks/gitleaks",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "uv itself: the exact version CI installs and the floor in pyproject.toml",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/", "/^pyproject\\.toml$/"],
+      "matchStrings": [
+        "version: \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\" # renovate: uv",
+        "required-version = \">=(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "uv"
+    }
+  ]
+}

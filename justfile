@@ -34,3 +34,10 @@ lint:
 [positional-arguments]
 adr-new title owner="platform":
     uv run python scripts/new_adr.py "$1" --owner "$2"
+
+# Scan the full git history for secrets (what the CI `secrets` job runs)
+secrets-scan: tools
+    .tools/bin/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose .
+
+# Everything CI runs, in one command: a local pass predicts a CI pass
+check: lint test secrets-scan
