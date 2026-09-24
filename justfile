@@ -14,3 +14,18 @@ tools:
 # Run the test suite (installs gitleaks first: test_secret_gate needs it)
 test: tools
     uv run pytest
+
+# One-time setup after cloning: sync the venv, install gitleaks, install the git hooks
+setup:
+    uv sync --locked
+    {{just_executable()}} tools
+    uv run prek install
+
+# Format Python and apply safe lint fixes
+fmt:
+    uv run ruff format
+    uv run ruff check --fix
+
+# Run every hook on every file (CI sets SKIP=gitleaks and runs secrets-scan instead)
+lint:
+    uv run prek run --all-files
