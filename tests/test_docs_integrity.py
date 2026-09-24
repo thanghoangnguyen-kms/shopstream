@@ -317,6 +317,11 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
         "ADR-000 is used by",
     ),
     ("adr-names", lambda r: (r / ADR).rename(r / "docs/adr/0001-record-decisions.md"), "adr-NNN"),
+    (
+        "adr-names",
+        lambda r: (r / ADR).rename(r / "docs/adr/adr-0001-record-decisions.md"),
+        "adr-NNN",
+    ),
     ("required-frontmatter", lambda r: replace(r / ADR, "owner: platform\n", ""), "missing owner"),
     (
         "required-frontmatter",
@@ -356,6 +361,14 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
     (
         "relative-links",
         lambda r: append(r / ADR, "\nSee [gone](gone.md#section).\n"),
+        "gone.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(
+            r / ADR,
+            "\n```bash\necho a\n```\n\nSee [gone](gone.md).\n\n```bash\necho b\n```\n",
+        ),
         "gone.md does not exist",
     ),
     (

@@ -8,6 +8,8 @@ created: 2026-09-24
 updated: 2026-09-24
 informs:
   - ../../CONTRIBUTING.md
+depends-on:
+  - ../platform/ref-architecture.md
 description: The writing standard for every Shopstream doc.
 ---
 
