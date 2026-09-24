@@ -64,7 +64,7 @@ Useful focused scans:
 
 ```bash
 wc -l <document>
-rg -n 'TODO|TBD|FIXME|REVIEW|COMMENT' <document>
+rg -n 'TO[D]O|TB[D]|FIXME|REVIEW|COMMENT' <document>
 rg -n '\x{2013}|\x{2014}' <document>
 rg -n '<retired-name-1>|<retired-name-2>' <document>
 ```

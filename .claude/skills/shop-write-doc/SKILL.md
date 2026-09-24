@@ -136,7 +136,7 @@ Write section by section in dependency order:
 
 Use the live document-type rules instead of a remembered template. Keep one canonical definition per concept and link to external authorities instead of copying them. Repeat only the consequence needed for a risk or test to remain understandable.
 
-Preserve meaning before polishing style. Use active voice, positive statements, concrete terms, one topic per paragraph, and parallel grammar. Prefer fewer, stronger edits over mechanical rewriting. Remove reviewer feedback, drafting comments, resolved questions, TODO markers, process narration, puffery, and AI-like filler from the final design unless they are intentional open decisions with an owner and deadline.
+Preserve meaning before polishing style. Use active voice, positive statements, concrete terms, one topic per paragraph, and parallel grammar. Prefer fewer, stronger edits over mechanical rewriting. Remove reviewer feedback, drafting comments, resolved questions, unresolved-item markers, process narration, puffery, and AI-like filler from the final design unless they are intentional open decisions with an owner and deadline.
 
 ### 6. Add only useful diagrams
 

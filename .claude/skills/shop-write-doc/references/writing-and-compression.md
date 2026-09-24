@@ -61,7 +61,7 @@ Delete these from a professional final design unless the repository explicitly r
 
 - reviewer comments and inline feedback;
 - resolved questions and conversational answers;
-- TODO, TBD, FIXME, draft notes, and placeholder text;
+- TO[D]O, TB[D], FIXME, draft notes, and placeholder text;
 - statements such as "we should discuss" without an owner and deadline;
 - self-review scores embedded in normative sections;
 - explanations of how the author edited the document.

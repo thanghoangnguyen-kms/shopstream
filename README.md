@@ -8,7 +8,7 @@ The point is **proof, not components**. Every week ends with a test, CI gate or 
 
 ## Quick start
 
-You need [uv](https://docs.astral.sh/uv/) 0.12.18 or newer.
+You need macOS or Linux (Windows: use WSL) and [uv](https://docs.astral.sh/uv/) 0.12.18 or newer.
 
 ```bash
 git clone https://github.com/thanghoangnguyen-kms/shopstream.git
