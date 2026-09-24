@@ -33,7 +33,13 @@ The normative rules for anything under `docs/specs/` or `docs/adr/`: [docs/claud
 
 ## 5. Skills
 
-The documentation skills arrive in Week 1 PR #2.
+Invoke these for documentation work; each one lives in `.claude/skills/<name>/SKILL.md`. `tests/test_skills.py` fails if this list and the skills folder disagree.
+
+| Skill                | Use it to                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `/shop-spec`         | author a new PRD, TRD, ADR, REF, GUIDE or GLOSSARY (8 phases, including the gotcha audit and the review gate) |
+| `/shop-write-doc`    | rewrite, review or update an existing doc, evidence first                                              |
+| `/shop-housekeeping` | audit and repair the docs tree: lint, banned terms, drift, duplication                                 |
 
 ## 6. Platform gotchas
 
