@@ -8,6 +8,7 @@ both classes of defect from coming back.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -24,8 +25,25 @@ SOURCE_RESIDUE = re.compile(r"\b(icc|enstructure)\b", re.IGNORECASE)
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 
 
+def tracked_skill_paths() -> list[Path]:
+    """Git-tracked paths under .claude/skills, relative to REPO.
+
+    Discovering skills this way, instead of walking the filesystem, means an untracked
+    personal skill dropped straight into the working tree never reaches `skill_dirs` or
+    `skill_markdown`.
+    """
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--", ".claude/skills"],
+        check=True,
+        capture_output=True,
+        cwd=REPO,
+    )
+    return [Path(name) for name in result.stdout.decode("utf-8").split("\0") if name]
+
+
 def skill_dirs() -> list[Path]:
-    return sorted(path for path in SKILLS.iterdir() if path.is_dir()) if SKILLS.is_dir() else []
+    names = {path.parts[2] for path in tracked_skill_paths()}
+    return sorted(SKILLS / name for name in names)
 
 
 def skill_meta(directory: Path) -> dict[str, str]:
@@ -36,7 +54,7 @@ def skill_meta(directory: Path) -> dict[str, str]:
 
 
 def skill_markdown() -> list[Path]:
-    return sorted(SKILLS.rglob("*.md")) if SKILLS.is_dir() else []
+    return sorted(REPO / path for path in tracked_skill_paths() if path.suffix == ".md")
 
 
 def test_expected_skills_are_installed() -> None:
