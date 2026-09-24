@@ -28,6 +28,6 @@ Enforced by the `/shop-spec` skill and `tests/test_docs_integrity.py`. Apply to 
 
 ## Review gate
 
-- Proposed → Accepted needs the `/shop-spec` Phase 6 critique at ≥ 13/15. Draft → Proposed can opt in at ≥ 11/15.
+- Proposed → Accepted needs the `/shop-spec` Phase 6 critique at ≥ 13/15. Draft → Proposed can opt in at ≥ 13/15.
 - The critique result goes in the PR description, never in the document.
 - Use `/shop-spec` for new docs and `/shop-write-doc` for rewrites and reviews.

@@ -1,6 +1,6 @@
 ---
 name: shop-spec
-description: Guides authoring of any Shopstream design document (PRD, TRD, ADR, REF, GUIDE, GLOSSARY) under docs/specs/ or docs/adr/. Enforces docs/CONTRIBUTING.md (frontmatter schema, owner roles platform/analytics-eng/governance, required sections, EARS acceptance criteria, MADR ADR bodies), audits the doc against the Platform gotchas in AGENTS.md, runs an optional three-critic review gate (at least 13/15 to become Accepted), and finishes with a compression pass and a relationship sweep. Covers data-pipeline TRDs (topics, tables, jobs, config). Use when creating or substantially revising any doc in docs/specs/ or docs/adr/.
+description: Guides authoring of any Shopstream design document (PRD, TRD, ADR, REF, GUIDE, GLOSSARY) under docs/specs/ or docs/adr/. Enforces docs/CONTRIBUTING.md (frontmatter schema, owner roles platform/analytics-eng/governance, required sections, EARS acceptance criteria, MADR ADR bodies), audits the doc against the Platform gotchas in AGENTS.md, runs a three-critic review gate (mandatory at ≥ 13/15 for Accepted, opt-in before that), and finishes with a compression pass and a relationship sweep. Covers data-pipeline TRDs (topics, tables, jobs, config). Use when creating or substantially revising any doc in docs/specs/ or docs/adr/.
 ---
 
 # Shopstream Spec Authoring Skill
@@ -94,7 +94,7 @@ The document isn't done until that passes.
 - Protocol: [references/critique-protocol.md](references/critique-protocol.md).
 - Process: run the Data Correctness, Reliability & Operability, and Security & Privacy critics as **independent subagents**, dispatched in parallel.
 - Score: the 5-dimension rubric (Completeness · Implementability · Testability · Risk Coverage · Owner Attribution).
-- Gate: ≥ 11 / 15 to advance to Proposed · ≥ 13 / 15 to advance to Accepted.
+- Gate: ≥ 13 / 15 to advance to Proposed · ≥ 13 / 15 to advance to Accepted.
 - Output: the score table and the unresolved flags go in the **PR description** (or the chat), never in the document. The writer resolves each flag, or logs it with an owner role and a target week: in Open Questions for a PRD, in the PR description for every other type.
 
 ### Phase 7 — spec_compression_and_relationship_sweep

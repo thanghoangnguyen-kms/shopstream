@@ -4,7 +4,7 @@
 
 | Transition          | Critique required?                                                            |
 | ------------------- | ----------------------------------------------------------------------------- |
-| Draft → Proposed    | Opt-in (recommended for PRDs, TRDs and the reference architecture); ≥ 11/15   |
+| Draft → Proposed    | Opt-in (recommended for PRDs, TRDs and the reference architecture); ≥ 13/15   |
 | Proposed → Accepted | **Mandatory**; aggregate ≥ 13/15                                              |
 
 ---
@@ -94,7 +94,7 @@ Critique result: <doc-slug> (<YYYY-MM-DD>)
 | Owner Attribution | /3    |       |
 | Aggregate         | /15   |       |
 
-Gate: Draft → Proposed ≥ 11 · Proposed → Accepted ≥ 13
+Gate: Draft → Proposed ≥ 13 · Proposed → Accepted ≥ 13
 Unresolved flags: <list, or "none">
 Recommendation: Advance / Hold pending flags <N, M>
 ```
