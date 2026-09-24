@@ -73,7 +73,7 @@ The aggregate uses, for each dimension, the **lowest** score any critic gave.
 
 1. **Independent review:** each critic scores all five dimensions and records flags as `[<Critic>] Q<N>: <one-line finding>`.
 2. **Cross-examination:** flags that touch shared ground (for example, replay idempotency and erasure) go to all three critics.
-3. **Writer response:** for each flag, the writer either edits the doc or logs it in the doc's Open Questions table with an owner role and a target week. REF and ADR docs without an Open Questions section log it in the PR description.
+3. **Writer response:** for each flag, the writer either edits the doc or logs it in the doc's Open Questions table with an owner role and a target week. Only PRDs have an Open Questions section; for every other type, log it in the PR description with the same owner role and target week.
 4. **Re-score:** critics re-score only the dimensions a resolution touched.
 
 ---

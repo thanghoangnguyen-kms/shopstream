@@ -212,6 +212,7 @@ sequenceDiagram
 | NFR-03 | Correctness  | SCD2 versions with overlapping validity           | 0           | Per build       | `non_overlapping_validity` test |
 | NFR-04 | Availability | Successful scheduled gold publishes               | ≥ 99 %      | Rolling 30 days | Airflow run history             |
 | NFR-05 | Security     | Reads of gold by an identity without a grant      | 0 (denied)  | Per request     | `just test-authz`               |
+| NFR-06 | Latency      | P95 time to answer one metric query through the semantic layer | ≤ 2 s       | Per request     | eval harness timing column      |
 
 ## Acceptance Criteria
 
@@ -388,7 +389,7 @@ Run these before advancing `status` beyond `Draft`.
 - [ ] The FR table has at least 1 row with ID, requirement and owner role
 - [ ] Acceptance Criteria has at least 3 EARS statements
 - [ ] Every NFR has an SLI, a quantified SLO, a window and a proof
-- [ ] NFRs cover freshness, completeness and security at minimum
+- [ ] NFRs cover freshness, completeness, latency, availability and security (the `docs/CONTRIBUTING.md` list)
 - [ ] Out of Scope is present and non-empty
 
 ### TRD Checklist

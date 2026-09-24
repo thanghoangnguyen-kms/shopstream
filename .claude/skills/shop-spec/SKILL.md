@@ -95,7 +95,7 @@ The document isn't done until that passes.
 - Process: run the Data Correctness, Reliability & Operability, and Security & Privacy critics as **independent subagents**, dispatched in parallel.
 - Score: the 5-dimension rubric (Completeness · Implementability · Testability · Risk Coverage · Owner Attribution).
 - Gate: ≥ 11 / 15 to advance to Proposed · ≥ 13 / 15 to advance to Accepted.
-- Output: the score table and the unresolved flags go in the **PR description** (or the chat), never in the document. The writer resolves each flag or logs it in Open Questions with an owner role and a target week.
+- Output: the score table and the unresolved flags go in the **PR description** (or the chat), never in the document. The writer resolves each flag, or logs it with an owner role and a target week: in Open Questions for a PRD, in the PR description for every other type.
 
 ### Phase 7 — spec_compression_and_relationship_sweep
 
