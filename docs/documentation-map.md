@@ -8,6 +8,7 @@ The stable domain map for the repository documentation. This page doesn't duplic
 - [Reference architecture](specs/platform/ref-architecture.md): system topology, boundaries, canonical flows, data ownership, technology choices and invariants.
 - [Contribution guide](CONTRIBUTING.md): frontmatter, owners, naming, required sections and review rules.
 - [Docs layout for agents](claude/docs-layout.md): where each domain lives and the status lifecycle.
+- [ADR-000](adr/adr-000-record-architecture-decisions.md): how decisions are recorded, plus the Week 1 toolchain baseline.
 
 ## Canonical product and engineering documents
 
