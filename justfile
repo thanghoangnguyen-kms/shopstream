@@ -23,8 +23,8 @@ setup:
 
 # Format Python and apply safe lint fixes
 fmt:
-    uv run ruff format
     uv run ruff check --fix
+    uv run ruff format
 
 # Run every hook on every file (CI sets SKIP=gitleaks and runs secrets-scan instead)
 lint:
@@ -40,4 +40,4 @@ secrets-scan: tools
     .tools/bin/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose .
 
 # Everything CI runs, in one command: a local pass predicts a CI pass
-check: lint test secrets-scan
+check: tools lint test secrets-scan
