@@ -379,7 +379,7 @@ Each invariant names the test or recipe that proves it and the week that proof l
 | `INV-26` | A forced freshness breach fires the SLO alert to the webhook. The bounds live in dbt `meta` and the Grafana alert rules. | W16 forced-breach test | W16 |
 | `INV-27` | If ADR-001 takes the static-key fallback, the key reads bronze but can't write it. | `just test-authz` | W5 |
 
-Each operational failure mode has a runbook, written in W20 under the domain that owns it, and `platform` owns all six. Game days #5 and #6 fail a CI gate or a test before anything ships, so they need none.
+Each operational failure mode has a runbook, written in W20 under the domain that owns it, and `platform` owns all seven. Game day #5 fails a CI gate before anything merges, so it needs none.
 
 | Failure mode       | Detected by                                 | Runbook (W20)                                                  |
 | ------------------ | ------------------------------------------- | -------------------------------------------------------------- |
@@ -387,6 +387,7 @@ Each operational failure mode has a runbook, written in W20 under the domain tha
 | Registry rejection | Game day #2 (INV-12)                        | `docs/specs/ingestion/guide-runbook-registry-rejection.md`     |
 | DLQ filling        | Game day #3 (INV-14), the DLQ-depth panel   | `docs/specs/ingestion/guide-runbook-dlq-filling.md`            |
 | Connector stuck    | Game day #4 (INV-15)                        | `docs/specs/ingestion/guide-runbook-connector-stuck.md`        |
+| Backfill not idempotent | Game day #6 (INV-17)                   | `docs/specs/orchestration/guide-runbook-backfill-not-idempotent.md` |
 | SLO breach         | The SLO alert (INV-26)                      | `docs/specs/orchestration/guide-runbook-slo-breach.md`         |
 | Erasure request    | Game day #7 (INV-05)                        | `docs/specs/platform/guide-runbook-erasure-request.md`         |
 
