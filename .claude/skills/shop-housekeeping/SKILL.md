@@ -63,7 +63,7 @@ One agent merges every Phase 1 result and emits one line per finding:
 ```
 BLOCK  docs/specs/platform/ref-architecture.md:42  — banned term "MinIO"
 WARN   docs/specs/ingestion/trd-cdc-to-bronze.md:8  — depends-on path broken
-NOTE   docs/adr/adr-001-version-matrix.md           — updated: older than the last commit
+NOTE   docs/adr/adr-001-feasibility-spike.md           — updated: older than the last commit
 ```
 
 **Stop here if there are 0 findings.** Report clean.

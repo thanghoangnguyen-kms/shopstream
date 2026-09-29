@@ -68,7 +68,7 @@ Values are relative paths from the current doc, as a list or a single path:
 
 ```yaml
 decided-by:
-  - ../../adr/adr-001-version-matrix.md
+  - ../../adr/adr-001-feasibility-spike.md
 depends-on: [../platform/ref-architecture.md]
 ```
 
