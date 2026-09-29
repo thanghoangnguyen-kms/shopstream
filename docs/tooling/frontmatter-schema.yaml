@@ -110,7 +110,7 @@ example_frontmatter:
     created: 2026-11-30
     updated: 2026-11-30
     decided-by:
-      - ../../adr/adr-001-version-matrix.md
+      - ../../adr/adr-001-feasibility-spike.md
     ---
   trd: |
     ---
