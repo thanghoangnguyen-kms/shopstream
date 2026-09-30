@@ -19,7 +19,7 @@ uv sync && uv run just setup
 uv run just check
 ```
 
-To run the local stack you also need [Colima](https://github.com/abiosoft/colima) on the Apple Virtualization framework: a `vz` VM with virtiofs mounts, 12 GiB of memory and 4 CPUs. Colima's default 2 GiB VM can't hold the stack's memory budget. Colima 0.10 mounts a `vz` VM with virtiofs by default, so no mount flag is needed.
+To run the local stack you also need [Colima](https://github.com/abiosoft/colima) on the Apple Virtualization framework: a `vz` VM with virtiofs mounts, 12 GiB of memory and 4 CPUs. Colima's default 2 GiB VM can't hold the stack's memory budget. Colima 0.10 mounts a `vz` VM with virtiofs by default, so no mount flag is needed. Clone this repo under your home directory: Colima shares only the home directory with its VM, so a clone elsewhere (such as in a temporary directory) leaves Postgres without its init scripts.
 
 ```bash
 colima start --vm-type vz --memory 12 --cpu 4
