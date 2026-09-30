@@ -51,7 +51,7 @@ These facts were verified on 2026-09-24. A document or change must not contradic
 | G2  | DuckDB has **no Iceberg branches and no remote signing**, so write-audit-publish is impossible on DuckDB-written tables. |
 | G3  | The Iceberg Kafka Connect sink is **append-only, v2, exactly-once**, with no upsert mode (its v3 writer, PR #14797, is unmerged). |
 | G4  | Only Spark 4.1 + Iceberg 1.11 and DuckDB 1.5.3+ write Iceberg v3. PyIceberg, Polars and ClickHouse only read v3. |
-| G5  | SeaweedFS replaces MinIO, whose community images were pulled. Keep bucket versioning and object-lock **off** (conditional-write bug #8073). |
+| G5  | SeaweedFS replaces MinIO, whose community images were pulled. Keep bucket versioning and object-lock **off** until an ADR needs them: a versioned bucket keeps a deleted file as a noncurrent version and object-lock blocks the delete, so erasure's `remove_orphan_files` couldn't erase (G10). The conditional-write bug #8073 that first set this was fixed by PR #8080 on 2026-01-22 (re-verified 2026-09-30). |
 | G6  | Lakekeeper's OpenFGA authorization only works with authentication on (OIDC or Kubernetes). |
 | G7  | dbt-mcp's semantic-layer tools need a dbt Platform (Cloud) account, so Shopstream uses a custom MCP server. |
 | G8  | Spark Real-Time Mode runs on classic compute only, **not** on Databricks Free Edition (serverless). |
