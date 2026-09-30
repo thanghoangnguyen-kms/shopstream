@@ -53,9 +53,10 @@ down *args:
 mem-sample *args:
     uv run python scripts/mem_report.py sample "$@"
 
-# Report peak memory, mem_limit totals and the OOM and restart check; non-zero on a breach
-mem-report:
-    uv run python scripts/mem_report.py report
+# Report peak memory, mem_limit totals and each container's OOM, exit-code and state check; non-zero on a breach (--min-frames N)
+[positional-arguments]
+mem-report *args:
+    uv run python scripts/mem_report.py report "$@"
 
 # Everything CI runs, in one command: a local pass predicts a CI pass
 check: tools lint test secrets-scan

@@ -3,7 +3,11 @@
 `sample` appends one `docker stats` frame every few seconds to .mem/samples.jsonl. `report`
 reads those frames and prints the per-service peak table, the peak summed sample, the sum of
 the compose `mem_limit` values with and without the Week 5 reserve, the VM headroom verdict
-and each container's OOM, restart and state record. Any breach exits 1; missing samples exit 2.
+and each container's OOM, restart and state record. Checks: peak over 10 GiB, limit total,
+missing mem_limit, OOM kill, restart, exit code 137, long-running service not running or with
+no container, long-running service never sampled, and a peak summed sample of 0 bytes.
+Exit codes: 0 ok, 1 breach, 2 no usable samples (none, or no frame with container rows) or
+fewer frames with container rows than `--min-frames N` (default 1).
 
 Two `docker inspect` calls, each with an explicit `--format`: INSPECT_FORMAT
 (`{{.Name}} {{.State.OOMKilled}} {{.RestartCount}}`, the PLAT-09 literal) and STATE_FORMAT
@@ -128,17 +132,19 @@ def service_of(name: str, project: str = PROJECT) -> str:
     return re.sub(rf"^{re.escape(project)}-|-\d+$", "", name.lstrip("/"))
 
 
-def load_frames(path: Path) -> list[Frame]:
-    """Frames from a samples file; a missing or empty file gives none.
+def read_samples(path: Path) -> tuple[list[Frame], int]:
+    """(frames, skipped lines) from a samples file; a missing or empty file gives none.
 
-    A row showing `-- / --` is left out of its frame, never counted as zero. A line that is
-    not valid JSON (a write cut off by Ctrl-C) is skipped.
+    A row showing `-- / --` is left out of its frame, never counted as zero, so a frame can
+    hold no rows at all. A non-blank line that does not parse (a write cut off by Ctrl-C, a
+    row with an unreadable MemUsage) is skipped and counted.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
+        return [], 0
     frames: list[Frame] = []
+    skipped = 0
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -154,9 +160,15 @@ def load_frames(path: Path) -> list[Frame]:
                 service = service_of(str(row["name"]))
                 usage[service] = usage.get(service, 0) + parsed[0]
         except (ValueError, KeyError, TypeError):
+            skipped += 1
             continue
         frames.append(Frame(ts=ts, usage=usage))
-    return frames
+    return frames, skipped
+
+
+def load_frames(path: Path) -> list[Frame]:
+    """Frames from a samples file; a missing or empty file gives none."""
+    return read_samples(path)[0]
 
 
 def service_peaks(frames: Sequence[Frame]) -> list[tuple[str, int]]:
@@ -258,6 +270,18 @@ def long_running_services(config: Mapping[str, object]) -> list[str]:
                 and condition.get("condition") == "service_completed_successfully"
             )
     return sorted(str(name) for name in services if str(name) not in one_shots)
+
+
+def coverage_breaches(frames: Sequence[Frame], long_running: Collection[str]) -> list[str]:
+    """Breaches that say the samples do not cover the stack: a long-running service that
+    appears in no frame, then a peak summed sample of 0 bytes."""
+    sampled = {service for frame in frames for service in frame.usage}
+    breaches = [
+        f"service {service} was never sampled" for service in sorted(set(long_running) - sampled)
+    ]
+    if frames and peak_frame(frames)[1] == 0:
+        breaches.append("peak summed sample is 0 B; no memory use was observed")
+    return breaches
 
 
 def evaluate(
@@ -411,10 +435,23 @@ def cmd_sample(duration: float | None, interval: float, append: bool, path: Path
     return 0
 
 
-def cmd_report(samples: Path) -> int:
-    frames = load_frames(samples)
-    if not frames:
+def cmd_report(samples: Path, min_frames: int = 1) -> int:
+    all_frames, skipped = read_samples(samples)
+    if not all_frames:
         print(f"mem-report: no samples in {samples.name}; run just mem-sample first")
+        return 2
+    frames = [frame for frame in all_frames if frame.usage]
+    if not frames:
+        print(
+            f"mem-report: no container rows in {samples.name}; "
+            "was the stack running while sampling?"
+        )
+        return 2
+    if len(frames) < min_frames:
+        print(
+            f"mem-report: {len(frames)} frames with container rows in {samples.name}, "
+            f"fewer than --min-frames {min_frames}"
+        )
         return 2
     profiles = parse_profiles(os.environ)
     config = compose_config(profiles)
@@ -426,7 +463,11 @@ def cmd_report(samples: Path) -> int:
     states = state_rows(profiles)
     state_of = {service: (status, code) for service, status, code in states}
 
-    print(f"mem-report: {len(frames)} frames, {frames[0].ts} to {frames[-1].ts}")
+    print(
+        f"mem-report: {len(frames)} frames with container rows, {frames[0].ts} to "
+        f"{frames[-1].ts}; {skipped} lines skipped, {len(all_frames) - len(frames)} frames "
+        "without container rows"
+    )
     print(f"{'service':<22}{'peak MiB':>10}{'mem_limit MiB':>15}")
     for service, peak in service_peaks(frames):
         limit = _mib(limits[service]) if service in limits else "-"
@@ -453,12 +494,19 @@ def cmd_report(samples: Path) -> int:
     breaches = evaluate(
         peak_sum, limit_total, missing, mem_total, rows, states=states, long_running=long_running
     )
+    breaches.extend(coverage_breaches(frames, long_running))
     for message in breaches:
         print(f"BREACH: {message}")
     if breaches:
         return 1
     print("mem-report: ok")
     return 0
+
+
+def _positive_int(text: str) -> int:
+    if re.fullmatch(r"[0-9]+", text) is None or int(text) < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(text)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -470,11 +518,17 @@ def main(argv: list[str] | None = None) -> int:
     sample.add_argument("--append", action="store_true", help="keep the existing samples")
     report = commands.add_parser("report", help="print peaks, limit totals and the OOM check")
     report.add_argument("--samples", type=Path, default=SAMPLES_FILE)
+    report.add_argument(
+        "--min-frames",
+        type=_positive_int,
+        default=1,
+        help="exit 2 when fewer frames than this hold container rows",
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "sample":
             return cmd_sample(args.duration, args.interval, args.append, SAMPLES_FILE)
-        return cmd_report(args.samples)
+        return cmd_report(args.samples, args.min_frames)
     except (DockerError, PreflightError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

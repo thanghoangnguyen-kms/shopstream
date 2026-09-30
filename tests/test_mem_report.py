@@ -748,3 +748,219 @@ def test_inspect_format_is_the_plat_09_literal(monkeypatch: pytest.MonkeyPatch) 
     mem_report.inspect_rows(["core"])
     inspect_call = next(c for c in calls if c[:2] == ["docker", "inspect"])
     assert inspect_call[2:4] == ["--format", mem_report.INSPECT_FORMAT]
+
+
+# --- empty and partial samples (WR-09) ------------------------------------------------------
+
+
+def test_read_samples_counts_skipped_lines(tmp_path: Path) -> None:
+    path = tmp_path / "samples.jsonl"
+    good = json.dumps(
+        {"ts": "t1", "rows": [{"name": "shopstream-a-1", "mem_usage": "1MiB / 2MiB"}]}
+    )
+    bad_usage = json.dumps({"ts": "t2", "rows": [{"name": "shopstream-a-1", "mem_usage": "1MiB"}]})
+    stopped = json.dumps({"ts": "t3", "rows": [{"name": "shopstream-a-1", "mem_usage": "-- / --"}]})
+    path.write_text(
+        "\n".join([good, "", "  ", bad_usage, stopped, '{"ts": "t4", "ro']), encoding="utf-8"
+    )
+    frames, skipped = mem_report.read_samples(path)
+    assert [frame.ts for frame in frames] == ["t1", "t3"]
+    assert skipped == 2
+    assert mem_report.read_samples(tmp_path / "absent.jsonl") == ([], 0)
+    assert isinstance(skipped, int)
+
+
+def test_load_frames_is_read_samples_frames(tmp_path: Path) -> None:
+    path = sample_file(tmp_path)
+    assert mem_report.load_frames(path) == mem_report.read_samples(path)[0]
+
+
+def test_coverage_breaches_sort_services_and_flag_a_zero_peak() -> None:
+    frames = [Frame("t1", {"postgres": 0}), Frame("t2", {"postgres": 0})]
+    assert mem_report.coverage_breaches(frames, ["seaweedfs", "postgres", "lakekeeper"]) == [
+        "service lakekeeper was never sampled",
+        "service seaweedfs was never sampled",
+        "peak summed sample is 0 B; no memory use was observed",
+    ]
+    assert mem_report.coverage_breaches([Frame("t", {"postgres": 1})], ["postgres"]) == []
+    assert mem_report.coverage_breaches([], []) == []
+    assert mem_report.coverage_breaches([], ["postgres"]) == ["service postgres was never sampled"]
+
+
+def test_report_with_only_empty_frames_returns_2_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    write_samples(path, [("t1", {}), ("t2", {})])
+    assert mem_report.main(["report", "--samples", str(path)]) == 2
+    out = capsys.readouterr().out
+    assert (
+        "mem-report: no container rows in samples.jsonl; was the stack running while sampling?"
+        in out
+    )
+    assert "mem-report: ok" not in out
+    assert fakes.profiles_seen == []
+
+
+def test_report_with_only_stopped_rows_returns_2_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    write_samples(
+        path,
+        [
+            ("t1", {"shopstream-postgres-1": "-- / --"}),
+            ("t2", {"shopstream-postgres-1": "-- / --", "shopstream-lakekeeper-1": "-- / --"}),
+        ],
+    )
+    assert mem_report.main(["report", "--samples", str(path)]) == 2
+    assert "no container rows in samples.jsonl" in capsys.readouterr().out
+    assert fakes.profiles_seen == []
+
+
+def test_report_flags_a_long_running_service_that_was_never_sampled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.limits["seaweedfs"] = "805306368"
+    fakes.states.append(("seaweedfs", "running", 0))
+    fakes.inspect.append(("seaweedfs", False, 0))
+    assert mem_report.main(["report", "--samples", str(sample_file(tmp_path))]) == 1
+    out = capsys.readouterr().out
+    assert "BREACH: service seaweedfs was never sampled" in out
+    assert "no container" not in out
+
+
+def test_a_one_shot_row_does_not_count_for_its_long_running_namesake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.limits = {"lakekeeper": "268435456"}
+    fakes.inspect = [("lakekeeper", False, 0)]
+    fakes.states = [("lakekeeper", "running", 0), ("lakekeeper-migrate", "exited", 0)]
+    path = tmp_path / "samples.jsonl"
+    write_samples(path, [("t1", {"shopstream-lakekeeper-migrate-1": "5MiB / 256MiB"})])
+    assert mem_report.main(["report", "--samples", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "BREACH: service lakekeeper was never sampled" in out
+    assert "lakekeeper-migrate" in out
+
+
+def test_report_flags_a_zero_peak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    rows = {
+        "shopstream-postgres-1": "0B / 512MiB",
+        "shopstream-lakekeeper-1": "0B / 256MiB",
+        "shopstream-frankfurter-1": "0B / 768MiB",
+    }
+    write_samples(path, [("t1", rows), ("t2", rows)])
+    assert mem_report.main(["report", "--samples", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "BREACH: peak summed sample is 0 B; no memory use was observed" in out
+    assert "never sampled" not in out
+
+
+def test_min_frames_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    path = sample_file(tmp_path)
+    assert mem_report.main(["report", "--samples", str(path), "--min-frames", "2"]) == 0
+    assert "mem-report: ok" in capsys.readouterr().out
+    fakes.profiles_seen.clear()
+    assert mem_report.main(["report", "--samples", str(path), "--min-frames", "3"]) == 2
+    out = capsys.readouterr().out
+    assert (
+        "mem-report: 2 frames with container rows in samples.jsonl, fewer than --min-frames 3"
+        in out
+    )
+    assert "mem-report: ok" not in out
+    assert fakes.profiles_seen == []
+
+
+def test_min_frames_counts_only_frames_with_container_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    row = {"shopstream-postgres-1": "1MiB / 2MiB"}
+    write_samples(path, [("t1", row), ("t2", {}), ("t3", row)])
+    assert mem_report.main(["report", "--samples", str(path), "--min-frames", "3"]) == 2
+    assert "2 frames with container rows" in capsys.readouterr().out
+    assert mem_report.main(["report", "--samples", str(path), "--min-frames", "2"]) in {0, 1}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "x", "1.5", ""])
+def test_min_frames_rejects_non_positive_values(value: str) -> None:
+    with pytest.raises(SystemExit) as caught:
+        mem_report.main(["report", "--min-frames", value])
+    assert caught.value.code == 2
+
+
+def test_report_header_states_the_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    row = {"shopstream-postgres-1": "1MiB / 2MiB"}
+    write_samples(path, [("2026-09-30T10:00:00Z", row), ("2026-09-30T10:00:05Z", {})])
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"ts": "2026-09-30T10:00:10Z", "rows": [{"name": "x"}]}) + "\n")
+        handle.write(
+            json.dumps(
+                {
+                    "ts": "2026-09-30T10:00:15Z",
+                    "rows": [{"name": "shopstream-postgres-1", "mem_usage": "2MiB / 4MiB"}],
+                }
+            )
+            + "\n"
+        )
+        handle.write('{"ts": "cut off')
+    mem_report.main(["report", "--samples", str(path)])
+    assert (
+        "mem-report: 2 frames with container rows, 2026-09-30T10:00:00Z to 2026-09-30T10:00:15Z; "
+        "2 lines skipped, 1 frames without container rows"
+    ) in capsys.readouterr().out
+
+
+def test_breaches_come_out_in_the_documented_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.mem_total = 2 * GIB
+    fakes.limits["seaweedfs"] = None
+    fakes.limits["zeta"] = "100"
+    fakes.inspect = [("frankfurter", True, 2)]
+    fakes.states = [
+        ("postgres", "running", 0),
+        ("lakekeeper", "exited", 137),
+        ("frankfurter", "running", 0),
+    ]
+    path = sample_file(tmp_path, postgres="10GiB / 11GiB")
+    assert mem_report.main(["report", "--samples", str(path)]) == 1
+    breaches = [
+        line.removeprefix("BREACH: ")
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("BREACH: ")
+    ]
+    starts = [
+        "peak summed sample",
+        "sum(mem_limit)",
+        "service seaweedfs has no mem_limit",
+        "container frankfurter was OOM killed",
+        "container frankfurter restarted 2 time(s)",
+        "container lakekeeper exited with code 137",
+        "long-running container lakekeeper is exited (exit code 137), not running",
+        "long-running service seaweedfs has no container",
+        "long-running service zeta has no container",
+        "service seaweedfs was never sampled",
+        "service zeta was never sampled",
+    ]
+    assert len(breaches) == len(starts)
+    for breach, start in zip(breaches, starts, strict=True):
+        assert breach.startswith(start), (breach, start)
