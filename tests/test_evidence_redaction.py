@@ -266,6 +266,10 @@ def must_fail_lines() -> dict[str, str]:
         # G-01-1: a secret flag glued after a dot is still reported.
         "flag-after-ellipsis": f"...--password {value} -h db",
         "flag-after-abbreviation": f"e.g.--token {value}",
+        # G-01-2: the HTTP client's user flag glued to its value, as --user=, or in a bundle.
+        "http-client-glued-user": CLIENT + f" -ubob:{value} http://x",
+        "http-client-long-user-equals": CLIENT + f" --user=bob:{value} http://x",
+        "http-client-bundle-user": CLIENT + f" -su bob:{value} http://x",
     }
 
 
@@ -299,6 +303,9 @@ def must_pass_texts() -> dict[str, str]:
         "http-client-user-only": CLIENT + " -u bob http://x",
         "masked-http-client-user": CLIENT + " -u bob:REDACTED http://x",
         "masked-registry-login": "docker login -u bob -p REDACTED reg",
+        "http-client-boolean-bundle": CLIENT + " -sS http://x",
+        "http-client-user-agent-equals": CLIENT + " --user-agent=Foo:bar http://x",
+        "masked-http-client-glued-user": CLIENT + " -ubob:REDACTED http://x",
     }
 
 

@@ -691,6 +691,67 @@ COMMAND_CASES: list[tuple[str, str, str]] = [
         "docker login -u bob -p ${v}\r\n",
         "docker login -u bob -p REDACTED\r\n",
     ),
+    # G-01-2: the user flag glued to its value, `--user=`, and a bundle that ends in the user flag.
+    (
+        "http-client-glued-user",
+        CLIENT + " -ubob:${v} http://x",
+        CLIENT + " -ubob:REDACTED http://x",
+    ),
+    (
+        "http-client-long-user-equals",
+        CLIENT + " --user=bob:${v} http://x",
+        CLIENT + " --user=bob:REDACTED http://x",
+    ),
+    (
+        "http-client-bundle-user",
+        CLIENT + " -su bob:${v} http://x",
+        CLIENT + " -su bob:REDACTED http://x",
+    ),
+    (
+        "http-client-bundle-glued-user",
+        CLIENT + " -subob:${v} http://x",
+        CLIENT + " -subob:REDACTED http://x",
+    ),
+    (
+        "http-client-long-bundle-user",
+        CLIENT + " -sSLu bob:${v} http://x",
+        CLIENT + " -sSLu bob:REDACTED http://x",
+    ),
+    (
+        "http-client-progress-bundle-user",
+        CLIENT + " -#u bob:${v} http://x",
+        CLIENT + " -#u bob:REDACTED http://x",
+    ),
+    (
+        "http-client-bundle-token-only",
+        CLIENT + " -Lu :${v} http://x",
+        CLIENT + " -Lu :REDACTED http://x",
+    ),
+    (
+        "http-client-glued-single-quoted",
+        CLIENT + " -u'bob:${v}' http://x",
+        CLIENT + " -u'bob:REDACTED' http://x",
+    ),
+    (
+        "http-client-long-user-equals-quoted",
+        CLIENT + ' --user="bob:${v}" http://x',
+        CLIENT + ' --user="bob:REDACTED" http://x',
+    ),
+    (
+        "http-client-glued-continued",
+        CLIENT + " -sS \\\n  -ubob:${v} \\\n  http://x",
+        CLIENT + " -sS \\\n  -ubob:REDACTED \\\n  http://x",
+    ),
+    (
+        "http-client-glued-password-like-flag",
+        CLIENT + " -Lu:-pass ${v} http://x",
+        CLIENT + " -Lu:REDACTED REDACTED http://x",
+    ),
+    (
+        "http-client-glued-after-masked-secret",
+        "--token ${a} " + CLIENT + " -ubob:${b} http://x",
+        "--token REDACTED " + CLIENT + " -ubob:REDACTED http://x",
+    ),
 ]
 
 COMMAND_LOOK_ALIKES: list[tuple[str, str]] = [
@@ -709,6 +770,23 @@ COMMAND_LOOK_ALIKES: list[tuple[str, str]] = [
     ("flag-before-the-command-word", "-u bob:x " + CLIENT),
     ("continued-line-without-context", "echo done \\\n  -u bob:x"),
     ("continued-psql", "psql -U postgres \\\n  -p 5432"),
+    # G-01-2: glued spellings that are not the user flag, or that lack the HTTP client word.
+    ("http-client-boolean-bundle", CLIENT + " -sS http://x"),
+    ("http-client-header-and-output", CLIENT + " -H x -o out http://x"),
+    ("http-client-user-agent-equals", CLIENT + " --user-agent=Foo:bar http://x"),
+    ("http-client-glued-header", CLIENT + " -Huser-agent:foo http://x"),
+    ("http-client-glued-data", CLIENT + " -dusername=a:b http://x"),
+    ("http-client-header-bundle", CLIENT + " -Hu bob:x http://x"),
+    ("http-client-data-bundle", CLIENT + " -du bob:x http://x"),
+    ("http-client-user-then-boolean", CLIENT + " -us bob:x http://x"),
+    ("http-client-glued-user-only", CLIENT + " -ubob http://x"),
+    ("http-client-glued-empty-password", CLIENT + " -ubob: http://x"),
+    ("run-glued-user", "docker run -u1000:1000 img"),
+    ("glued-user-without-context", "x -ubob:x"),
+    ("glued-user-before-the-command-word", "-ubob:x " + CLIENT),
+    ("masked-http-client-glued-user", CLIENT + " -ubob:REDACTED http://x"),
+    ("masked-http-client-long-user-equals", CLIENT + " --user=bob:REDACTED http://x"),
+    ("masked-http-client-bundle-user", CLIENT + " -su bob:REDACTED http://x"),
 ]
 
 
@@ -861,6 +939,12 @@ def test_name_and_quote_rules_are_linear_on_long_lines(text: str) -> None:
         pytest.param("docker " * (LONG // 7), id="docker-words"),
         pytest.param("docker" + " " * LONG, id="docker-then-spaces"),
         pytest.param(CLIENT + " " + "a.-" * (LONG // 3), id="dot-dash-run-in-context"),
+        pytest.param(CLIENT + " " + "-ua:b " * (LONG // 6), id="glued-users-in-context"),
+        pytest.param("x " + "-ua:b " * (LONG // 6), id="glued-users-without-context"),
+        pytest.param(CLIENT + " " + "-sua:b " * (LONG // 7), id="bundle-glued-users"),
+        pytest.param(CLIENT + " " + "--user=a:b " * (LONG // 11), id="long-user-equals"),
+        pytest.param(CLIENT + " " + "--user=" * (LONG // 7), id="long-user-equals-run"),
+        pytest.param(CLIENT + " -" + "s" * LONG, id="boolean-bundle-run"),
     ],
 )
 def test_command_context_rules_are_linear_on_long_lines(text: str) -> None:
@@ -886,6 +970,8 @@ def best_of_three(text: str) -> float:
         pytest.param("", "v1.-rc", id="version-dot-dash"),
         pytest.param(CLIENT + " ", "a.-", id="dot-dash-in-context"),
         pytest.param("", "eyJ-", id="jwt-dash"),
+        pytest.param(CLIENT + " ", "-ua:b ", id="glued-users-in-context"),
+        pytest.param(CLIENT + " ", "--user=a:b ", id="long-user-equals"),
     ],
 )
 def test_layer1_time_grows_linearly_with_the_input(prefix: str, unit: str) -> None:
