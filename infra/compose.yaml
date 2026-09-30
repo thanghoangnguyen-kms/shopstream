@@ -105,6 +105,49 @@ services:
       retries: 12
       start_period: 15s
 
+  frankfurter-init:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [core]
+    # A fresh named volume at /app/data is root-owned and the image runs as uid 1000.
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1000:1000", "/app/data"]
+    command: []
+    volumes:
+      - frankfurter-data:/app/data
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  frankfurter:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [core]
+    init: true
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+      # The defaults of 4 Puma workers and 5 threads do not fit the memory limit.
+      WORKER_PROCESSES: "1"
+      MAX_THREADS: "3"
+    depends_on:
+      frankfurter-init:
+        condition: service_completed_successfully
+    volumes:
+      - frankfurter-data:/app/data
+    ports:
+      - "127.0.0.1:8090:8080"
+    # Raised from D-12's 192m starting value. The first provider backfill was OOM-killed at 192m, 384m
+    # and 512m; at 1g its anonymous memory plateaued near 360 MiB with a spike to 493 MiB (measured
+    # 2026-09-30). 768m keeps the peak plus about 50 percent. Plan 01-04 sets the final value from mem-report.
+    mem_limit: 768m
+    memswap_limit: 768m
+    healthcheck:
+      # The root route answers before the provider backfill finishes; backfill completeness is item 10's check.
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 120s
+
   bootstrap:
     <<: *defaults
     image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
@@ -154,3 +197,4 @@ services:
 volumes:
   postgres-data:
   seaweedfs-data:
+  frankfurter-data:
