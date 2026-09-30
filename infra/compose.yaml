@@ -135,11 +135,11 @@ services:
       - frankfurter-data:/app/data
     ports:
       - "127.0.0.1:8090:8080"
-    # Sized by Plan 01-04 from just mem-report over a from-empty backfill at 768m: 420 frames across
-    # 38 minutes peaked at 310.4 MiB, and 310.4 x 1.25 rounded up to a multiple of 32 MiB is 416m.
-    # Earlier backfills were OOM-killed at 192m, 384m and 512m, so the clean-clone run checks it.
-    mem_limit: 416m
-    memswap_limit: 416m
+    # Sized by Plan 01-04. A from-empty backfill at 768m peaked at 310.4 MiB (formula: x 1.25, rounded up
+    # to 32 MiB = 416m), but the clean-clone run at 416m peaked at 412.4 of 416 MiB and plan 01-03 saw a
+    # 493 MiB spike (OOM kill at 512m). The owner set 640m: 493 MiB x 1.25 rounded up to 32 MiB.
+    mem_limit: 640m
+    memswap_limit: 640m
     healthcheck:
       # The root route answers before the provider backfill finishes; backfill completeness is item 10's check.
       test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
