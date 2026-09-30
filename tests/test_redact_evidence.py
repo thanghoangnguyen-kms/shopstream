@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import io
 import secrets
+import string
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,21 @@ MASK = re_.REDACTED
 
 def hexval() -> str:
     return secrets.token_hex(12)
+
+
+class Fresh(dict[str, str]):
+    """A mapping that invents a new runtime secret for every placeholder it is asked about."""
+
+    def __missing__(self, key: str) -> str:
+        self[key] = secrets.token_hex(12)
+        return self[key]
+
+
+def fill(template: str) -> tuple[str, list[str]]:
+    """Fill each `${name}` in a template with a fresh runtime value; return text and values."""
+    values = Fresh()
+    text = string.Template(template).substitute(values)
+    return text, list(values.values())
 
 
 def jwt_like() -> str:
@@ -287,3 +303,93 @@ def test_main_malformed_env_file_exits_2_without_printing_values(
 
 def test_default_env_file_is_infra_dot_env() -> None:
     assert DEFAULT_ENV_FILE == REPO_ROOT / "infra" / ".env"
+
+
+# (id, raw template, expected output) for each leak reproduced in 01-REVIEW.md CR-01 and WR-02.
+# `${name}` placeholders are filled at run time, so no secret-shaped literal is committed.
+NESTED_CASES: list[tuple[str, str, str]] = [
+    ("query-string", "http://h/x?user=bob&password=${v}", "http://h/x?user=bob&password=REDACTED"),
+    ("semicolon", "a=1;password=${v}", "a=1;password=REDACTED"),
+    (
+        "logfmt-quoted-msg",
+        'level=error msg="connect failed password=${v} host=x"',
+        'level=error msg="connect failed password=REDACTED host=x"',
+    ),
+    ("flag-equals", "postgres --password=${v}", "postgres --password=REDACTED"),
+    (
+        "yaml-command",
+        'command: "postgres --password=${v}"',
+        'command: "postgres --password=REDACTED"',
+    ),
+    (
+        "presigned-url",
+        "https://b.s3/x?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=${id}/20260930/us-east-1/s3/aws4_request"
+        "&X-Amz-Date=20260930T000000Z&X-Amz-SignedHeaders=host&X-Amz-Signature=${v}",
+        "https://b.s3/x?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=REDACTED"
+        "&X-Amz-Date=20260930T000000Z&X-Amz-SignedHeaders=host&X-Amz-Signature=REDACTED",
+    ),
+    (
+        "bare-signature",
+        "request failed Signature=${v} for key x",
+        "request failed Signature=REDACTED for key x",
+    ),
+    ("yaml-spaces", "password: ${w1} ${w2} ${w3} ${w4}", "password: REDACTED"),
+    ("mid-line-colon", "Error: password: ${w1} ${w2}", "Error: password: REDACTED"),
+    ("pgpassword-comma", "PGPASSWORD=${a},${b}", "PGPASSWORD=REDACTED"),
+    ("compose-list", "  - POSTGRES_PASSWORD=${v}", "  - POSTGRES_PASSWORD=REDACTED"),
+    ("export", "export TOKEN=${a} ${b}", "export TOKEN=REDACTED"),
+    ("escaped-quote", '{"password": "ab\\"cd${v}"}', '{"password": "REDACTED"}'),
+    ("unterminated-quote", 'password: "unclosed ${v}', 'password: "REDACTED'),
+    (
+        "quoted-msg-colon",
+        'msg="bad password: ${v}" host=y',
+        'msg="bad password: REDACTED" host=y',
+    ),
+    ("amp-adjacent", "password=${a}&token=${b}", "password=REDACTED&token=REDACTED"),
+    ("semicolon-adjacent", "password=${a};api_key=${b}", "password=REDACTED;api_key=REDACTED"),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [pytest.param(template, expected, id=name) for name, template, expected in NESTED_CASES],
+)
+def test_nested_and_whole_value_credentials_are_masked(template: str, expected: str) -> None:
+    raw, values = fill(template)
+    out = re_.redact_shapes(raw)
+    assert out == expected
+    for value in values:
+        assert value not in out
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "SignedHeaders=host;x-amz-date",
+        "X-Amz-Date=20260930T000000Z",
+        "unique_key: order_id",
+        "signature_version: s3v4",
+        "sts:AssumeRole",
+        "arn:aws:s3:::warehouse/*",
+        "user=bob&region=local&host=db",
+    ],
+)
+def test_nested_pairs_leave_non_secret_values_alone(line: str) -> None:
+    assert re_.redact_shapes(line) == line
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password=&user=bob",
+        'password: ""',
+        "token=",
+        "password:   \nregion: local\n",
+        "password: REDACTED   ",
+        'password: "REDACTED"  ',
+    ],
+)
+def test_empty_values_consume_nothing(text: str) -> None:
+    assert re_.redact_shapes(text) == text
