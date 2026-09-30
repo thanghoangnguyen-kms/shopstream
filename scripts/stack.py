@@ -232,9 +232,12 @@ def rewrite_env(path: Path, text: str) -> None:
     """Replace the env file with `text` at mode 0600, via a temp file and os.replace.
 
     The temp file is in the same directory, so an interrupted run leaves the old file or the
-    new one and never a torn file, and a failed replace leaves no temp file behind.
+    new one and never a torn file, and a failed replace leaves no temp file behind. Its name is
+    the env file's name, a dot and a random tail, which the env-file ignore rule already covers,
+    so a SIGKILL or power loss between mkstemp and os.replace can't leave an un-ignored copy of
+    the secrets.
     """
-    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=".env-", suffix=".tmp")
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
     try:
         os.fchmod(fd, ENV_FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
