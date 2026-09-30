@@ -276,10 +276,16 @@ class Fakes:
             ("lakekeeper", False, 0),
             ("frankfurter", False, 0),
         ]
+        self.states: list[tuple[str, str, int]] = [
+            ("postgres", "running", 0),
+            ("lakekeeper", "running", 0),
+            ("frankfurter", "running", 0),
+        ]
         self.mem_total = MEM_TOTAL
         self.profiles_seen: list[list[str]] = []
         monkeypatch.setattr(mem_report, "compose_config", self.compose_config)
         monkeypatch.setattr(mem_report, "inspect_rows", self.inspect_rows)
+        monkeypatch.setattr(mem_report, "state_rows", self.state_rows)
         monkeypatch.setattr(mem_report, "read_mem_total", lambda: self.mem_total)
         monkeypatch.delenv("COMPOSE_PROFILES", raising=False)
 
@@ -293,6 +299,9 @@ class Fakes:
 
     def inspect_rows(self, profiles: list[str]) -> list[tuple[str, bool, int]]:
         return list(self.inspect)
+
+    def state_rows(self, profiles: list[str]) -> list[tuple[str, str, int]]:
+        return list(self.states)
 
 
 def sample_file(tmp_path: Path, postgres: str = "100MiB / 512MiB") -> Path:
@@ -497,3 +506,245 @@ def test_compose_config_is_parsed_and_returned_not_printed(
     assert mem_report.mem_limit_total(config) == (1, [])
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
+
+
+# --- container state: a kill outside the cgroup limit (WR-10) -------------------------------
+
+CORE_CONFIG: dict[str, object] = {
+    "services": {
+        "postgres": {"profiles": ["core"]},
+        "seaweedfs": {"profiles": ["core"]},
+        "lakekeeper-migrate": {"profiles": ["core"]},
+        "lakekeeper": {
+            "profiles": ["core"],
+            "depends_on": {
+                "lakekeeper-migrate": {"condition": "service_completed_successfully"},
+                "postgres": {"condition": "service_healthy"},
+            },
+        },
+        "frankfurter-init": {"profiles": ["core"]},
+        "frankfurter": {
+            "profiles": ["core"],
+            "depends_on": {
+                "frankfurter-init": {"condition": "service_completed_successfully"},
+                "postgres": {"condition": "service_healthy"},
+            },
+        },
+        "bootstrap": {"profiles": ["bootstrap"]},
+        "warehouse": {"profiles": ["bootstrap"]},
+    }
+}
+
+
+def test_parse_state() -> None:
+    text = "/shopstream-postgres-1 running 0\n/shopstream-bootstrap-1 exited 0\n\n"
+    assert mem_report.parse_state(text) == [("postgres", "running", 0), ("bootstrap", "exited", 0)]
+    assert mem_report.parse_state("/shopstream-a-1 exited -1") == [("a", "exited", -1)]
+    assert mem_report.parse_state("/shopstream-a-1 exited 137") == [("a", "exited", 137)]
+    assert mem_report.parse_state("") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/shopstream-a-1 running",
+        "/shopstream-a-1 sleeping 0",
+        "/shopstream-a-1 Running 0",
+        "/shopstream-a-1 running x",
+        "/shopstream-a-1 running 1.5",
+        "/shopstream-a-1 running +",
+        "a b c d",
+    ],
+)
+def test_parse_state_rejects_odd_lines_without_echoing_them(text: str) -> None:
+    with pytest.raises(ValueError, match="unexpected docker inspect state line") as caught:
+        mem_report.parse_state(text)
+    assert text not in str(caught.value)
+
+
+def test_long_running_services_follow_the_one_shot_rule() -> None:
+    assert mem_report.long_running_services(CORE_CONFIG) == [
+        "frankfurter",
+        "lakekeeper",
+        "postgres",
+        "seaweedfs",
+    ]
+    assert mem_report.long_running_services({"services": {}}) == []
+    assert mem_report.long_running_services({}) == []
+
+
+def test_a_container_killed_outside_its_cgroup_breaches() -> None:
+    killed = [("frankfurter", False, 0)]
+    assert mem_report.evaluate(
+        0,
+        0,
+        [],
+        MEM_TOTAL,
+        killed,
+        states=[("frankfurter", "exited", 137)],
+        long_running=["frankfurter"],
+    ) == [
+        "container frankfurter exited with code 137 (SIGKILL, which the out-of-memory killer sends)",
+        "long-running container frankfurter is exited (exit code 137), not running",
+    ]
+
+
+@pytest.mark.parametrize(
+    "status", ["created", "paused", "restarting", "removing", "exited", "dead"]
+)
+def test_every_non_running_status_breaches_for_a_long_running_service(status: str) -> None:
+    breaches = mem_report.evaluate(
+        0, 0, [], MEM_TOTAL, CLEAN, states=[("postgres", status, 0)], long_running=["postgres"]
+    )
+    assert breaches == [f"long-running container postgres is {status} (exit code 0), not running"]
+    assert (
+        mem_report.evaluate(
+            0,
+            0,
+            [],
+            MEM_TOTAL,
+            CLEAN,
+            states=[("postgres", "running", 0)],
+            long_running=["postgres"],
+        )
+        == []
+    )
+
+
+def test_an_exited_one_shot_is_not_a_breach() -> None:
+    for code in (0, 1):
+        assert (
+            mem_report.evaluate(
+                0,
+                0,
+                [],
+                MEM_TOTAL,
+                CLEAN,
+                states=[("frankfurter-init", "exited", code)],
+                long_running=[],
+            )
+            == []
+        )
+    assert mem_report.evaluate(
+        0, 0, [], MEM_TOTAL, CLEAN, states=[("frankfurter-init", "exited", 137)], long_running=[]
+    ) == [
+        "container frankfurter-init exited with code 137 "
+        "(SIGKILL, which the out-of-memory killer sends)"
+    ]
+
+
+def test_a_long_running_service_without_a_container_breaches() -> None:
+    assert mem_report.evaluate(
+        0,
+        0,
+        [],
+        MEM_TOTAL,
+        CLEAN,
+        states=[("postgres", "running", 0)],
+        long_running=["seaweedfs", "postgres", "lakekeeper"],
+    ) == [
+        "long-running service lakekeeper has no container",
+        "long-running service seaweedfs has no container",
+    ]
+    assert mem_report.evaluate(0, 0, [], MEM_TOTAL, [], states=[], long_running=["b", "a"]) == [
+        "long-running service a has no container",
+        "long-running service b has no container",
+    ]
+
+
+def test_evaluate_without_the_new_arguments_keeps_its_result() -> None:
+    assert mem_report.evaluate(0, 0, [], MEM_TOTAL, CLEAN) == []
+
+
+def test_report_flags_a_vm_level_oom_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.states = [
+        ("postgres", "running", 0),
+        ("lakekeeper", "running", 0),
+        ("frankfurter", "exited", 137),
+    ]
+    assert mem_report.main(["report", "--samples", str(sample_file(tmp_path))]) == 1
+    out = capsys.readouterr().out
+    assert "BREACH: container frankfurter exited with code 137" in out
+    assert (
+        "BREACH: long-running container frankfurter is exited (exit code 137), not running" in out
+    )
+    assert "frankfurter: OOMKilled=false RestartCount=0 Status=exited ExitCode=137" in out
+    assert fakes.profiles_seen == [["core"]]
+
+
+def test_report_prints_status_and_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    assert mem_report.main(["report", "--samples", str(sample_file(tmp_path))]) == 0
+    out = capsys.readouterr().out
+    assert "  postgres: OOMKilled=false RestartCount=0 Status=running ExitCode=0" in out
+    assert "four significant digits" in out
+    assert "OOMKilled, exit code 137 or a long-running service that is not running" in out
+    assert "the OOM and restart checks cover it" not in out
+
+
+def test_report_prints_a_dash_for_a_container_without_a_state_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.states = [("lakekeeper", "running", 0), ("frankfurter", "running", 0)]
+    assert mem_report.main(["report", "--samples", str(sample_file(tmp_path))]) == 1
+    out = capsys.readouterr().out
+    assert "  postgres: OOMKilled=false RestartCount=0 Status=- ExitCode=-" in out
+    assert "BREACH: long-running service postgres has no container" in out
+
+
+def test_state_rows_always_passes_a_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake(argv: list[str]) -> str:
+        calls.append(argv)
+        if argv[:2] == ["docker", "inspect"]:
+            return "/shopstream-postgres-1 running 0\n/shopstream-bootstrap-1 exited 0\n"
+        return "id1\nid2\n"
+
+    monkeypatch.setattr(mem_report, "_docker", fake)
+    assert mem_report.state_rows(["core"]) == [
+        ("postgres", "running", 0),
+        ("bootstrap", "exited", 0),
+    ]
+    inspect_call = next(c for c in calls if c[:2] == ["docker", "inspect"])
+    assert inspect_call[2:4] == ["--format", "{{.Name}} {{.State.Status}} {{.State.ExitCode}}"]
+    assert inspect_call[4:] == ["id1", "id2"]
+    listing = next(c for c in calls if c[:2] == ["docker", "compose"])
+    assert "bootstrap" in listing
+    assert listing[-2:] == ["ps", "-aq"]
+
+
+def test_state_rows_with_no_containers_runs_no_inspect(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake(argv: list[str]) -> str:
+        calls.append(argv)
+        return ""
+
+    monkeypatch.setattr(mem_report, "_docker", fake)
+    assert mem_report.state_rows(["core"]) == []
+    assert len(calls) == 1
+
+
+def test_inspect_format_is_the_plat_09_literal(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert mem_report.INSPECT_FORMAT == "{{.Name}} {{.State.OOMKilled}} {{.RestartCount}}"
+    assert mem_report.STATE_FORMAT == "{{.Name}} {{.State.Status}} {{.State.ExitCode}}"
+    assert mem_report.OOM_KILL_EXIT_CODE == 137
+    states = {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
+    assert states == mem_report.DOCKER_STATES
+    calls: list[list[str]] = []
+
+    def fake(argv: list[str]) -> str:
+        calls.append(argv)
+        return "id1\n" if argv[:2] == ["docker", "compose"] else ""
+
+    monkeypatch.setattr(mem_report, "_docker", fake)
+    mem_report.inspect_rows(["core"])
+    inspect_call = next(c for c in calls if c[:2] == ["docker", "inspect"])
+    assert inspect_call[2:4] == ["--format", mem_report.INSPECT_FORMAT]

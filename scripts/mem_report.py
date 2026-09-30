@@ -3,7 +3,15 @@
 `sample` appends one `docker stats` frame every few seconds to .mem/samples.jsonl. `report`
 reads those frames and prints the per-service peak table, the peak summed sample, the sum of
 the compose `mem_limit` values with and without the Week 5 reserve, the VM headroom verdict
-and each container's OOM and restart record. Any breach exits 1; missing samples exit 2.
+and each container's OOM, restart and state record. Any breach exits 1; missing samples exit 2.
+
+Two `docker inspect` calls, each with an explicit `--format`: INSPECT_FORMAT
+(`{{.Name}} {{.State.OOMKilled}} {{.RestartCount}}`, the PLAT-09 literal) and STATE_FORMAT
+(`{{.Name}} {{.State.Status}} {{.State.ExitCode}}`). The state check is what catches a container
+killed outside its cgroup limit (a VM-level OOM kill or a crash), which leaves OOMKilled false
+and, with `restart: "no"` on every service, RestartCount 0: a long-running service that is not
+`running`, a long-running service with no container, or any container that exited 137 breaches.
+Long-running services follow the repo policy test's one-shot rule.
 
 Counting rule (research P11): every service that has a `mem_limit` in the active profiles
 counts toward the limit total, one-shots included. The active profiles are `core` plus
@@ -26,7 +34,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -43,6 +51,12 @@ VM_HEADROOM_BYTES = 1024**3  # sum(mem_limit) stays within MemTotal minus 1 GiB
 W05_RESERVE_BYTES = 384 * 1024**2  # informational: the Week 5 streaming reserve
 PROJECT = "shopstream"
 DOCKER_TIMEOUT_S = 120
+INSPECT_FORMAT = "{{.Name}} {{.State.OOMKilled}} {{.RestartCount}}"  # PLAT-09, kept verbatim
+STATE_FORMAT = "{{.Name}} {{.State.Status}} {{.State.ExitCode}}"
+DOCKER_STATES = frozenset(
+    {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
+)
+OOM_KILL_EXIT_CODE = 137  # 128 + SIGKILL, what the out-of-memory killer sends
 
 # docker stats prints binary units as KiB/MiB/GiB and decimal ones as kB/MB/GB.
 UNITS: dict[str, int] = {
@@ -57,10 +71,13 @@ UNITS: dict[str, int] = {
 }
 _SIZE = re.compile(r"^\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)\s*$")
 _ABSENT = "--"
+_EXIT_CODE = re.compile(r"-?[0-9]+")
 CAVEAT = (
     "caveat: docker stats prints four significant digits and samples every "
-    f"{SAMPLE_INTERVAL_S} s, so a short peak can fall between samples; the OOM and restart "
-    "checks cover it."
+    f"{SAMPLE_INTERVAL_S} s, so a short peak can fall between samples; a peak that kills a "
+    "container still shows as OOMKilled, exit code 137 or a long-running service that is not "
+    'running; every service has restart "no", so RestartCount stays 0 unless a restart policy '
+    "is added."
 )
 
 
@@ -199,12 +216,59 @@ def parse_inspect(text: str) -> list[tuple[str, bool, int]]:
     return rows
 
 
+def parse_state(text: str) -> list[tuple[str, str, int]]:
+    """(service, status, exit code) per line of the fixed `docker inspect` state format."""
+    rows: list[tuple[str, str, int]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if (
+            len(parts) != 3
+            or parts[1] not in DOCKER_STATES
+            or _EXIT_CODE.fullmatch(parts[2]) is None
+        ):
+            raise ValueError("unexpected docker inspect state line")
+        rows.append((service_of(parts[0]), parts[1], int(parts[2])))
+    return rows
+
+
+def long_running_services(config: Mapping[str, object]) -> list[str]:
+    """Services that must stay up: every one except the one-shots, sorted.
+
+    Same rule as the repo policy test: a service in the `bootstrap` profile, or one another
+    service waits on with `service_completed_successfully`, is a one-shot.
+    """
+    services = config.get("services")
+    if not isinstance(services, Mapping):
+        return []
+    one_shots: set[str] = set()
+    for name, definition in services.items():
+        if not isinstance(definition, Mapping):
+            continue
+        profiles = definition.get("profiles")
+        if isinstance(profiles, list) and "bootstrap" in profiles:
+            one_shots.add(str(name))
+        depends = definition.get("depends_on")
+        if isinstance(depends, Mapping):
+            one_shots.update(
+                str(dep)
+                for dep, condition in depends.items()
+                if isinstance(condition, Mapping)
+                and condition.get("condition") == "service_completed_successfully"
+            )
+    return sorted(str(name) for name in services if str(name) not in one_shots)
+
+
 def evaluate(
     peak_sum: int,
     limit_total: int,
     missing: Sequence[str],
     mem_total: int,
     inspect_rows: Sequence[tuple[str, bool, int]],
+    *,
+    states: Sequence[tuple[str, str, int]] = (),
+    long_running: Collection[str] = (),
 ) -> list[str]:
     """Breach messages; an empty list means every threshold holds."""
     breaches: list[str] = []
@@ -223,6 +287,21 @@ def evaluate(
             breaches.append(f"container {service} was OOM killed")
         if restarts > 0:
             breaches.append(f"container {service} restarted {restarts} time(s)")
+    for service, status, exit_code in states:
+        if exit_code == OOM_KILL_EXIT_CODE and status != "running":
+            breaches.append(
+                f"container {service} exited with code {OOM_KILL_EXIT_CODE} "
+                "(SIGKILL, which the out-of-memory killer sends)"
+            )
+        if service in long_running and status != "running":
+            breaches.append(
+                f"long-running container {service} is {status} (exit code {exit_code}), not running"
+            )
+    with_container = {service for service, _status, _code in states}
+    breaches.extend(
+        f"long-running service {service} has no container"
+        for service in sorted(set(long_running) - with_container)
+    )
     return breaches
 
 
@@ -271,14 +350,26 @@ def compose_config(profiles: Sequence[str]) -> dict[str, object]:
     return config
 
 
+def container_ids(profiles: Sequence[str]) -> list[str]:
+    """Ids of every container of the project, one-shots included (bootstrap is added)."""
+    listing = _docker(compose_argv([*profiles, "bootstrap"], "ps", "-aq"))
+    return [line.strip() for line in listing.splitlines() if line.strip()]
+
+
 def inspect_rows(profiles: Sequence[str]) -> list[tuple[str, bool, int]]:
     """OOMKilled and RestartCount of every container, one-shots included."""
-    listing = _docker(compose_argv([*profiles, "bootstrap"], "ps", "-aq"))
-    container_ids = [line.strip() for line in listing.splitlines() if line.strip()]
-    if not container_ids:
+    ids = container_ids(profiles)
+    if not ids:
         return []
-    fmt = "{{.Name}} {{.State.OOMKilled}} {{.RestartCount}}"
-    return parse_inspect(_docker(["docker", "inspect", "--format", fmt, *container_ids]))
+    return parse_inspect(_docker(["docker", "inspect", "--format", INSPECT_FORMAT, *ids]))
+
+
+def state_rows(profiles: Sequence[str]) -> list[tuple[str, str, int]]:
+    """Status and exit code of every container, one-shots included."""
+    ids = container_ids(profiles)
+    if not ids:
+        return []
+    return parse_state(_docker(["docker", "inspect", "--format", STATE_FORMAT, *ids]))
 
 
 # --- commands ------------------------------------------------------------------------------
@@ -330,7 +421,10 @@ def cmd_report(samples: Path) -> int:
     limits, missing = limits_by_service(config)
     limit_total = sum(limits.values())
     mem_total = read_mem_total()
+    long_running = long_running_services(config)
     rows = inspect_rows(profiles)
+    states = state_rows(profiles)
+    state_of = {service: (status, code) for service, status, code in states}
 
     print(f"mem-report: {len(frames)} frames, {frames[0].ts} to {frames[-1].ts}")
     print(f"{'service':<22}{'peak MiB':>10}{'mem_limit MiB':>15}")
@@ -347,12 +441,18 @@ def cmd_report(samples: Path) -> int:
     print(f"VM MemTotal {_gib(mem_total)}, minus 1 GiB leaves {_gib(ceiling)}: limits {verdict}")
     print("OOMKilled and RestartCount per container:")
     for service, oom_killed, restarts in rows:
-        print(f"  {service}: OOMKilled={str(oom_killed).lower()} RestartCount={restarts}")
+        status, code = state_of.get(service, ("-", "-"))
+        print(
+            f"  {service}: OOMKilled={str(oom_killed).lower()} RestartCount={restarts} "
+            f"Status={status} ExitCode={code}"
+        )
     if not rows:
         print("  no containers found")
     print(CAVEAT)
 
-    breaches = evaluate(peak_sum, limit_total, missing, mem_total, rows)
+    breaches = evaluate(
+        peak_sum, limit_total, missing, mem_total, rows, states=states, long_running=long_running
+    )
     for message in breaches:
         print(f"BREACH: {message}")
     if breaches:
