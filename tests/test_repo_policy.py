@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import stack
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
@@ -53,7 +54,12 @@ FROM_LINE = re.compile(
     r"FROM\s+(?:--\S+\s+)*(?P<ref>\S+)(?:\s+AS\s+(?P<alias>\S+))?", re.IGNORECASE
 )
 COPY_FROM = re.compile(r"COPY\s+.*?--from=(?P<ref>\S+)", re.IGNORECASE)
-IGNORED_PATHS = ("infra/.generated/seaweedfs/iam.json", ".mem/samples.jsonl", "infra/.env")
+IGNORED_PATHS = (
+    "infra/.generated/seaweedfs/iam.json",
+    ".mem/samples.jsonl",
+    "infra/.env",
+    "infra/.env.a1b2c3d4.tmp",
+)
 
 
 def _git_env() -> dict[str, str]:
@@ -386,7 +392,9 @@ def test_git_listing_is_sorted(git_repo: Path) -> None:
 
 
 def test_an_empty_repo_has_no_violations(git_repo: Path) -> None:
-    (git_repo / ".gitignore").write_text("infra/.generated/\n.mem/\ninfra/.env\n", encoding="utf-8")
+    (git_repo / ".gitignore").write_text(
+        "infra/.generated/\n.mem/\ninfra/.env\ninfra/.env.*\n", encoding="utf-8"
+    )
     for name, check in CHECKS.items():
         assert check(git_repo) == [], name
 
@@ -395,6 +403,7 @@ def test_a_missing_ignore_rule_is_reported(git_repo: Path) -> None:
     assert ignore_violations(git_repo) == [
         ".mem/samples.jsonl is not git-ignored",
         "infra/.env is not git-ignored",
+        "infra/.env.a1b2c3d4.tmp is not git-ignored",
         "infra/.generated/seaweedfs/iam.json is not git-ignored",
     ]
 
@@ -797,8 +806,31 @@ def test_a_plain_file_has_no_structure_violations(git_repo: Path) -> None:
     assert structure_violations(git_repo) == []
 
 
+def test_the_env_rewrite_temp_file_is_git_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between mkstemp and os.replace must not leave an un-ignored copy of the secrets."""
+    sources: list[Path] = []
+
+    def failing_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        sources.append(Path(source))
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        stack.rewrite_env(tmp_path / stack.ENV_FILE.name, "A=1\n")
+    assert len(sources) == 1
+    temp = sources[0]
+    assert temp.parent == tmp_path
+    assert temp.name != stack.ENV_EXAMPLE.name
+    assert list(tmp_path.iterdir()) == []
+    assert _git(REPO, "check-ignore", "-q", f"infra/{temp.name}", check=False).returncode == 0
+
+
 def test_a_compliant_service_passes_every_check(git_repo: Path) -> None:
-    (git_repo / ".gitignore").write_text("infra/.generated/\n.mem/\ninfra/.env\n", encoding="utf-8")
+    (git_repo / ".gitignore").write_text(
+        "infra/.generated/\n.mem/\ninfra/.env\ninfra/.env.*\n", encoding="utf-8"
+    )
     write_service(git_repo, GOOD_BODY + '    ports:\n      - "127.0.0.1:8181:8181"\n')
     for name, check in CHECKS.items():
         assert check(git_repo) == [], name
