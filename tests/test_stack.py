@@ -7,6 +7,7 @@ bound to a name ruff's S105 or S106 would treat as a password.
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import re
@@ -118,6 +119,10 @@ class Sandbox:
     def identity_file(self) -> Path:
         return self.root / "infra" / ".generated" / "seaweedfs" / "iam.json"
 
+    @property
+    def lock_file(self) -> Path:
+        return self.root / "infra" / ".generated" / "stack.lock"
+
     def argvs(self) -> list[list[str]]:
         return [argv for argv, _ in self.calls]
 
@@ -133,6 +138,7 @@ def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Sandbox:
     monkeypatch.setattr(stack, "ENV_FILE", box.env_file)
     monkeypatch.setattr(stack, "IDENTITY_TEMPLATE", infra / "seaweedfs" / "iam.json.tmpl")
     monkeypatch.setattr(stack, "IDENTITY_FILE", box.identity_file)
+    monkeypatch.setattr(stack, "ENV_LOCK_FILE", box.lock_file)
     monkeypatch.setattr(stack, "read_mem_total", lambda: MEASURED_MEM_TOTAL)
     monkeypatch.delenv("COMPOSE_PROFILES", raising=False)
 
@@ -366,6 +372,149 @@ def test_sync_env_makes_an_existing_complete_file_private_without_changing_it(
     assert stack.sync_env() == []
     assert sandbox.env_file.read_text(encoding="utf-8") == complete
     assert stat.S_IMODE(sandbox.env_file.stat().st_mode) == 0o600
+
+
+def locked_elsewhere(path: Path) -> bool:
+    """True while another open file description holds the exclusive lock on `path`."""
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)  # closing also drops a lock this probe just took
+    return False
+
+
+def test_a_whitespace_only_env_file_is_written_whole(sandbox: Sandbox) -> None:
+    sandbox.env_file.write_text("\n\n", encoding="utf-8")
+    assert stack.sync_env() == KEYS
+    text = sandbox.env_file.read_text(encoding="utf-8")
+    assert text.splitlines()[0] == EXAMPLE.splitlines()[0]
+    assert list(parse_dotenv(text)) == KEYS
+    assert all(parse_dotenv(text).values())
+
+
+def test_crlf_line_endings_survive_a_top_up(sandbox: Sandbox) -> None:
+    complete, _ = stack.init_env(EXAMPLE, "")
+    lines = complete.splitlines()
+    index = next(i for i, line in enumerate(lines) if line.startswith(f"{KEYS[3]}="))
+    lines[index] = f"{KEYS[3]}="
+    sandbox.env_file.write_bytes("".join(line + "\r\n" for line in lines).encode())
+    assert stack.sync_env() == [KEYS[3]]
+    data = sandbox.env_file.read_bytes()
+    assert data.count(b"\n") == data.count(b"\r\n") == len(lines)
+    after = data.decode().splitlines(keepends=True)
+    assert after[index].startswith(f"{KEYS[3]}=")
+    assert after[index].endswith("\r\n")
+    assert len(after[index]) > len(f"{KEYS[3]}=\r\n")
+    assert [line for i, line in enumerate(after) if i != index] == [
+        line + "\r\n" for i, line in enumerate(lines) if i != index
+    ]
+
+
+def test_spaced_and_unterminated_empty_keys_are_filled_once() -> None:
+    kept = secrets.token_hex(4)
+    existing = f"{KEYS[0]} =\n{KEYS[1]}= \n{KEYS[2]}={kept}\nCANARY_TOKEN="
+    text, added = stack.init_env(EXAMPLE, existing)
+    assert added == [key for key in KEYS if key != KEYS[2]]
+    lines = text.splitlines()
+    assert len(lines) == len(KEYS)
+    assert lines[3].startswith("CANARY_TOKEN=")
+    assert lines[4].startswith(f"{KEYS[3]}=")
+    for key in KEYS:
+        assert len([line for line in lines if line.partition("=")[0].strip() == key]) == 1
+    values = parse_dotenv(text)
+    assert values[KEYS[2]] == kept
+    assert all(values.values())
+
+
+def test_keys_outside_the_example_are_left_alone() -> None:
+    kept = secrets.token_hex(4)
+    existing = f"EXTRA=\nOTHER={kept}\n{KEYS[0]}=\n"
+    text, added = stack.init_env(EXAMPLE, existing)
+    assert text.startswith(f"EXTRA=\nOTHER={kept}\n")
+    assert "EXTRA" not in added
+    assert "OTHER" not in added
+    values = parse_dotenv(text)
+    assert values["EXTRA"] == ""
+    assert values["OTHER"] == kept
+    assert values[KEYS[0]]
+
+
+def test_added_keys_come_back_in_example_order() -> None:
+    a, b = secrets.token_hex(4), secrets.token_hex(4)
+    existing = f"{KEYS[1]}={a}\n{KEYS[2]}=\n" + "".join(f"{key}={b}\n" for key in KEYS[3:])
+    text, added = stack.init_env(EXAMPLE, existing)
+    assert added == [KEYS[0], KEYS[2]]
+    lines = text.splitlines()
+    assert lines[0] == f"{KEYS[1]}={a}"
+    assert lines[1].startswith(f"{KEYS[2]}=")
+    assert lines[1] != f"{KEYS[2]}="
+    assert lines[-1].startswith(f"{KEYS[0]}=")
+
+
+def test_a_failed_rewrite_keeps_the_old_file_and_leaves_no_temp_file(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = secrets.token_hex(4)
+    old = f"{KEYS[0]}={kept}\n"
+    sandbox.env_file.write_text(old, encoding="utf-8")
+    before = sorted(child.name for child in sandbox.env_file.parent.iterdir())
+
+    def fail(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError, match="disk full"):
+        stack.sync_env()
+    assert sandbox.env_file.read_text(encoding="utf-8") == old
+    assert sorted(child.name for child in sandbox.env_file.parent.iterdir()) == before
+
+
+def test_env_lock_is_exclusive_until_released(tmp_path: Path) -> None:
+    path = tmp_path / ".generated" / "stack.lock"
+    with stack.env_lock(path):
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert locked_elsewhere(path)
+    assert not locked_elsewhere(path)
+    assert path.exists()  # kept, never deleted: deleting it would reopen the race
+
+
+def test_up_tops_up_and_renders_under_the_lock(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, bool] = {}
+    real_sync, real_write = stack.sync_env, stack.write_identity
+
+    def sync() -> list[str]:
+        seen["sync"] = locked_elsewhere(sandbox.lock_file)
+        return real_sync()
+
+    def write(path: Path, text: str) -> None:
+        seen["identity"] = locked_elsewhere(sandbox.lock_file)
+        real_write(path, text)
+
+    def docker(argv: list[str], env: Mapping[str, str]) -> int:
+        seen["compose"] = locked_elsewhere(sandbox.lock_file)
+        return 0
+
+    monkeypatch.setattr(stack, "sync_env", sync)
+    monkeypatch.setattr(stack, "write_identity", write)
+    monkeypatch.setattr(stack, "run_docker", docker)
+    assert stack.cmd_up() == 0
+    assert seen == {"sync": True, "identity": True, "compose": False}
+    assert stat.S_IMODE(sandbox.lock_file.stat().st_mode) == 0o600
+
+
+def test_a_failing_preflight_creates_no_lock_file(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stack, "read_mem_total", lambda: 8 * GIB)
+    assert stack.cmd_up() == 1
+    assert not sandbox.lock_file.exists()
+    assert not sandbox.lock_file.parent.exists()
 
 
 # --- the identity file -----------------------------------------------------------------------

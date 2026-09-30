@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -26,7 +28,7 @@ import string
 import subprocess
 import sys
 import tempfile
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from pathlib import Path
 
 from dotenv_lite import DEFAULT_ENV_FILE, DotenvError, parse_dotenv
@@ -37,9 +39,11 @@ ENV_EXAMPLE = REPO_ROOT / "infra" / ".env.example"
 ENV_FILE = DEFAULT_ENV_FILE
 IDENTITY_TEMPLATE = REPO_ROOT / "infra" / "seaweedfs" / "iam.json.tmpl"
 IDENTITY_FILE = REPO_ROOT / "infra" / ".generated" / "seaweedfs" / "iam.json"
+ENV_LOCK_FILE = REPO_ROOT / "infra" / ".generated" / "stack.lock"
 IDENTITY_FILE_MODE = 0o600
 GENERATED_DIR_MODE = 0o700
 ENV_FILE_MODE = 0o600
+ENV_LOCK_FILE_MODE = 0o600
 
 # D-03 calibration: the owner measured 12515225600 bytes of `docker info` MemTotal on the
 # Colima vz VM (12 GiB) on 2026-09-30. Rounded down to a multiple of 256 MiB (268435456)
@@ -258,6 +262,27 @@ def write_identity(path: Path, text: str) -> None:
         raise
 
 
+@contextlib.contextmanager
+def env_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive flock on `path` (created at 0600 in a 0700 directory) for the block.
+
+    The lock file is kept after the block: deleting it would let a second run lock a new
+    inode while the first still holds the old one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(GENERATED_DIR_MODE)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, ENV_LOCK_FILE_MODE)
+    try:
+        os.fchmod(fd, ENV_LOCK_FILE_MODE)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def run_docker(argv: list[str], env: Mapping[str, str]) -> int:
     try:
         return subprocess.run(argv, env=dict(env), cwd=REPO_ROOT, check=False).returncode
@@ -304,14 +329,17 @@ def cmd_up() -> int:
     print(message, flush=True)
     if not ok:
         return 1
-    added = sync_env()
-    if added:
-        print(f"env file: added {len(added)} keys: {', '.join(added)}", flush=True)
-    else:
-        print("env file: up to date", flush=True)
-    values = parse_dotenv(ENV_FILE.read_text(encoding="utf-8"))
-    write_identity(IDENTITY_FILE, render_identity(IDENTITY_TEMPLATE.read_text("utf-8"), values))
-    print("identity file: rendered", flush=True)
+    # One lock covers the top-up and the identity render, so two `just up` runs cannot
+    # generate two sets of secrets. The compose steps run after it is released.
+    with env_lock(ENV_LOCK_FILE):
+        added = sync_env()
+        if added:
+            print(f"env file: added {len(added)} keys: {', '.join(added)}", flush=True)
+        else:
+            print("env file: up to date", flush=True)
+        values = parse_dotenv(ENV_FILE.read_text(encoding="utf-8"))
+        write_identity(IDENTITY_FILE, render_identity(IDENTITY_TEMPLATE.read_text("utf-8"), values))
+        print("identity file: rendered", flush=True)
     profiles = parse_profiles(os.environ)
     env = child_env(os.environ, values.keys(), env_file_exists=True)
     for argv in up_steps(profiles):
