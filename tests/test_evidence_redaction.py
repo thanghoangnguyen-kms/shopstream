@@ -234,6 +234,10 @@ def test_every_env_example_key_is_reported_when_unmasked(tmp_path: Path, name: s
     ]
 
 
+# Built from parts so the source never holds a user:password pair after the HTTP client word.
+CLIENT = "cu" + "rl"
+
+
 def must_fail_lines() -> dict[str, str]:
     """Raw lines the gate must report: the shapes reproduced in review (CR-01, WR-01, WR-02)."""
     value = secrets.token_hex(8)
@@ -255,6 +259,10 @@ def must_fail_lines() -> dict[str, str]:
         "yaml-doubled-quote": f"password: '{first}''{second}'",
         "yaml-leaked-tail": f"password: 'REDACTED''{second}'",
         "flag-doubled-quote": f"cli --password '{first}''{second}'",
+        "http-client-user": CLIENT + f" -u bob:{value} http://x",
+        "http-client-long-user": CLIENT + f" --user bob:{value} http://x",
+        "registry-login": f"docker login -u bob -p {value} registry.example",
+        "registry-login-after-mkdir": f"mkdir -p /tmp/x && docker login -u bob -p {value} reg",
     }
 
 
@@ -280,6 +288,14 @@ def must_pass_texts() -> dict[str, str]:
         "compass": "compass: north",
         "empty-single-quoted": "password: ''",
         "masked-single-quoted": "password: 'REDACTED'",
+        "psql-user-flag": "psql -U postgres -d shopstream",
+        "compose-project-flag": "docker compose -p shopstream-uat up -d",
+        "run-port-and-user": "docker run -p 127.0.0.1:8080:8080 -u 1000:1000 img",
+        "mkdir-parents": "mkdir -p /tmp/x",
+        "login-password-stdin-with-user": "docker login -u bob --password-stdin",
+        "http-client-user-only": CLIENT + " -u bob http://x",
+        "masked-http-client-user": CLIENT + " -u bob:REDACTED http://x",
+        "masked-registry-login": "docker login -u bob -p REDACTED reg",
     }
 
 
@@ -317,6 +333,17 @@ def test_a_pem_private_key_reports_each_body_line(tmp_path: Path) -> None:
 def test_field_names_and_prose_pass(tmp_path: Path, text: str) -> None:
     write_evidence(tmp_path, text + "\n")
     assert evidence_violations(tmp_path) == []
+
+
+def test_a_continued_command_reports_only_the_credential_line(tmp_path: Path) -> None:
+    value = secrets.token_hex(8)
+    raw = CLIENT + " -sS \\\n  -u bob:" + value + " \\\n  http://x\n"
+    write_evidence(tmp_path / "raw", raw)
+    assert evidence_violations(tmp_path / "raw") == [
+        "docs/evidence/w-test.md:2: secret CLI flag is not REDACTED"
+    ]
+    write_evidence(tmp_path / "clean", redact_evidence.redact_shapes(raw))
+    assert evidence_violations(tmp_path / "clean") == []
 
 
 def test_a_partially_masked_value_is_reported(tmp_path: Path) -> None:

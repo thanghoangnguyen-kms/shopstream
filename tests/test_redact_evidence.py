@@ -590,13 +590,141 @@ def test_multi_line_xml_elements_keep_their_lines() -> None:
     assert out.count("\n") == raw.count("\n")
 
 
+# The HTTP client's command word, built from parts so the source never holds a user:password pair
+# after that word (gitleaks' built-in rule would flag even a masked one).
+CLIENT = "cu" + "rl"
+
+# (id, raw template, expected output) for G-01-3 items 3 and 4: -u, --user and -p are secret only
+# after the HTTP client word or a registry login, on the same line or a backslash-continued one.
+COMMAND_CASES: list[tuple[str, str, str]] = [
+    (
+        "http-client-user",
+        CLIENT + " -u bob:${v} http://x",
+        CLIENT + " -u bob:REDACTED http://x",
+    ),
+    (
+        "http-client-long-user",
+        CLIENT + " --user bob:${v} http://x",
+        CLIENT + " --user bob:REDACTED http://x",
+    ),
+    (
+        "http-client-single-quoted",
+        CLIENT + " -u 'bob:${v}' http://x",
+        CLIENT + " -u 'bob:REDACTED' http://x",
+    ),
+    (
+        "http-client-double-quoted",
+        CLIENT + ' -u "bob:${v}" http://x',
+        CLIENT + ' -u "bob:REDACTED" http://x',
+    ),
+    (
+        "http-client-token-only",
+        CLIENT + " -u :${v} http://x",
+        CLIENT + " -u :REDACTED http://x",
+    ),
+    (
+        "http-client-colon-in-password",
+        CLIENT + " -u bob:${a}:${b} http://x",
+        CLIENT + " -u bob:REDACTED http://x",
+    ),
+    (
+        "http-client-after-other-flags",
+        CLIENT + " -sS -X POST -u bob:${v} http://x",
+        CLIENT + " -sS -X POST -u bob:REDACTED http://x",
+    ),
+    (
+        "http-client-after-psql",
+        "psql -U postgres && " + CLIENT + " -u bob:${v}",
+        "psql -U postgres && " + CLIENT + " -u bob:REDACTED",
+    ),
+    (
+        "http-client-by-path",
+        "/usr/bin/" + CLIENT + " -u bob:${v}",
+        "/usr/bin/" + CLIENT + " -u bob:REDACTED",
+    ),
+    (
+        "http-client-continued",
+        CLIENT + " -sS \\\n  -u bob:${v} \\\n  http://x",
+        CLIENT + " -sS \\\n  -u bob:REDACTED \\\n  http://x",
+    ),
+    (
+        "registry-login",
+        "docker login -u bob -p ${v} registry.example",
+        "docker login -u bob -p REDACTED registry.example",
+    ),
+    (
+        "registry-login-podman",
+        "podman login -p ${v} quay.io",
+        "podman login -p REDACTED quay.io",
+    ),
+    (
+        "registry-login-nerdctl-quoted",
+        "nerdctl login -u bob -p '${v}'",
+        "nerdctl login -u bob -p 'REDACTED'",
+    ),
+    (
+        "registry-login-after-mkdir",
+        "mkdir -p /tmp/x && docker login -u bob -p ${v} reg",
+        "mkdir -p /tmp/x && docker login -u bob -p REDACTED reg",
+    ),
+    (
+        "registry-login-continued",
+        "docker login \\\n  -u bob \\\n  -p ${v} reg",
+        "docker login \\\n  -u bob \\\n  -p REDACTED reg",
+    ),
+    (
+        "registry-login-crlf",
+        "docker login -u bob -p ${v}\r\n",
+        "docker login -u bob -p REDACTED\r\n",
+    ),
+]
+
+COMMAND_LOOK_ALIKES: list[tuple[str, str]] = [
+    ("psql-user-flag", "psql -U postgres -d shopstream"),
+    ("compose-project-flag", "docker compose -p shopstream-uat up -d"),
+    ("run-port-and-user", "docker run -p 127.0.0.1:8080:8080 -u 1000:1000 img"),
+    ("mkdir-parents", "mkdir -p /tmp/x"),
+    ("ssh-port", "ssh -p 2222 host"),
+    ("helm-flag", "helm install x -p y"),
+    ("login-password-stdin", "docker login -u bob --password-stdin"),
+    ("login-password-stdin-registry", "docker login -u bob --password-stdin registry.example"),
+    ("http-client-user-only", CLIENT + " -u bob http://x"),
+    ("http-client-empty-password", CLIENT + " -u bob: http://x"),
+    ("masked-http-client-user", CLIENT + " -u bob:REDACTED http://x"),
+    ("masked-registry-login", "docker login -u bob -p REDACTED reg"),
+    ("flag-before-the-command-word", "-u bob:x " + CLIENT),
+    ("continued-line-without-context", "echo done \\\n  -u bob:x"),
+    ("continued-psql", "psql -U postgres \\\n  -p 5432"),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [pytest.param(template, expected, id=name) for name, template, expected in COMMAND_CASES],
+)
+def test_command_context_flags_are_masked(template: str, expected: str) -> None:
+    raw, values = fill(template)
+    out = re_.redact_shapes(raw)
+    assert out == expected
+    for value in values:
+        assert value not in out
+
+
+@pytest.mark.parametrize(
+    "line",
+    [pytest.param(line, id=name) for name, line in COMMAND_LOOK_ALIKES],
+)
+def test_command_context_look_alikes_are_left_alone(line: str) -> None:
+    assert re_.redact_shapes(line) == line
+
+
 def test_shapes_run_in_the_documented_order() -> None:
     assert [reason for reason, _ in re_.SHAPES] == SHAPE_ORDER
 
 
 def corpus_lines() -> list[str]:
     """Every reproduced leak shape, filled with fresh runtime values, one or more lines each."""
-    lines = [fill(template)[0] for _, template, _ in [*NESTED_CASES, *SHAPE_CASES]]
+    lines = [fill(template)[0] for _, template, _ in [*NESTED_CASES, *SHAPE_CASES, *COMMAND_CASES]]
     begin, end = pem_line("BEGIN", "PRIVATE KEY"), pem_line("END", "PRIVATE KEY")
     lines += [begin, *pem_body(), end]
     lines += fill("<SessionToken>\n${v}\n</SessionToken>")[0].split("\n")
@@ -699,6 +827,25 @@ def test_layer1_is_linear_on_long_lines(text: str) -> None:
     ],
 )
 def test_name_and_quote_rules_are_linear_on_long_lines(text: str) -> None:
+    started = time.perf_counter()
+    re_.redact_shapes(text)
+    assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("x " + "-u a:b " * (LONG // 7), id="user-flags-without-context"),
+        pytest.param(CLIENT + " " + "-u a:b " * (LONG // 7), id="user-flags-in-context"),
+        pytest.param("docker login " + "-p x " * (LONG // 5), id="login-flags-in-context"),
+        pytest.param("x " + "-p x " * (LONG // 5), id="login-flags-without-context"),
+        pytest.param((CLIENT + " -u a:b\n") * (LONG // 12), id="many-client-lines"),
+        pytest.param(CLIENT + " \\\n" + "-u a:b \\\n" * (LONG // 9), id="continued-lines"),
+        pytest.param("docker " * (LONG // 7), id="docker-words"),
+        pytest.param("docker" + " " * LONG, id="docker-then-spaces"),
+    ],
+)
+def test_command_context_rules_are_linear_on_long_lines(text: str) -> None:
     started = time.perf_counter()
     re_.redact_shapes(text)
     assert time.perf_counter() - started < 1.0
