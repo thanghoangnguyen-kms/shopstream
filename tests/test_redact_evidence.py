@@ -461,6 +461,15 @@ SHAPE_CASES: list[tuple[str, str, str]] = [
         "cli --password '${a}''${b}",
         "cli --password 'REDACTED",
     ),
+    # G-01-1: a flag glued after a `.` is still masked, and the first flag in a run is judged.
+    (
+        "flag-after-ellipsis",
+        "...--password ${v} -h db",
+        "...--password REDACTED -h db",
+    ),
+    ("flag-after-abbreviation", "e.g.--token ${v}", "e.g.--token REDACTED"),
+    ("flag-after-list-number", "1.--password ${v}", "1.--password REDACTED"),
+    ("flag-name-across-dot-dash", "x.-pass.-word ${v}", "x.-pass.-word REDACTED"),
 ]
 
 SHAPE_ORDER = [
@@ -806,6 +815,8 @@ LONG = 64 * 1024
         pytest.param("<" + "Token" * (LONG // 5), id="xml-tag-run"),
         pytest.param("a://:" + "@" * LONG, id="dsn-at-run"),
         pytest.param("a://:x@" * (LONG // 7), id="dsn-repeats"),
+        pytest.param("a.-" * (LONG // 3), id="dot-dash-run"),
+        pytest.param("v1.-rc" * (LONG // 6), id="version-dot-dash-run"),
     ],
 )
 def test_layer1_is_linear_on_long_lines(text: str) -> None:
@@ -843,9 +854,39 @@ def test_name_and_quote_rules_are_linear_on_long_lines(text: str) -> None:
         pytest.param(CLIENT + " \\\n" + "-u a:b \\\n" * (LONG // 9), id="continued-lines"),
         pytest.param("docker " * (LONG // 7), id="docker-words"),
         pytest.param("docker" + " " * LONG, id="docker-then-spaces"),
+        pytest.param(CLIENT + " " + "a.-" * (LONG // 3), id="dot-dash-run-in-context"),
     ],
 )
 def test_command_context_rules_are_linear_on_long_lines(text: str) -> None:
     started = time.perf_counter()
     re_.redact_shapes(text)
     assert time.perf_counter() - started < 1.0
+
+
+def best_of_three(text: str) -> float:
+    """The fastest of three timed Layer 1 passes over `text`."""
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        re_.redact_shapes(text)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+@pytest.mark.parametrize(
+    ("prefix", "unit"),
+    [
+        pytest.param("", "a.-", id="dot-dash"),
+        pytest.param("", "v1.-rc", id="version-dot-dash"),
+        pytest.param(CLIENT + " ", "a.-", id="dot-dash-in-context"),
+    ],
+)
+def test_layer1_time_grows_linearly_with_the_input(prefix: str, unit: str) -> None:
+    """Four times the input may take at most eight times as long, plus 50 ms.
+
+    A linear pass takes about four times as long and a quadratic one about sixteen, so the bound
+    also holds on a slow runner, where a fixed number of seconds would not.
+    """
+    small = prefix + unit * (LONG // 4 // len(unit))
+    big = prefix + unit * (LONG // len(unit))
+    assert best_of_three(big) < 8 * best_of_three(small) + 0.05

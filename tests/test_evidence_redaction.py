@@ -263,6 +263,9 @@ def must_fail_lines() -> dict[str, str]:
         "http-client-long-user": CLIENT + f" --user bob:{value} http://x",
         "registry-login": f"docker login -u bob -p {value} registry.example",
         "registry-login-after-mkdir": f"mkdir -p /tmp/x && docker login -u bob -p {value} reg",
+        # G-01-1: a secret flag glued after a dot is still reported.
+        "flag-after-ellipsis": f"...--password {value} -h db",
+        "flag-after-abbreviation": f"e.g.--token {value}",
     }
 
 
