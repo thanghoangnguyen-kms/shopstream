@@ -232,3 +232,122 @@ def test_every_env_example_key_is_reported_when_unmasked(tmp_path: Path, name: s
     assert evidence_violations(tmp_path) == [
         "docs/evidence/w-test.md:1: credential-named field is not REDACTED"
     ]
+
+
+def must_fail_lines() -> dict[str, str]:
+    """Raw lines the gate must report: the shapes reproduced in review (CR-01, WR-01, WR-02)."""
+    value = secrets.token_hex(8)
+    first, second = secrets.token_hex(6), secrets.token_hex(6)
+    return {
+        "query-string": f"http://h/x?user=bob&password={value}",
+        "logfmt-message": f'level=error msg="connect failed password={value} host=x"',
+        "curl-header": f"curl -H 'Authorization: Bearer {value}' http://x",
+        "cookie": f"Cookie: session={value}; theme=dark",
+        "space-separated-flag": f"postgres --password {value} -h db",
+        "partially-masked": f"password: REDACTED {first} {second}",
+        "bare-bearer": f"using Bearer {value} now",
+        "dsn-password-with-at": f"postgresql://u:{first}@{second}@host/db",
+        "comma-in-value": f"PGPASSWORD={first},{second}",
+    }
+
+
+def must_pass_texts() -> dict[str, str]:
+    """Field names, prose and exact masks the gate must not report. A value may span lines."""
+    certificate_body = base64.b64encode(secrets.token_bytes(48)).decode()
+    return {
+        "unique-key": "unique_key: order_id",
+        "signed-headers": "SignedHeaders=host;x-amz-date",
+        "amz-date": "X-Amz-Date=20260930T000000Z",
+        "signature-version": "signature_version: s3v4",
+        "password-stdin": "docker login --password-stdin",
+        "no-password": "psql --no-password -h db",
+        "certificate-block": f"-----BEGIN CERTIFICATE-----\n{certificate_body}\n-----END CERTIFICATE-----",
+        "authorization-prose": "The Authorization header carries a SigV4 signature.",
+        "authorization-endpoint": "authorization_endpoint: http://127.0.0.1:8181/x",
+        "partition-key": "partition key: 7",
+        "bearer-of-news": "a bearer of news",
+        "mask-with-trailing-spaces": "password: REDACTED   ",
+        "masked-authorization": "Authorization: REDACTED",
+        "masked-bearer": "Bearer REDACTED",
+    }
+
+
+def fake_paths(root: Path) -> tuple[Path, Path]:
+    home = root / "fake-home" / "someone"
+    return home / "Code" / "shopstream", home
+
+
+MUST_FAIL = must_fail_lines()
+MUST_PASS = must_pass_texts()
+
+
+@pytest.mark.parametrize("raw", MUST_FAIL.values(), ids=MUST_FAIL.keys())
+def test_reproduced_leak_shapes_fail_raw_and_pass_redacted(tmp_path: Path, raw: str) -> None:
+    repo, home = fake_paths(tmp_path)
+    raw_root, clean_root = tmp_path / "raw", tmp_path / "clean"
+    write_evidence(raw_root, raw + "\n")
+    write_evidence(clean_root, redact_evidence.redact(raw, [], repo, home) + "\n")
+    assert [item for item in evidence_violations(raw_root) if ":1:" in item]
+    assert evidence_violations(clean_root) == []
+
+
+def test_a_pem_private_key_reports_each_body_line(tmp_path: Path) -> None:
+    body = [base64.b64encode(secrets.token_bytes(48)).decode() for _ in range(2)]
+    text = "\n".join(["-----BEGIN PRIVATE KEY-----", *body, "-----END PRIVATE KEY-----"]) + "\n"
+    write_evidence(tmp_path / "raw", text)
+    assert evidence_violations(tmp_path / "raw") == [
+        f"docs/evidence/w-test.md:{number}: PEM private key is not REDACTED" for number in (2, 3)
+    ]
+    write_evidence(tmp_path / "clean", redact_evidence.redact_shapes(text))
+    assert evidence_violations(tmp_path / "clean") == []
+
+
+@pytest.mark.parametrize("text", MUST_PASS.values(), ids=MUST_PASS.keys())
+def test_field_names_and_prose_pass(tmp_path: Path, text: str) -> None:
+    write_evidence(tmp_path, text + "\n")
+    assert evidence_violations(tmp_path) == []
+
+
+def test_a_partially_masked_value_is_reported(tmp_path: Path) -> None:
+    write_evidence(tmp_path, f"password: REDACTED {secrets.token_hex(4)} {secrets.token_hex(4)}\n")
+    assert evidence_violations(tmp_path) == [
+        "docs/evidence/w-test.md:1: credential-named field is not REDACTED"
+    ]
+
+
+@pytest.mark.parametrize("name", ["API_KEY", "api-key", "apiKey", "Api.Key"])
+def test_credential_names_match_across_case_and_separators(tmp_path: Path, name: str) -> None:
+    write_evidence(tmp_path, f"{name}={secrets.token_hex(8)}\n")
+    assert evidence_violations(tmp_path) == [
+        "docs/evidence/w-test.md:1: credential-named field is not REDACTED"
+    ]
+
+
+def test_line_numbers_count_newlines_only(tmp_path: Path) -> None:
+    write_evidence(tmp_path, f"page\x0cbreak\ntoken: {secrets.token_hex(8)}\n", "w-lines.md")
+    assert evidence_violations(tmp_path) == [
+        "docs/evidence/w-lines.md:2: credential-named field is not REDACTED"
+    ]
+
+
+def test_an_empty_evidence_file_has_no_violations(tmp_path: Path) -> None:
+    write_evidence(tmp_path, "")
+    assert evidence_violations(tmp_path) == []
+
+
+def test_a_masked_dsn_is_not_an_email(tmp_path: Path) -> None:
+    write_evidence(tmp_path, "postgresql://lakekeeper:REDACTED@db.example.com/lakekeeper\n")
+    assert evidence_violations(tmp_path) == []
+    write_evidence(tmp_path, "reach me at someone@example.com\n")
+    assert evidence_violations(tmp_path) == ["docs/evidence/w-test.md:1: email address"]
+
+
+def test_gate_flags_exactly_what_the_redactor_would_change() -> None:
+    samples = [*MUST_FAIL.values(), *MUST_PASS.values()]
+    assert any(redact_evidence.redact_shapes(sample) != sample for sample in MUST_FAIL.values())
+    for sample in samples:
+        for line in sample.split("\n"):
+            shape_reasons = [r for r in line_violations(line) if r.endswith("is not REDACTED")]
+            assert bool(shape_reasons) == (redact_evidence.redact_shapes(line) != line), line
+        whole = bool(redact_evidence.shape_findings(sample))
+        assert whole == (redact_evidence.redact_shapes(sample) != sample), sample
