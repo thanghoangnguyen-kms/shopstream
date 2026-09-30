@@ -7,10 +7,13 @@ Every capture for docs/evidence passes through this filter first:
 The pipeline is three ordered layers, so a secret that contains a path fragment is masked
 whole before any path is rewritten:
 
-1. Shapes: credential-named values (JSON, YAML, properties, KEY=value, dict repr, `=>`),
-   DSN passwords, STS XML secret elements, auth headers and JWTs. A non-secret pair never hides
-   a credential that follows it (`user=bob&password=X` masks X), and a secret value is masked
-   whole, however many words, separators or escaped quotes it holds.
+1. Shapes: eight passes, always in this order: PEM private key, auth header, bearer token,
+   credential-named field (JSON, YAML, properties, KEY=value, dict repr, `=>`), secret CLI
+   flag, DSN password, XML credential element, JWT-shaped string. A non-secret pair never
+   hides a credential that follows it (`user=bob&password=X` masks X), and a secret value is
+   masked whole, however many words, separators or escaped quotes it holds. SHAPES is the one
+   rule the evidence gate reuses through `shape_findings`, so the gate and the redactor can't
+   drift apart. No pass adds or removes a line.
 2. Literals: every value in infra/.env of length 8 or more, longest first. It runs only
    when that file exists.
 3. Paths: the repo root becomes `<repo>` and the home directory becomes `<home>`.
@@ -300,6 +303,31 @@ def redact_shapes(text: str) -> str:
     for _reason, mask in SHAPES:
         text = mask(text)
     return text
+
+
+def shape_findings(text: str) -> list[tuple[int, str]]:
+    """The 1-based line number and reason for every line a Layer 1 pass would change.
+
+    The passes run in SHAPES order on a running copy of the text, exactly as `redact_shapes`
+    does. The result is sorted by line, keeping SHAPES order within a line. A pass that adds or
+    removes a line raises ValueError naming the pass, never a value.
+    """
+    findings: list[tuple[int, str]] = []
+    current = text
+    for reason, mask in SHAPES:
+        masked = mask(current)
+        if masked.count("\n") != current.count("\n"):
+            raise ValueError(f"shape pass {reason} changed the line count")
+        if masked != current:
+            pairs = zip(current.split("\n"), masked.split("\n"), strict=True)
+            findings.extend(
+                (number, reason)
+                for number, (before, after) in enumerate(pairs, start=1)
+                if before != after
+            )
+        current = masked
+    findings.sort(key=lambda finding: finding[0])
+    return findings
 
 
 def redact_literals(text: str, values: Iterable[str]) -> str:

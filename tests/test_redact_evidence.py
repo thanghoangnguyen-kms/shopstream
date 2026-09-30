@@ -9,11 +9,12 @@ import base64
 import io
 import secrets
 import string
+import time
 from pathlib import Path
 
 import pytest
 import redact_evidence as re_
-from dotenv_lite import DEFAULT_ENV_FILE, REPO_ROOT
+from dotenv_lite import DEFAULT_ENV_FILE, REPO_ROOT, parse_dotenv
 
 MASK = re_.REDACTED
 
@@ -539,3 +540,95 @@ def test_multi_line_xml_elements_keep_their_lines() -> None:
 
 def test_shapes_run_in_the_documented_order() -> None:
     assert [reason for reason, _ in re_.SHAPES] == SHAPE_ORDER
+
+
+def corpus_lines() -> list[str]:
+    """Every reproduced leak shape, filled with fresh runtime values, one or more lines each."""
+    lines = [fill(template)[0] for _, template, _ in [*NESTED_CASES, *SHAPE_CASES]]
+    begin, end = pem_line("BEGIN", "PRIVATE KEY"), pem_line("END", "PRIVATE KEY")
+    lines += [begin, *pem_body(), end]
+    lines += fill("<SessionToken>\n${v}\n</SessionToken>")[0].split("\n")
+    lines += [
+        "SignedHeaders=host;x-amz-date",
+        "unique_key: order_id",
+        "password=&user=bob",
+        "Authorization:",
+    ]
+    return lines
+
+
+def test_shape_findings_reports_the_line_and_reason() -> None:
+    assert re_.shape_findings(f"fine\ntoken: {hexval()}\n") == [(2, "credential-named field")]
+
+
+def test_shape_findings_numbers_each_pem_body_line() -> None:
+    body = pem_body()
+    begin, end = pem_line("BEGIN", "PRIVATE KEY"), pem_line("END", "PRIVATE KEY")
+    text = "\n".join(["before", begin, *body, end, "after"]) + "\n"
+    assert re_.shape_findings(text) == [(3, "PEM private key"), (4, "PEM private key")]
+
+
+def test_shape_findings_of_redacted_text_is_empty() -> None:
+    redacted = re_.redact_shapes("\n".join(corpus_lines()) + "\n")
+    assert re_.shape_findings(redacted) == []
+    assert re_.shape_findings(f"token: {MASK}\n") == []
+
+
+def test_shape_findings_reports_every_reason_on_a_line() -> None:
+    a, b = hexval(), hexval()
+    text = f"postgresql://u:{a}@host/db Authorization: Bearer {b}\n"
+    assert re_.shape_findings(text) == [(1, "auth header"), (1, "DSN password")]
+
+
+def test_shape_findings_rejects_a_pass_that_changes_the_line_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(re_, "SHAPES", (("line inserter", lambda text: text + "\n"),))
+    with pytest.raises(ValueError, match="line inserter"):
+        re_.shape_findings("one line\n")
+
+
+def test_the_whole_corpus_is_idempotent_and_keeps_its_lines(tmp_path: Path) -> None:
+    home = tmp_path / "home" / "someone"
+    repo = home / "Code" / "shopstream"
+    lines = corpus_lines()
+    for text in ["\n".join(lines) + "\n", *lines]:
+        once = re_.redact(text, [], repo, home)
+        assert re_.redact(once, [], repo, home) == once
+        assert re_.redact_shapes(text).count("\n") == text.count("\n")
+
+
+ENV_EXAMPLE_KEYS = list(
+    parse_dotenv((REPO_ROOT / "infra" / ".env.example").read_text(encoding="utf-8"))
+)
+
+
+@pytest.mark.parametrize("key", ENV_EXAMPLE_KEYS)
+def test_every_env_example_key_is_masked_by_layer1_alone(key: str) -> None:
+    value = hexval()
+    out = re_.redact_shapes(f"{key}={value}")
+    assert value not in out
+    assert out == f"{key}={MASK}"
+
+
+LONG = 64 * 1024
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("x" * LONG, id="no-separator"),
+        pytest.param("a=1&" * (LONG // 4), id="non-secret-pairs"),
+        pytest.param("a" * LONG + ":", id="name-run-then-colon"),
+        pytest.param("password=a&" * (LONG // 11), id="secret-pairs"),
+        pytest.param("--password " * (LONG // 11), id="secret-flags"),
+        pytest.param("Bearer " * (LONG // 7), id="bearer-words"),
+        pytest.param("<" + "Token" * (LONG // 5), id="xml-tag-run"),
+        pytest.param("a://:" + "@" * LONG, id="dsn-at-run"),
+        pytest.param("a://:x@" * (LONG // 7), id="dsn-repeats"),
+    ],
+)
+def test_layer1_is_linear_on_long_lines(text: str) -> None:
+    started = time.perf_counter()
+    re_.redact_shapes(text)
+    assert time.perf_counter() - started < 1.0
