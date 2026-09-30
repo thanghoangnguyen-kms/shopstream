@@ -19,6 +19,16 @@ dev = [
   "types-pyyaml==6.0.12.20260906",
   "zizmor==1.30.1",
 ]
+spike = [
+    "boto3==1.43.103",
+    "confluent-kafka==2.15.1",
+    "dlt==1.30.0",
+    "fastavro==1.12.2",
+    "pandas==3.0.6",
+    "polars==1.44.2",
+    "psycopg[binary]==3.3.6",
+    "pyarrow==25.0.1",
+]
 
 [tool.uv]
 package = false
@@ -44,12 +54,39 @@ ignore = ["E501"]
 "packages/*/tests/**" = ["S101", "S603", "S607"]
 # REPO_TOKEN and HOME_TOKEN hold the <repo> and <home> placeholders, not secrets.
 "scripts/redact_evidence.py" = ["S105"]
+# These scripts run fixed argv lists (docker, git) or a loopback health probe, never shell strings.
+"scripts/stack.py" = ["S603", "S607"]
+"scripts/mem_report.py" = ["S603", "S607"]
+"scripts/lakekeeper_bootstrap.py" = ["S310"]
 
 [tool.mypy]
 python_version = "3.13"
 strict = true
 files = ["packages", "scripts", "tests"]
 mypy_path = ["scripts"]
+
+# The spike probe clients (uv group `spike`) ship no stubs and are not installed in CI.
+[[tool.mypy.overrides]]
+module = [
+  "boto3",
+  "boto3.*",
+  "botocore.*",
+  "polars",
+  "polars.*",
+  "pandas",
+  "pandas.*",
+  "pyarrow",
+  "pyarrow.*",
+  "dlt",
+  "dlt.*",
+  "psycopg",
+  "psycopg.*",
+  "confluent_kafka",
+  "confluent_kafka.*",
+  "fastavro",
+  "fastavro.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib", "-ra", "--strict-markers"]
