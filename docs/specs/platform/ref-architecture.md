@@ -3,9 +3,9 @@ title: "Shopstream: Reference Architecture"
 type: ref
 status: Proposed
 owner: platform
-version: 1.0.1
+version: 1.0.2
 created: 2026-09-24
-updated: 2026-09-29
+updated: 2026-09-30
 informs:
   - ../guide/guide-doc-style.md
 ---
@@ -27,7 +27,7 @@ The rest of the corpus uses these names. Where a thing has two names, the one de
 
 | Term                           | Means                                                                                                                                                                                                                                        |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| bronze                         | The raw landing namespace, all Iceberg v2. The Iceberg sink only appends to its CDC and clickstream tables (G3), which keep one row per Kafka record with the Debezium `op` retained; dlt writes `bronze.fx_rates` idempotently.            |
+| bronze                         | The raw landing namespace, all Iceberg v2. The Iceberg sink only appends to its CDC and clickstream tables (G3), which keep one row per non-null Kafka record (a tombstone lands no row) with the Debezium `op` retained; dlt writes `bronze.fx_rates` idempotently.            |
 | silver                         | The cleaned namespace dbt builds from bronze: current-state entity tables with CDC changes applied in source order, deletes included, plus clickstream staging. Iceberg v3, because every model sets `format-version=3` (G1).              |
 | gold                           | The published Kimball namespace: conformed dimensions (`dim_customer` as SCD2, `dim_product`, `dim_date`) and facts at a declared grain (`fct_orders`, `fct_order_items`, `fct_payments`). The only namespace `reader-agent` can read.     |
 | gold_candidate                 | The namespace dbt builds the next gold into. Nothing reads it except the publish checks.                                                                                                                                                    |
