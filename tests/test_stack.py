@@ -311,6 +311,63 @@ def test_a_concurrent_first_run_is_topped_up_never_clobbered(
     assert sandbox.env_file.read_text(encoding="utf-8") == winner_text
 
 
+def test_up_from_a_copy_of_the_example_fills_every_value_and_renders_the_identity(
+    sandbox: Sandbox, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sandbox.env_file.write_bytes(stack.ENV_EXAMPLE.read_bytes())
+    sandbox.env_file.chmod(0o644)
+    assert stack.main(["up"]) == 0
+    assert stat.S_IMODE(sandbox.env_file.stat().st_mode) == 0o600
+    text = sandbox.env_file.read_text(encoding="utf-8")
+    values = parse_dotenv(text)
+    assert list(values) == KEYS
+    for key, value in values.items():
+        assert (CANARY if key == "CANARY_TOKEN" else HEX64).match(value), key
+    assert len(set(values.values())) == len(KEYS)
+    comments = [line for line in text.splitlines() if line.startswith("#")]
+    assert comments == [line for line in EXAMPLE.splitlines() if line.startswith("#")]
+    assert isinstance(json.loads(sandbox.identity_file.read_text(encoding="utf-8")), dict)
+    assert len(sandbox.calls) == 3
+    captured = capsys.readouterr()
+    for value in values.values():
+        assert value not in captured.out + captured.err
+
+
+def test_init_env_fills_every_empty_value_of_a_copied_example() -> None:
+    text, added = stack.init_env(EXAMPLE, EXAMPLE)
+    assert added == KEYS
+    values = parse_dotenv(text)
+    assert list(values) == KEYS
+    assert all(values.values())
+
+
+def test_init_env_fills_an_empty_value_in_place_and_keeps_set_values_byte_for_byte() -> None:
+    kept = secrets.token_hex(8)
+    existing = f"{KEYS[0]}={kept}\n{KEYS[1]}=\n"
+    text, added = stack.init_env(EXAMPLE, existing)
+    assert added == KEYS[1:]
+    lines = text.splitlines(keepends=True)
+    assert lines[0] == f"{KEYS[0]}={kept}\n"
+    assert lines[1].startswith(f"{KEYS[1]}=")
+    assert lines[1].endswith("\n")
+    assert len([line for line in lines if line.startswith(f"{KEYS[1]}=")]) == 1
+    values = parse_dotenv(text)
+    assert values[KEYS[0]] == kept
+    assert values[KEYS[1]]
+    assert list(values) == KEYS
+
+
+def test_sync_env_makes_an_existing_complete_file_private_without_changing_it(
+    sandbox: Sandbox,
+) -> None:
+    complete, _ = stack.init_env(EXAMPLE, "")
+    sandbox.env_file.write_text(complete, encoding="utf-8")
+    sandbox.env_file.chmod(0o644)
+    assert stack.sync_env() == []
+    assert sandbox.env_file.read_text(encoding="utf-8") == complete
+    assert stat.S_IMODE(sandbox.env_file.stat().st_mode) == 0o600
+
+
 # --- the identity file -----------------------------------------------------------------------
 
 
