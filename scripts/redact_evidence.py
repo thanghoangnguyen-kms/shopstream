@@ -125,19 +125,20 @@ HEADER = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 BEARER = re.compile(r"(?<![A-Za-z0-9_\-])(?P<pre>Bearer[ \t]+)(?P<token>[A-Za-z0-9._~+/=\-]{8,})")
+# A flag match starts only at the beginning of a run of flag characters, the flag body's own
+# class, so each run is scanned a bounded number of times (as NAME_SEP does).
+FLAG_START = r"(?<![A-Za-z0-9_.\-])"
+# The run before its first flag, when the run does not begin with one (`...--password`,
+# `e.g.--token`). It is lazy and atomic: it stops at the first `.` that a flag follows and never
+# backtracks, so the flag it leaves is the one an unbounded scan of the run would judge first.
+FLAG_LEAD = r"(?P<lead>(?:(?!--?[A-Za-z])(?>[A-Za-z0-9_.\-]*?\.(?=--?[A-Za-z])))?)"
+FLAG_VALUE = r"""(?:"(?:[^"\\\r\n]|\\.)*"|'(?:[^'\r\n]|'')*+'|["'][^\r\n]*|[^\s\-]\S*)"""
 FLAG = re.compile(
-    r"""
-    (?<![A-Za-z0-9_\-])
-    (?P<flag>--?[A-Za-z][A-Za-z0-9_.\-]*)
-    (?P<gap>[ \t]+)
-    (?P<value>
-        "(?:[^"\\\r\n]|\\.)*"
-        |'(?:[^'\r\n]|'')*+'
-        |["'][^\r\n]*
-        |[^\s\-]\S*
-    )
-    """,
-    re.VERBOSE,
+    FLAG_START
+    + FLAG_LEAD
+    + r"(?P<flag>--?[A-Za-z][A-Za-z0-9_.\-]*)(?P<gap>[ \t]+)(?P<value>"
+    + FLAG_VALUE
+    + ")"
 )
 PEM = re.compile(
     r"""
@@ -291,26 +292,29 @@ def command_end(pattern: re.Pattern[str], line: str) -> int | None:
 def flag_replacement(match: re.Match[str], curl_end: int | None, login_end: int | None) -> str:
     """The masked form of one `flag value` match, or the match itself when it is not a secret.
 
-    `curl_end` and `login_end` are where the HTTP client word or the registry login words end on
-    this line (0 when the command began on an earlier, backslash-continued line), or None when
-    the line has no such command. The short flags `-u`, `--user` and `-p` are secret only when
-    they come after that command; every other flag is judged by its name.
+    A masked result keeps the match's lead, the text before its flag. `curl_end` and `login_end`
+    are where the HTTP client word or the registry login words end on this line (0 when the
+    command began on an earlier, backslash-continued line), or None when the line has no such
+    command. The short flags `-u`, `--user` and `-p` are secret only when they come after that
+    command; every other flag is judged by its name.
     """
+    lead = match["lead"]
     flag = match["flag"]
     value = match["value"]
+    start = match.start("flag")
     quote = value[0] if value[0] in "\"'" else ""
     closing = quote if len(value) > 1 and value.endswith(quote) else ""
-    if flag in CLIENT_USER_FLAGS and curl_end is not None and match.start() >= curl_end:
+    if flag in CLIENT_USER_FLAGS and curl_end is not None and start >= curl_end:
         user, colon, password = value[len(quote) : len(value) - len(closing)].partition(":")
         if not colon or not password.strip():
             return match[0]
-        return f"{flag}{match['gap']}{quote}{user}:{REDACTED}{closing}"
-    if flag in LOGIN_SECRET_FLAGS and login_end is not None and match.start() >= login_end:
-        return f"{flag}{match['gap']}{quote}{REDACTED}{closing}"
+        return f"{lead}{flag}{match['gap']}{quote}{user}:{REDACTED}{closing}"
+    if flag in LOGIN_SECRET_FLAGS and login_end is not None and start >= login_end:
+        return f"{lead}{flag}{match['gap']}{quote}{REDACTED}{closing}"
     name = flag.lstrip("-")
     if name.startswith("no-") or not is_secret_name(name):
         return match[0]
-    return f"{flag}{match['gap']}{quote}{REDACTED}{closing}"
+    return f"{lead}{flag}{match['gap']}{quote}{REDACTED}{closing}"
 
 
 def mask_flags(text: str) -> str:
