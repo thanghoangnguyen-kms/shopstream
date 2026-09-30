@@ -18,7 +18,8 @@ whole before any path is rewritten:
    also covers dbt's DBT_ENV_SECRET_ prefix and a last name segment of pass or pwd, and a
    single-quoted value may hold a doubled quote (`'it''s'`). SHAPES is the one
    rule the evidence gate reuses through `shape_findings`, so the gate and the redactor can't
-   drift apart. No pass adds or removes a line.
+   drift apart. No pass adds or removes a line. Every pass is linear in its input, because each
+   pattern starts a match only at the beginning of a run of its own characters.
 2. Literals: every value in infra/.env of length 8 or more, longest first. It runs only
    when that file exists.
 3. Paths: the repo root becomes `<repo>` and the home directory becomes `<home>`.
@@ -155,7 +156,17 @@ LOGIN_COMMAND = re.compile(r"(?<![\w.\-])(?:docker|podman|nerdctl)[ \t]+login(?!
 CLIENT_USER_FLAGS = frozenset({"-u", "--user"})
 LOGIN_SECRET_FLAGS = frozenset({"-p"})
 LINE_BREAK = re.compile(r"(\r\n|\n|\r)")
-JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
+# A JWT match starts only at the beginning of a run of its own characters, so a long run is
+# scanned once. The lead keeps a JWT glued after a dash (`id-eyJ...`) masked: it is the run
+# before the first `-eyJ`, and is empty when the run begins with `eyJ`.
+JWT = re.compile(
+    r"""
+    (?<![A-Za-z0-9_\-])
+    (?P<lead>(?:(?!eyJ)(?>[A-Za-z0-9_\-]*?-(?=eyJ)))?)
+    eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*
+    """,
+    re.VERBOSE,
+)
 
 
 def is_secret_name(name: str) -> bool:
@@ -355,7 +366,7 @@ def mask_xml_elements(text: str) -> str:
 
 
 def mask_jwt(text: str) -> str:
-    return JWT.sub(REDACTED, text)
+    return JWT.sub(lambda m: f"{m['lead']}{REDACTED}", text)
 
 
 # Layer 1, in the one order it runs. The reason is the text the evidence gate prints.
