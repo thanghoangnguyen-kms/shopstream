@@ -812,3 +812,25 @@ def test_violation_lists_are_sorted(git_repo: Path) -> None:
     for name, check in CHECKS.items():
         result = check(git_repo)
         assert result == sorted(result), name
+
+
+README_RUNTIME_STRINGS = (
+    "Colima",
+    "Apple Virtualization",
+    "virtiofs",
+    "12 GiB",
+    "colima start --vm-type vz --memory 12 --cpu 4",
+    "just up",
+    "just down",
+)
+
+
+def test_readme_names_the_container_runtime() -> None:
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    missing = [text for text in README_RUNTIME_STRINGS if text not in readme]
+    assert missing == []
+
+
+def test_agents_repo_map_lists_infra() -> None:
+    agents = (REPO / "AGENTS.md").read_text(encoding="utf-8")
+    assert "| `infra/`" in agents

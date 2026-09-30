@@ -6,7 +6,7 @@ An enterprise-grade open lakehouse that runs on a 16 GB laptop, built in public 
 
 The point is **proof, not components**. Every week ends with a test, CI gate or `just` command that turns a claim into evidence.
 
-> **Status: Week 1 of 23 (repo foundations).** Only the foundations below exist so far; the roadmap says when the rest lands.
+> **Status: Week 2 of 23 (feasibility spike).** The repo foundations and a local Docker stack exist so far; the roadmap says when the rest lands.
 
 ## Quick start
 
@@ -19,6 +19,16 @@ uv sync && uv run just setup
 uv run just check
 ```
 
+To run the local stack you also need [Colima](https://github.com/abiosoft/colima) on the Apple Virtualization framework: a `vz` VM with virtiofs mounts, 12 GiB of memory and 4 CPUs. Colima's default 2 GiB VM can't hold the stack's memory budget. Colima 0.10 mounts a `vz` VM with virtiofs by default, so no mount flag is needed.
+
+```bash
+colima start --vm-type vz --memory 12 --cpu 4
+uv run just up
+uv run just down
+```
+
+`just up` refuses a VM under 12 GiB, and `just down --volumes` also deletes the data volumes. That start command keeps Colima's default VM disk (100 GiB in Colima 0.10; the spike's own VM runs a 40 GiB disk). ADR-001 item 12 projects the spike's disk use against the VM's disk, and `colima start --disk <GiB>` grows an existing VM's disk.
+
 ## What's here now
 
 - **One lockfile for every tool:** a uv workspace on Python 3.13, with ruff, sqlfluff, mypy, zizmor, pytest, prek and just pinned in `uv.lock`.
@@ -26,6 +36,7 @@ uv run just check
 - **Four required checks:** `lint`, `test`, `secrets` (full-history gitleaks) and `pr-title` (Conventional Commits). Every action is pinned to a full commit SHA.
 - **Gates that are proven to fail:** tests plant a fake secret, break the docs conventions on purpose and feed bad PR titles, and each one must go red.
 - **Renovate** keeps pins current, with a 3-day minimum release age.
+- **A local stack and evidence guardrails:** `just up` starts Postgres, Lakekeeper, SeaweedFS and Frankfurter with loopback-only ports and secrets generated into a git-ignored `infra/.env`. Evidence captures pass through a redactor, a pre-commit hook rejects the erasure canary token, and `just mem-report` checks the stack's memory against its budget.
 - **A documentation system** with enforced frontmatter, owner roles and MADR decision records: start at [docs/README.md](docs/README.md) and [ADR-000](docs/adr/adr-000-record-architecture-decisions.md).
 
 ## Roadmap
