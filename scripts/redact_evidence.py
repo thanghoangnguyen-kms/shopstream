@@ -25,7 +25,7 @@ import argparse
 import os
 import re
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 from dotenv_lite import DEFAULT_ENV_FILE, REPO_ROOT, DotenvError, read_dotenv
@@ -81,15 +81,54 @@ TO_QUOTE_OR_LINE_END = re.compile(r"""[^\r\n"']*""")
 PAIR_JOIN = re.compile(r"[&;](?=[A-Za-z0-9_.\-]+=)")
 TO_TERMINATOR = re.compile(r"""[^\s&;,"'}\])]*""")
 EMPTY_TERMINATORS = "&;,}])"
-DSN = re.compile(r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)(?P<pw>[^\s@/]+)(?=@)")
-XML = re.compile(
-    r"(?P<open><(?P<tag>[A-Za-z]*(?:Secret|Token|Password|Credential|AccessKey)[A-Za-z]*)>)"
-    r"(?P<v>[^<]+)(?P<close></(?P=tag)>)"
+DSN = re.compile(
+    r"""
+    (?<![a-zA-Z0-9+.\-])
+    (?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]*:)
+    (?P<pw>[^\s/]+)
+    (?=@[^@\s/"']*(?:[/?\#\s"',;)\]}]|$))
+    """,
+    re.VERBOSE | re.MULTILINE,
 )
+XML = re.compile(r"(?P<open><(?P<tag>[A-Za-z]+)>)(?P<v>[^<]+)(?P<close></(?P=tag)>)")
+XML_SECRET_TAG = re.compile(r"Secret|Token|Password|Credential|AccessKey")
 HEADER = re.compile(
-    r"(?im)^(?P<k>[ \t]*(?:authorization|x-amz-security-token|x-amz-signature|x-api-key)"
-    r"[ \t]*:[ \t]*)(?P<v>.+)$"
+    r"""
+    (?<![A-Za-z0-9_\-])
+    (?P<pre>
+        (?P<q>["'])?
+        (?:proxy-authorization|authorization|set-cookie|cookie
+           |x-amz-security-token|x-amz-signature|x-api-key)
+        [ \t]*:[ \t]*
+    )
+    (?(q)(?P<qv>(?:(?!(?P=q))[^\r\n])*)|(?P<v>[^\r\n]*))
+    """,
+    re.VERBOSE | re.IGNORECASE,
 )
+BEARER = re.compile(r"(?<![A-Za-z0-9_\-])(?P<pre>Bearer[ \t]+)(?P<token>[A-Za-z0-9._~+/=\-]{8,})")
+FLAG = re.compile(
+    r"""
+    (?<![A-Za-z0-9_\-])
+    (?P<flag>--?[A-Za-z][A-Za-z0-9_.\-]*)
+    (?P<gap>[ \t]+)
+    (?P<value>
+        "(?:[^"\\\r\n]|\\.)*"
+        |'[^'\r\n]*'
+        |["'][^\r\n]*
+        |[^\s\-]\S*
+    )
+    """,
+    re.VERBOSE,
+)
+PEM = re.compile(
+    r"""
+    (?P<begin>-----BEGIN[ ](?P<label>(?:[A-Z]+[ ])*PRIVATE[ ]KEY(?:[ ]BLOCK)?)-----)
+    (?P<body>.*?)
+    (?P<end>-----END[ ](?P=label)-----|\Z)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+LINE_BREAK = re.compile(r"(\r\n|\n|\r)")
 JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
 
 
@@ -172,19 +211,95 @@ def mask_key_values(text: str) -> str:
     return "".join(pieces)
 
 
-def mask_xml(match: re.Match[str]) -> str:
-    if not match.group("v").strip():
-        return match.group(0)
-    return f"{match.group('open')}{REDACTED}{match.group('close')}"
+def mask_lines(body: str) -> str:
+    """Replace the content of every non-blank line with REDACTED, keeping each line ending."""
+    parts = LINE_BREAK.split(body)
+    for index in range(0, len(parts), 2):
+        line = parts[index]
+        content = line.strip()
+        if content:
+            lead = line[: len(line) - len(line.lstrip())]
+            trail = line[len(line.rstrip()) :]
+            parts[index] = f"{lead}{REDACTED}{trail}"
+    return "".join(parts)
+
+
+def mask_pem(text: str) -> str:
+    """Mask every body line of a PEM private key, from its BEGIN line to its END line or the end."""
+    return PEM.sub(lambda m: f"{m['begin']}{mask_lines(m['body'])}{m['end']}", text)
+
+
+def header_replacement(match: re.Match[str]) -> str:
+    value = match["qv"] if match["q"] else match["v"]
+    content = value.rstrip(" \t")
+    if not content.strip():
+        return match[0]
+    return f"{match['pre']}{REDACTED}{value[len(content) :]}"
+
+
+def mask_headers(text: str) -> str:
+    """Mask the whole value of an auth or cookie header, wherever it sits on a line."""
+    return HEADER.sub(header_replacement, text)
+
+
+def mask_bearer(text: str) -> str:
+    """Mask a free-standing `Bearer <token>`, keeping the word Bearer."""
+    return BEARER.sub(lambda m: f"{m['pre']}{REDACTED}", text)
+
+
+def flag_replacement(match: re.Match[str]) -> str:
+    name = match["flag"].lstrip("-")
+    if name.startswith("no-") or not is_secret_name(name):
+        return match[0]
+    value = match["value"]
+    quote = value[0] if value[0] in "\"'" else ""
+    closing = quote if len(value) > 1 and value.endswith(quote) else ""
+    return f"{match['flag']}{match['gap']}{quote}{REDACTED}{closing}"
+
+
+def mask_flags(text: str) -> str:
+    """Mask the value of a space-separated secret flag (`--password X`, `--token "a b"`)."""
+    return FLAG.sub(flag_replacement, text)
+
+
+def mask_dsn(text: str) -> str:
+    """Mask a DSN password, which ends at the last `@` before the host."""
+    return DSN.sub(lambda m: f"{m['pre']}{REDACTED}", text)
+
+
+def xml_replacement(match: re.Match[str]) -> str:
+    if XML_SECRET_TAG.search(match["tag"]) is None:
+        return match[0]
+    return f"{match['open']}{mask_lines(match['v'])}{match['close']}"
+
+
+def mask_xml_elements(text: str) -> str:
+    """Mask the text of an STS-style credential element, keeping its line structure."""
+    return XML.sub(xml_replacement, text)
+
+
+def mask_jwt(text: str) -> str:
+    return JWT.sub(REDACTED, text)
+
+
+# Layer 1, in the one order it runs. The reason is the text the evidence gate prints.
+SHAPES: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("PEM private key", mask_pem),
+    ("auth header", mask_headers),
+    ("bearer token", mask_bearer),
+    ("credential-named field", mask_key_values),
+    ("secret CLI flag", mask_flags),
+    ("DSN password", mask_dsn),
+    ("XML credential element", mask_xml_elements),
+    ("JWT-shaped string", mask_jwt),
+)
 
 
 def redact_shapes(text: str) -> str:
     """Layer 1: mask values by shape, keeping quotes, separators and structure."""
-    text = mask_key_values(text)
-    text = DSN.sub(lambda m: f"{m.group('pre')}{REDACTED}", text)
-    text = XML.sub(mask_xml, text)
-    text = HEADER.sub(lambda m: f"{m.group('k')}{REDACTED}", text)
-    return JWT.sub(REDACTED, text)
+    for _reason, mask in SHAPES:
+        text = mask(text)
+    return text
 
 
 def redact_literals(text: str, values: Iterable[str]) -> str:

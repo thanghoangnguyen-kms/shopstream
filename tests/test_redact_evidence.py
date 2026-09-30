@@ -393,3 +393,149 @@ def test_nested_pairs_leave_non_secret_values_alone(line: str) -> None:
 )
 def test_empty_values_consume_nothing(text: str) -> None:
     assert re_.redact_shapes(text) == text
+
+
+# (id, raw template, expected output) for the header, bearer, flag and DSN leaks in WR-01, WR-02.
+SHAPE_CASES: list[tuple[str, str, str]] = [
+    (
+        "curl-single-quoted",
+        "curl -H 'Authorization: Bearer ${v}' http://x",
+        "curl -H 'Authorization: REDACTED' http://x",
+    ),
+    (
+        "curl-double-quoted",
+        'curl -H "Authorization: Bearer ${v}"',
+        'curl -H "Authorization: REDACTED"',
+    ),
+    (
+        "curl-verbose-sigv4",
+        "> Authorization: AWS4-HMAC-SHA256 Credential=${id}/20260930/us-east-1/s3/aws4_request,"
+        " SignedHeaders=host;x-amz-date, Signature=${v}",
+        "> Authorization: REDACTED",
+    ),
+    ("set-cookie", "< Set-Cookie: sid=${v}; Path=/; HttpOnly", "< Set-Cookie: REDACTED"),
+    ("cookie", "Cookie: session=${v}; theme=dark", "Cookie: REDACTED"),
+    ("proxy-authorization", "Proxy-Authorization: Basic ${v}", "Proxy-Authorization: REDACTED"),
+    ("bare-bearer", "using Bearer ${v} for the call", "using Bearer REDACTED for the call"),
+    ("flag-space", "postgres --password ${v} -h db", "postgres --password REDACTED -h db"),
+    ("flag-quoted", 'cli --token "${a} ${b}"', 'cli --token "REDACTED"'),
+    (
+        "dsn-at-in-password",
+        "postgresql://u:${a}@${b}@host:5432/db",
+        "postgresql://u:REDACTED@host:5432/db",
+    ),
+    ("dsn-empty-user", "redis://:${v}@cache:6379", "redis://:REDACTED@cache:6379"),
+]
+
+SHAPE_ORDER = [
+    "PEM private key",
+    "auth header",
+    "bearer token",
+    "credential-named field",
+    "secret CLI flag",
+    "DSN password",
+    "XML credential element",
+    "JWT-shaped string",
+]
+
+PEM_LABELS = [
+    "PRIVATE KEY",
+    "RSA PRIVATE KEY",
+    "EC PRIVATE KEY",
+    "OPENSSH PRIVATE KEY",
+    "ENCRYPTED PRIVATE KEY",
+]
+
+
+def pem_line(kind: str, label: str) -> str:
+    """A PEM marker line, built from parts so no full private-key marker pair sits in the source."""
+    return "-----" + kind + " " + label + "-----"
+
+
+def pem_body() -> list[str]:
+    """Two base64 lines from 48 random bytes (64 characters, so no `=` padding)."""
+    encoded = base64.b64encode(secrets.token_bytes(48)).decode()
+    return [encoded[:32], encoded[32:]]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [pytest.param(template, expected, id=name) for name, template, expected in SHAPE_CASES],
+)
+def test_header_bearer_flag_and_dsn_shapes_are_masked(template: str, expected: str) -> None:
+    raw, values = fill(template)
+    out = re_.redact_shapes(raw)
+    assert out == expected
+    for value in values:
+        assert value not in out
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "x-authorization-mode: none",
+        "authorization_endpoint: http://127.0.0.1:8181/x",
+        "Content-Type: text/xml",
+        "a bearer of news",
+        "Bearer short",
+        "docker login --password-stdin",
+        "psql --no-password -h db",
+        "pg_dump --host db",
+        "http://host:8080/x",
+        "Authorization:",
+        "Set-Cookie:   ",
+        "postgres --password",
+        "postgres --password\nnext line",
+    ],
+)
+def test_non_secret_headers_and_flags_are_left_alone(line: str) -> None:
+    assert re_.redact_shapes(line) == line
+
+
+@pytest.mark.parametrize("label", PEM_LABELS)
+def test_pem_private_key_bodies_are_masked_line_by_line(label: str) -> None:
+    body = pem_body()
+    begin, end = pem_line("BEGIN", label), pem_line("END", label)
+    raw = "\n".join(["before", begin, *body, end, "after"]) + "\n"
+    out = re_.redact_shapes(raw)
+    assert out == "\n".join(["before", begin, MASK, MASK, end, "after"]) + "\n"
+    assert not any(line in out for line in body)
+
+
+def test_a_pem_block_cut_off_before_its_end_line_is_masked_to_the_end() -> None:
+    body = pem_body()
+    begin = pem_line("BEGIN", "RSA PRIVATE KEY")
+    raw = "\n".join([begin, body[0], "", body[1]]) + "\n"
+    out = re_.redact_shapes(raw)
+    assert out == f"{begin}\n{MASK}\n\n{MASK}\n"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        pytest.param(
+            "-----BEGIN CERTIFICATE-----\n"
+            + "\n".join(pem_body())
+            + "\n-----END CERTIFICATE-----\n",
+            id="certificate",
+        ),
+        pytest.param(
+            pem_line("BEGIN", "PRIVATE KEY") + "\n" + pem_line("END", "PRIVATE KEY") + "\n",
+            id="empty-body",
+        ),
+    ],
+)
+def test_certificate_blocks_are_left_alone(block: str) -> None:
+    assert re_.redact_shapes(block) == block
+
+
+def test_multi_line_xml_elements_keep_their_lines() -> None:
+    raw, values = fill("<SessionToken>\n${v}\n</SessionToken>\n<Token>  \n</Token>\n")
+    out = re_.redact_shapes(raw)
+    assert out == "<SessionToken>\nREDACTED\n</SessionToken>\n<Token>  \n</Token>\n"
+    assert all(value not in out for value in values)
+    assert out.count("\n") == raw.count("\n")
+
+
+def test_shapes_run_in_the_documented_order() -> None:
+    assert [reason for reason, _ in re_.SHAPES] == SHAPE_ORDER
