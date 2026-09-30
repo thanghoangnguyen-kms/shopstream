@@ -42,6 +42,8 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S603", "S607"]
 "packages/*/tests/**" = ["S101", "S603", "S607"]
+# REPO_TOKEN and HOME_TOKEN hold the <repo> and <home> placeholders, not secrets.
+"scripts/redact_evidence.py" = ["S105"]
 
 [tool.mypy]
 python_version = "3.13"
