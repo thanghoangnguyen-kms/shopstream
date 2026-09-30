@@ -11,7 +11,9 @@ whole before any path is rewritten:
    credential-named field (JSON, YAML, properties, KEY=value, dict repr, `=>`), secret CLI
    flag, DSN password, XML credential element, JWT-shaped string. A non-secret pair never
    hides a credential that follows it (`user=bob&password=X` masks X), and a secret value is
-   masked whole, however many words, separators or escaped quotes it holds. SHAPES is the one
+   masked whole, however many words, separators or escaped quotes it holds. A credential name
+   also covers dbt's DBT_ENV_SECRET_ prefix and a last name segment of pass or pwd, and a
+   single-quoted value may hold a doubled quote (`'it''s'`). SHAPES is the one
    rule the evidence gate reuses through `shape_findings`, so the gate and the redactor can't
    drift apart. No pass adds or removes a line.
 2. Literals: every value in infra/.env of length 8 or more, longest first. It runs only
@@ -52,6 +54,13 @@ SECRET_SUFFIXES = (
     "authorization",
     "cookie",
 )
+# dbt scrubs every DBT_ENV_SECRET_ variable from its own logs, so the prefix marks a secret
+# whatever the tail is. Compared with separators removed, and checked before the exclusions.
+SECRET_NAME_PREFIXES = ("dbtenvsecret",)
+# A name whose LAST segment is one of these is a credential (`DB_PASS`, `dbPass`, `MYSQL_PWD`).
+# They are not SECRET_SUFFIXES, because an ending match would also mask `bypass` and `compass`.
+CREDENTIAL_SEGMENTS = frozenset({"pass", "pwd"})
+NAME_SEGMENT_SPLIT = re.compile(r"[_.\-]|(?<=[a-z0-9])(?=[A-Z])")
 # Names that end in "key" but are not secrets, compared with separators removed.
 NON_SECRET_KEY_SUFFIXES = (
     "primarykey",
@@ -77,7 +86,10 @@ NAME_SEP = re.compile(
 # What may precede a line-level assignment: indentation, `export`, a YAML list dash, a quote.
 LINE_LEAD = re.compile(r"""[ \t]*(?:export[ \t]+)?(?:-[ \t]+)?["']?""")
 DOUBLE_QUOTED = re.compile(r'"((?:[^"\\\r\n]|\\.)*)"')
-SINGLE_QUOTED = re.compile(r"'((?:[^'\\\r\n]|\\.)*)'")
+# A doubled quote is the YAML and SQL escape. The repetition is possessive, so an unterminated
+# value that holds a `''` cannot backtrack to end at that pair: it fails and the caller masks
+# to the end of the line.
+SINGLE_QUOTED = re.compile(r"'((?:[^'\\\r\n]|\\.|'')*+)'")
 TO_LINE_END = re.compile(r"[^\r\n]*")
 TO_QUOTE_OR_LINE_END = re.compile(r"""[^\r\n"']*""")
 # `&` or `;` that opens another `name=` pair: where a line-level `KEY=value` value stops.
@@ -116,7 +128,7 @@ FLAG = re.compile(
     (?P<gap>[ \t]+)
     (?P<value>
         "(?:[^"\\\r\n]|\\.)*"
-        |'[^'\r\n]*'
+        |'(?:[^'\r\n]|'')*+'
         |["'][^\r\n]*
         |[^\s\-]\S*
     )
@@ -136,11 +148,21 @@ JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
 
 
 def is_secret_name(name: str) -> bool:
-    """True when a key name carries a credential, so its value must be masked."""
+    """True when a key name carries a credential, so its value must be masked.
+
+    Three rules, in this order. The dbt secret prefix wins over everything, the
+    `key` exclusions included. Then a name that ends in a credential word is secret unless it
+    is `key` or a non-secret key. Last, a name whose last segment (split at `_`, `.`, `-` and a
+    camelCase boundary) is `pass` or `pwd` is secret.
+    """
     bare = re.sub(r"[_.\-]", "", name.lower())
+    if bare.startswith(SECRET_NAME_PREFIXES):
+        return True
     if bare == "key" or bare.endswith(NON_SECRET_KEY_SUFFIXES):
         return False
-    return bare.endswith(SECRET_SUFFIXES)
+    if bare.endswith(SECRET_SUFFIXES):
+        return True
+    return NAME_SEGMENT_SPLIT.split(name)[-1].lower() in CREDENTIAL_SEGMENTS
 
 
 def match_end(pattern: re.Pattern[str], text: str, start: int) -> int:
