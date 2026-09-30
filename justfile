@@ -39,5 +39,14 @@ adr-new title owner="platform":
 secrets-scan: tools
     .tools/bin/gitleaks git --config .gitleaks.toml --redact --no-banner --verbose .
 
+# Bring the core stack up from a clean clone, refusing a Colima VM under 12 GiB
+up:
+    uv run python scripts/stack.py up
+
+# Stop every profile's containers; pass --volumes to delete the named volumes
+[positional-arguments]
+down *args:
+    uv run python scripts/stack.py down "$@"
+
 # Everything CI runs, in one command: a local pass predicts a CI pass
 check: tools lint test secrets-scan
