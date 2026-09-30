@@ -48,5 +48,14 @@ up:
 down *args:
     uv run python scripts/stack.py down "$@"
 
+# Sample docker stats every 5 s into .mem/samples.jsonl until Ctrl-C or --duration SECONDS
+[positional-arguments]
+mem-sample *args:
+    uv run python scripts/mem_report.py sample "$@"
+
+# Report peak memory, mem_limit totals and the OOM and restart check; non-zero on a breach
+mem-report:
+    uv run python scripts/mem_report.py report
+
 # Everything CI runs, in one command: a local pass predicts a CI pass
 check: tools lint test secrets-scan
