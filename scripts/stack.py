@@ -4,6 +4,10 @@
 identity file into the git-ignored infra/.generated/, brings the core profile up healthy and
 runs the bootstrap and warehouse one-shots. `down` removes every profile's containers.
 
+The top-up fills every empty value in an existing infra/.env (so a plain copy of
+.env.example works), appends the keys the file lacks, never changes a value that is set and
+keeps the file at mode 0600.
+
 The planning functions are pure and tested without Docker; the small I/O functions at the
 bottom are what tests replace. Nothing here prints a value from infra/.env or the output of
 `docker compose config`: the values are secrets.
@@ -76,11 +80,13 @@ def generate_value(key: str) -> str:
 
 
 def init_env(example_text: str, existing_text: str) -> tuple[str, list[str]]:
-    """Return the new file text and the keys added.
+    """Return the new file text and the keys filled or added, in example order.
 
-    A fresh file keeps the example's comments and order with every empty value filled. An
-    existing file keeps its content byte for byte and gains only the keys it lacks, appended
-    in example order. Existing values are never changed. A duplicate key raises DotenvError.
+    A fresh file (empty or whitespace only) keeps the example's comments and order with every
+    empty value filled. An existing file keeps every non-empty line byte for byte, line ending
+    included: an example key it holds with an empty value is filled on its own line, and a key
+    it lacks is appended in example order. A key that is not in the example is never touched.
+    A duplicate key raises DotenvError.
     """
     example = parse_dotenv(example_text)
     if not existing_text.strip():
@@ -96,12 +102,24 @@ def init_env(example_text: str, existing_text: str) -> tuple[str, list[str]]:
                 lines.append(line)
         return "\n".join(lines) + "\n", added
     present = parse_dotenv(existing_text)
+    empties = {key for key in example if key in present and not present[key]}
     missing = [key for key in example if key not in present]
-    if not missing:
+    if not empties and not missing:
         return existing_text, []
-    separator = "" if existing_text.endswith("\n") else "\n"
-    appended = "".join(f"{key}={example[key] or generate_value(key)}\n" for key in missing)
-    return existing_text + separator + appended, missing
+    kept: list[str] = []
+    for raw in existing_text.splitlines(keepends=True):
+        body = raw.splitlines()[0]
+        key, separator, _ = body.partition("=")
+        key = key.strip()
+        if separator and not body.strip().startswith("#") and key in empties:
+            kept.append(f"{key}={generate_value(key)}{raw[len(body) :]}")
+        else:
+            kept.append(raw)
+    text = "".join(kept)
+    if missing:
+        text += "" if text.endswith("\n") else "\n"
+        text += "".join(f"{key}={example[key] or generate_value(key)}\n" for key in missing)
+    return text, [key for key in example if key in empties or key in missing]
 
 
 def render_identity(template_text: str, env: Mapping[str, str]) -> str:
@@ -206,9 +224,21 @@ def write_env_fresh(path: Path, text: str) -> None:
         handle.write(text)
 
 
-def append_env(path: Path, text: str) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(text)
+def rewrite_env(path: Path, text: str) -> None:
+    """Replace the env file with `text` at mode 0600, via a temp file and os.replace.
+
+    The temp file is in the same directory, so an interrupted run leaves the old file or the
+    new one and never a torn file, and a failed replace leaves no temp file behind.
+    """
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=".env-", suffix=".tmp")
+    try:
+        os.fchmod(fd, ENV_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        os.replace(temp_name, path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 def write_identity(path: Path, text: str) -> None:
@@ -241,14 +271,24 @@ def _shown(argv: list[str]) -> str:
 
 
 def sync_env() -> list[str]:
-    """Create infra/.env, or top it up, and return the key names added."""
+    """Create infra/.env, or top it up, and return the key names filled or added.
+
+    An existing file is made private (0600) on every run, then every empty value is filled
+    in place and every absent key appended; a value that is set is never changed. The top-up
+    rewrites the whole file atomically, so a whitespace-only file is written whole.
+    """
     example = ENV_EXAMPLE.read_text(encoding="utf-8")
     for _attempt in range(2):
         if ENV_FILE.is_file():
-            existing = ENV_FILE.read_text(encoding="utf-8")
+            try:
+                ENV_FILE.chmod(ENV_FILE_MODE)
+            except OSError as exc:
+                raise EnvInitError("cannot make the env file private (mode 0600)") from exc
+            with ENV_FILE.open(encoding="utf-8", newline="") as handle:
+                existing = handle.read()  # newline="" keeps CRLF endings as they are
             text, added = init_env(example, existing)
             if added:
-                append_env(ENV_FILE, text[len(existing) :])
+                rewrite_env(ENV_FILE, text)
             return added
         text, added = init_env(example, "")
         try:
