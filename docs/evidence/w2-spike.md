@@ -11,7 +11,11 @@ Recorded 2026-09-30.
 - Runtime: Colima 0.10.3, docker context `colima`, Docker Engine 29.5.2, Docker Compose 5.3.1.
 - VM: Colima `default` profile on the Apple Virtualization framework (`vz`, virtiofs mounts), 12 GiB memory and 4 CPUs.
 - Preflight: `docker info` MemTotal 12515225600 B against a threshold of 12348030976 B (D-03: the measured MemTotal rounded down to a multiple of 256 MiB).
-- Stack: Compose project `shopstream`, profile `core` (postgres, lakekeeper-migrate, lakekeeper, seaweedfs) and the `bootstrap` one-shots. Frankfurter joins `core` later in this phase.
+- Stack: Compose project `shopstream`, profile `core` (postgres, lakekeeper-migrate, lakekeeper, seaweedfs) and the `bootstrap` one-shots. Frankfurter joined `core` after this capture.
+
+### Frankfurter memory (first provider backfill)
+
+Observation, not a verdict; Plan 01-04 sets the final limit from `just mem-report`. With `WORKER_PROCESSES=1` and `MAX_THREADS=3`, the first provider backfill from empty volumes was OOM-killed at limits of 192m, 384m and 512m. At 1g its anonymous memory plateaued near 360 MiB with one spike to 493 MiB and the SQLite file grew to about 380 MB; a run from empty volumes at 768m stayed up for over 13 minutes (peak anonymous memory 379 MiB sampled every 20 s). The starting limit in the compose file is now 768m.
 
 ### First just up (skeleton)
 
