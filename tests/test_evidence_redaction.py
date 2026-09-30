@@ -1,10 +1,12 @@
 """The evidence gate: docs/evidence/**/*.md must hold no unmasked credential or PII.
 
 `evidence_violations` reads every Markdown file under docs/evidence as strict UTF-8 and
-reports credential-named fields whose value is not exactly REDACTED, XML secret elements,
-DSN passwords, JWT shapes, email addresses and phone numbers. It is the CI backstop behind
-`scripts/redact_evidence.py`: the redactor masks at capture time, this test proves nothing
-got through. Fake secrets are generated at runtime so none enters git history.
+reports each line that holds a credential or PII. Credential detection is the redactor's own
+SHAPES rule, reached through `redact_evidence.shape_findings`: the gate flags exactly the lines
+the redactor would still mask, so the two cannot drift apart. Email addresses and phone numbers
+are gate-only checks. It is the CI backstop behind `scripts/redact_evidence.py`: the redactor
+masks at capture time, this test proves nothing got through, including on a machine that has no
+infra/.env. Fake secrets are generated at runtime so none enters git history.
 """
 
 from __future__ import annotations
@@ -15,29 +17,12 @@ import re
 import secrets
 from pathlib import Path
 
+import dotenv_lite
 import pytest
 import redact_evidence
 
 REPO = Path(__file__).resolve().parents[1]
 
-CRED = (
-    r"(?:access[_-]?key(?:[_-]?id)?|secret(?:[_-]?access)?[_-]?key|session[_-]?token"
-    r"|security[_-]?token|password|passwd|token|credential|secret)"
-)
-FIELD = re.compile(
-    r"""(?ix)
-    (?P<name>[A-Za-z0-9_.\-]*?"""
-    + CRED
-    + r""")
-    (?P<q1>["']?) [ \t]*(?:=|:(?=[ \t"'])|[ \t]+=>[ \t]*) [ \t]*
-    (?P<q2>["']?) (?P<value>[^\s"',}\]]+)"""
-)
-XML = re.compile(
-    r"<(?P<tag>[A-Za-z]*(?:Secret|Token|Password|Credential|AccessKey)[A-Za-z]*)>"
-    r"(?P<value>[^<]+)</(?P=tag)>"
-)
-DSN = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:(?P<value>[^\s@/]+)(?=@)")
-JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
 EMAIL = re.compile(
     r"(?<![\w.+-])(?P<local>[A-Za-z0-9._%+-]+)@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b"
 )
@@ -47,17 +32,9 @@ PHONE_NANP = re.compile(r"(?<![\d.-])\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?![\d.-])")
 MASK = redact_evidence.REDACTED
 
 
-def line_violations(line: str) -> list[str]:
-    """Reasons a single evidence line is not safe to publish."""
+def pii_violations(line: str) -> list[str]:
+    """Reasons a single line holds an email address or a phone number."""
     reasons: list[str] = []
-    if any(match.group("value") != MASK for match in FIELD.finditer(line)):
-        reasons.append("credential-named field is not REDACTED")
-    if any(match.group("value") != MASK for match in XML.finditer(line)):
-        reasons.append("XML credential element is not REDACTED")
-    if any(match.group("value") != MASK for match in DSN.finditer(line)):
-        reasons.append("DSN password is not REDACTED")
-    if JWT.search(line):
-        reasons.append("JWT-shaped string")
     # A DSN whose password is already masked reads like `REDACTED@host.tld`; not an email.
     if any(match.group("local") != MASK for match in EMAIL.finditer(line)):
         reasons.append("email address")
@@ -66,19 +43,33 @@ def line_violations(line: str) -> list[str]:
     return reasons
 
 
+def line_violations(line: str) -> list[str]:
+    """Reasons a single evidence line is not safe to publish."""
+    reasons = [f"{reason} is not REDACTED" for _, reason in redact_evidence.shape_findings(line)]
+    return reasons + pii_violations(line)
+
+
 def evidence_violations(root: Path) -> list[str]:
     """Every violation under root/docs/evidence, as `<path>:<line>: <reason>`, sorted."""
-    violations: list[str] = []
+    violations: list[tuple[str, int, str]] = []
     for path in sorted((root / "docs" / "evidence").glob("**/*.md")):
         rel = path.relative_to(root).as_posix()
         try:
             text = path.read_bytes().decode("utf-8")
         except UnicodeDecodeError:
-            violations.append(f"{rel}: not valid UTF-8")
+            violations.append((rel, 0, "not valid UTF-8"))
             continue
-        for number, line in enumerate(text.splitlines(), start=1):
-            violations.extend(f"{rel}:{number}: {reason}" for reason in line_violations(line))
-    return sorted(violations)
+        # Whole-file text, so a multi-line PEM block is seen, and newline-only line numbers.
+        try:
+            findings = redact_evidence.shape_findings(text)
+        except ValueError:
+            violations.append((rel, 0, "redactor changed the line count"))
+            findings = []
+        violations.extend((rel, number, f"{reason} is not REDACTED") for number, reason in findings)
+        for number, line in enumerate(text.split("\n"), start=1):
+            violations.extend((rel, number, reason) for reason in pii_violations(line))
+    ordered = sorted(violations)
+    return [f"{rel}:{n}: {why}" if n else f"{rel}: {why}" for rel, n, why in ordered]
 
 
 def write_evidence(root: Path, body: str, name: str = "w-test.md") -> None:
@@ -211,3 +202,33 @@ def test_redactor_output_passes_gate(tmp_path: Path) -> None:
     assert literal not in cleaned
     assert "<repo>/infra" in cleaned
     assert "<home>/.docker/config.json" in cleaned
+
+
+GAP_TEMPLATES = {
+    "sts-signing-key": "STS_SIGNING_KEY={v}",
+    "seaweedfs-admin-key": "SEAWEEDFS_ADMIN_KEY={v}",
+    "api-key-yaml": "api_key: {v}",
+    "authorization-header": "Authorization: Bearer {v}",
+    "presigned-signature": "https://b.s3/x?X-Amz-Date=20260930T000000Z&X-Amz-Signature={v}",
+}
+ENV_EXAMPLE_KEYS = list(
+    dotenv_lite.parse_dotenv((REPO / "infra" / ".env.example").read_text(encoding="utf-8"))
+)
+
+
+@pytest.mark.parametrize("template", GAP_TEMPLATES.values(), ids=GAP_TEMPLATES.keys())
+def test_the_gap_fixtures_are_reported(tmp_path: Path, template: str) -> None:
+    line = template.format(v=secrets.token_hex(8))
+    reasons = line_violations(line)
+    assert reasons
+    assert all(reason.endswith("is not REDACTED") for reason in reasons)
+    write_evidence(tmp_path, line + "\n")
+    assert [item for item in evidence_violations(tmp_path) if ":1:" in item]
+
+
+@pytest.mark.parametrize("name", ENV_EXAMPLE_KEYS)
+def test_every_env_example_key_is_reported_when_unmasked(tmp_path: Path, name: str) -> None:
+    write_evidence(tmp_path, f"{name}={secrets.token_hex(8)}\n")
+    assert evidence_violations(tmp_path) == [
+        "docs/evidence/w-test.md:1: credential-named field is not REDACTED"
+    ]
