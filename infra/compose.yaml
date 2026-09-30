@@ -1,0 +1,156 @@
+name: shopstream
+
+x-defaults: &defaults
+  restart: "no"
+
+services:
+  postgres:
+    <<: *defaults
+    image: docker.io/library/postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    profiles: [core]
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - track_commit_timestamp=on
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run just up}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?run just up}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?run just up}
+      SHOPSTREAM_DB_PASSWORD: ${SHOPSTREAM_DB_PASSWORD:?run just up}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      # TCP, because the init-time server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  lakekeeper-migrate:
+    <<: *defaults
+    image: quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5
+    profiles: [core]
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?run just up}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?run just up}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_PG_ENCRYPTION_KEY:?run just up}
+      # ADR-001 spike exception (G6): no authentication, loopback-only ports. Week 5 re-bootstraps with OIDC and OpenFGA.
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  lakekeeper:
+    <<: *defaults
+    image: quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5
+    profiles: [core]
+    command: ["serve"]
+    environment: *lakekeeper-env
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8181:8181"
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      # The image is FROM scratch: only the binary itself can probe.
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  seaweedfs:
+    <<: *defaults
+    image: docker.io/chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    profiles: [core]
+    command:
+      - mini
+      - -dir=/data
+      - -s3.config=/etc/seaweedfs/iam.json
+      - -s3.iam.config=/etc/seaweedfs/iam.json
+      - -webdav=false
+      - -admin.ui=false
+    volumes:
+      - seaweedfs-data:/data
+      # The only mount from infra/.generated: on virtiofs any container uid can read the 0600 file.
+      - ./.generated/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+    ports:
+      - "127.0.0.1:8333:8333"
+    mem_limit: 768m
+    memswap_limit: 768m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8333/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  bootstrap:
+    <<: *defaults
+    image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    profiles: [bootstrap]
+    command: ["python", "/app/lakekeeper_bootstrap.py", "bootstrap"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      SEAWEEDFS_ADMIN_KEY: ${SEAWEEDFS_ADMIN_KEY:?run just up}
+      SEAWEEDFS_ADMIN_SECRET: ${SEAWEEDFS_ADMIN_SECRET:?run just up}
+    volumes:
+      - ../scripts/lakekeeper_bootstrap.py:/app/lakekeeper_bootstrap.py:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  warehouse:
+    <<: *defaults
+    image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    profiles: [bootstrap]
+    command: ["python", "/app/lakekeeper_bootstrap.py", "warehouse"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      LAKEKEEPER_S3_KEY: ${LAKEKEEPER_S3_KEY:?run just up}
+      LAKEKEEPER_S3_SECRET: ${LAKEKEEPER_S3_SECRET:?run just up}
+    volumes:
+      - ../scripts/lakekeeper_bootstrap.py:/app/lakekeeper_bootstrap.py:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 128m
+    memswap_limit: 128m
+
+volumes:
+  postgres-data:
+  seaweedfs-data:
