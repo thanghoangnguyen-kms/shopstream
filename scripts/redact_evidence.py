@@ -12,7 +12,9 @@ whole before any path is rewritten:
    flag, DSN password, XML credential element, JWT-shaped string. The short flags `-u`,
    `--user` and `-p` are not secret names: they are masked only after the HTTP client word or
    after a docker, podman or nerdctl login, on the same line or on a line continued from it by
-   a trailing backslash. A non-secret pair never
+   a trailing backslash. After the HTTP client word the user flag also counts when its value is
+   glued to it, when it is written `--user=`, and when it ends a bundle of short flags that take
+   no value. A non-secret pair never
    hides a credential that follows it (`user=bob&password=X` masks X), and a secret value is
    masked whole, however many words, separators or escaped quotes it holds. A credential name
    also covers dbt's DBT_ENV_SECRET_ prefix and a last name segment of pass or pwd, and a
@@ -151,10 +153,27 @@ PEM = re.compile(
 )
 # The command words that give the short flags below their meaning. The context is found once per
 # line, never per flag match, so a long line of flags stays linear. `-U` and `-P` never qualify.
+# After the client word the user flag also counts glued to its value, written `--user=`, and as
+# the last letter of a bundle whose earlier letters take no value.
 CURL_COMMAND = re.compile(r"(?<![\w.\-])curl(?![\w.\-])")
 LOGIN_COMMAND = re.compile(r"(?<![\w.\-])(?:docker|podman|nerdctl)[ \t]+login(?![\w.\-])")
-CLIENT_USER_FLAGS = frozenset({"-u", "--user"})
 LOGIN_SECRET_FLAGS = frozenset({"-p"})
+# Short flags that take no value, then `u`: `-u` alone is the empty bundle. `#` is the progress bar.
+CURL_USER_BUNDLE = re.compile(r"-[#012346BGIJLMNORSVZafgijklnpqsv]*u")
+# Runs after FLAG on a line with the client word. The flag branch takes a value exactly as FLAG
+# does, and `=` is a gap only after exactly `--user`; the glued branch takes a user bundle and its
+# value with no gap. Both start where FLAG's match starts, behind the same lead.
+CURL_FLAG = re.compile(
+    FLAG_START
+    + FLAG_LEAD
+    + r"(?:(?P<flag>--?[A-Za-z][A-Za-z0-9_.\-]*)(?P<gap>[ \t]+|=(?<=--user=))(?P<value>"
+    + FLAG_VALUE
+    + r")|(?P<glued>"
+    + CURL_USER_BUNDLE.pattern
+    + r")(?P<glued_gap>[ \t]*)(?P<glued_value>"
+    + FLAG_VALUE
+    + "))"
+)
 LINE_BREAK = re.compile(r"(\r\n|\n|\r)")
 # A JWT match starts only at the beginning of a run of its own characters, so a long run is
 # scanned once. The lead keeps a JWT glued after a dash (`id-eyJ...`) masked: it is the run
@@ -306,35 +325,48 @@ def flag_replacement(match: re.Match[str], curl_end: int | None, login_end: int 
     A masked result keeps the match's lead, the text before its flag. `curl_end` and `login_end`
     are where the HTTP client word or the registry login words end on this line (0 when the
     command began on an earlier, backslash-continued line), or None when the line has no such
-    command. The short flags `-u`, `--user` and `-p` are secret only when they come after that
+    command. The user flag is `--user` or a bundle ending in `u`, glued to its value or not, and
+    the short flag `-p` is the login password. Both are secret only when they come after that
     command; every other flag is judged by its name.
     """
     lead = match["lead"]
-    flag = match["flag"]
-    value = match["value"]
-    start = match.start("flag")
+    glued = match.groupdict().get("glued")
+    if glued is not None:
+        flag, gap, value = glued, match["glued_gap"], match["glued_value"]
+        start = match.start("glued")
+    else:
+        flag, gap, value = match["flag"], match["gap"], match["value"]
+        start = match.start("flag")
     quote = value[0] if value[0] in "\"'" else ""
     closing = quote if len(value) > 1 and value.endswith(quote) else ""
-    if flag in CLIENT_USER_FLAGS and curl_end is not None and start >= curl_end:
+    is_user_flag = flag == "--user" or CURL_USER_BUNDLE.fullmatch(flag) is not None
+    if is_user_flag and curl_end is not None and start >= curl_end:
         user, colon, password = value[len(quote) : len(value) - len(closing)].partition(":")
         if not colon or not password.strip():
             return match[0]
-        return f"{lead}{flag}{match['gap']}{quote}{user}:{REDACTED}{closing}"
+        return f"{lead}{flag}{gap}{quote}{user}:{REDACTED}{closing}"
+    if glued is not None:
+        return match[0]
     if flag in LOGIN_SECRET_FLAGS and login_end is not None and start >= login_end:
-        return f"{lead}{flag}{match['gap']}{quote}{REDACTED}{closing}"
+        return f"{lead}{flag}{gap}{quote}{REDACTED}{closing}"
     name = flag.lstrip("-")
     if name.startswith("no-") or not is_secret_name(name):
         return match[0]
-    return f"{lead}{flag}{match['gap']}{quote}{REDACTED}{closing}"
+    return f"{lead}{flag}{gap}{quote}{REDACTED}{closing}"
 
 
 def mask_flags(text: str) -> str:
     """Mask the value of a space-separated secret flag (`--password X`, `--token "a b"`).
 
-    Also masks the password of `-u` / `--user` after the HTTP client word and the value of `-p`
-    after a registry login. The command context is computed once per line and carried to the
-    next line when this line ends in a backslash. Lines are split and rejoined on `\\n` only,
-    so the text keeps its line structure byte for byte.
+    Also masks the password of the user flag after the HTTP client word (written `-u`, `--user`,
+    `--user=` or as the end of a bundle of short flags, glued to its value or not) and the value
+    of `-p` after a registry login. The command context is computed once per line and carried to
+    the next line when this line ends in a backslash. FLAG runs first on every line, which judges
+    every flag as it always was. On a line with the client word the glued and `--user=` spellings
+    are then masked by CURL_FLAG, whose replacement only swaps a password for the mask and copies
+    the rest, so such a line is never masked less than FLAG alone would. Masking moves offsets,
+    so the client word is located again in the masked text. Lines are split and rejoined on `\\n`
+    only, so the text keeps its line structure byte for byte.
     """
     lines = text.split("\n")
     carry_client = carry_login = False
@@ -342,7 +374,13 @@ def mask_flags(text: str) -> str:
         curl_end = 0 if carry_client else command_end(CURL_COMMAND, line)
         login_end = 0 if carry_login else command_end(LOGIN_COMMAND, line)
         replace = functools.partial(flag_replacement, curl_end=curl_end, login_end=login_end)
-        lines[index] = FLAG.sub(replace, line)
+        masked = FLAG.sub(replace, line)
+        if curl_end is not None:
+            client_end = 0 if carry_client else command_end(CURL_COMMAND, masked)
+            if client_end is not None:
+                replace = functools.partial(flag_replacement, curl_end=client_end, login_end=None)
+                masked = CURL_FLAG.sub(replace, masked)
+        lines[index] = masked
         continued = line.removesuffix("\r").endswith("\\")
         carry_client = curl_end is not None and continued
         carry_login = login_end is not None and continued
