@@ -135,9 +135,10 @@ services:
       - frankfurter-data:/app/data
     ports:
       - "127.0.0.1:8090:8080"
-    # Sized by Plan 01-04. A from-empty backfill at 768m peaked at 310.4 MiB (formula: x 1.25, rounded up
-    # to 32 MiB = 416m), but the clean-clone run at 416m peaked at 412.4 of 416 MiB and plan 01-03 saw a
-    # 493 MiB spike (OOM kill at 512m). The owner set 640m: 493 MiB x 1.25 rounded up to 32 MiB.
+    # Sized by Plan 01-04. From-empty backfills were OOM-killed at 192m, 384m and 512m. A run at 768m peaked
+    # at 310.4 MiB (formula: x 1.25, rounded up to 32 MiB = 416m), the clean-clone run at 416m peaked at
+    # 412.4 of 416 MiB, and a run at a 1g limit reached 493 MiB of anonymous memory. The owner set 640m:
+    # 493 MiB x 1.25 rounded up to 32 MiB.
     mem_limit: 640m
     memswap_limit: 640m
     healthcheck:
