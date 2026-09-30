@@ -248,6 +248,13 @@ def must_fail_lines() -> dict[str, str]:
         "bare-bearer": f"using Bearer {value} now",
         "dsn-password-with-at": f"postgresql://u:{first}@{second}@host/db",
         "comma-in-value": f"PGPASSWORD={first},{second}",
+        # G-01-3: the shapes the redactor closed after the first review round.
+        "dbt-secret-env": f"DBT_ENV_SECRET_PG_USER={value}",
+        "db-pass": f"DB_PASS={value}",
+        "odbc-pwd": f"Server=db;Uid=bob;Pwd={value};",
+        "yaml-doubled-quote": f"password: '{first}''{second}'",
+        "yaml-leaked-tail": f"password: 'REDACTED''{second}'",
+        "flag-doubled-quote": f"cli --password '{first}''{second}'",
     }
 
 
@@ -269,6 +276,10 @@ def must_pass_texts() -> dict[str, str]:
         "mask-with-trailing-spaces": "password: REDACTED   ",
         "masked-authorization": "Authorization: REDACTED",
         "masked-bearer": "Bearer REDACTED",
+        "bypass": "bypass: true",
+        "compass": "compass: north",
+        "empty-single-quoted": "password: ''",
+        "masked-single-quoted": "password: 'REDACTED'",
     }
 
 

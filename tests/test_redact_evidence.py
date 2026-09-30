@@ -350,6 +350,35 @@ NESTED_CASES: list[tuple[str, str, str]] = [
     ),
     ("amp-adjacent", "password=${a}&token=${b}", "password=REDACTED&token=REDACTED"),
     ("semicolon-adjacent", "password=${a};api_key=${b}", "password=REDACTED;api_key=REDACTED"),
+    # G-01-3 items 1, 5 and 2: dbt's secret prefix, pass/pwd last segments, doubled quotes.
+    ("dbt-secret-name", "DBT_ENV_SECRET_X=${v}", "DBT_ENV_SECRET_X=REDACTED"),
+    ("dbt-secret-user", "DBT_ENV_SECRET_PG_USER=${v}", "DBT_ENV_SECRET_PG_USER=REDACTED"),
+    ("dbt-secret-export", "export DBT_ENV_SECRET_ABC=${v}", "export DBT_ENV_SECRET_ABC=REDACTED"),
+    ("dbt-secret-yaml", "dbt_env_secret_host: ${v}", "dbt_env_secret_host: REDACTED"),
+    (
+        "dbt-secret-over-key-exclusion",
+        "DBT_ENV_SECRET_PRIMARY_KEY=${v}",
+        "DBT_ENV_SECRET_PRIMARY_KEY=REDACTED",
+    ),
+    ("db-pass", "DB_PASS=${v}", "DB_PASS=REDACTED"),
+    ("db-pass-yaml", "db_pass: ${v}", "db_pass: REDACTED"),
+    ("db-pass-dotted", "db.pass=${v}", "db.pass=REDACTED"),
+    ("db-pass-camel-json", '{"dbPass": "${v}"}', '{"dbPass": "REDACTED"}'),
+    ("pwd", "pwd=${v}", "pwd=REDACTED"),
+    ("pwd-upper", "PWD=${v}", "PWD=REDACTED"),
+    ("pwd-yaml", "Pwd: ${v}", "Pwd: REDACTED"),
+    ("mysql-pwd", "MYSQL_PWD=${v}", "MYSQL_PWD=REDACTED"),
+    ("odbc-pwd", "Server=db;Uid=bob;Pwd=${v};", "Server=db;Uid=bob;Pwd=REDACTED;"),
+    ("yaml-doubled-quote", "password: '${a}''${b}'", "password: 'REDACTED'"),
+    ("yaml-leading-doubled-quote", "password: '''${a} ${b}'", "password: 'REDACTED'"),
+    ("dict-doubled-quote", "{'password': '${a}''${b}'}", "{'password': 'REDACTED'}"),
+    (
+        "yaml-doubled-quote-comment",
+        "password: '${a}''${b}' # note",
+        "password: 'REDACTED' # note",
+    ),
+    ("yaml-doubled-quote-unterminated", "password: '${a}''${b}", "password: 'REDACTED"),
+    ("yaml-leaked-tail", "password: 'REDACTED''${b}'", "password: 'REDACTED'"),
 ]
 
 
@@ -426,6 +455,12 @@ SHAPE_CASES: list[tuple[str, str, str]] = [
         "postgresql://u:REDACTED@host:5432/db",
     ),
     ("dsn-empty-user", "redis://:${v}@cache:6379", "redis://:REDACTED@cache:6379"),
+    ("flag-doubled-quote", "cli --password '${a}''${b}'", "cli --password 'REDACTED'"),
+    (
+        "flag-doubled-quote-unterminated",
+        "cli --password '${a}''${b}",
+        "cli --password 'REDACTED",
+    ),
 ]
 
 SHAPE_ORDER = [
@@ -490,6 +525,23 @@ def test_header_bearer_flag_and_dsn_shapes_are_masked(template: str, expected: s
     ],
 )
 def test_non_secret_headers_and_flags_are_left_alone(line: str) -> None:
+    assert re_.redact_shapes(line) == line
+
+
+NAME_AND_QUOTE_LOOK_ALIKES = [
+    "bypass: true",
+    "compass: north",
+    "passthrough: yes",
+    "password: ''",
+    "password: '' # empty",
+    "password: 'REDACTED'",
+    "{'password': '', 'user': 'bob'}",
+    "Server=db;Uid=bob;Pwd=;",
+]
+
+
+@pytest.mark.parametrize("line", NAME_AND_QUOTE_LOOK_ALIKES)
+def test_name_and_quote_look_alikes_are_left_alone(line: str) -> None:
     assert re_.redact_shapes(line) == line
 
 
@@ -629,6 +681,24 @@ LONG = 64 * 1024
     ],
 )
 def test_layer1_is_linear_on_long_lines(text: str) -> None:
+    started = time.perf_counter()
+    re_.redact_shapes(text)
+    assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("password: '" + "''" * (LONG // 2), id="doubled-quotes-unclosed"),
+        pytest.param("password: '" + "''" * (LONG // 2) + "a'", id="doubled-quotes-closed"),
+        pytest.param("--password '" + "''" * (LONG // 2), id="flag-doubled-quotes"),
+        pytest.param("'" * LONG, id="quote-run"),
+        pytest.param("password: 'a''b' " * (LONG // 17), id="doubled-quote-values"),
+        pytest.param("DBT_ENV_SECRET_" * (LONG // 15) + "=x", id="dbt-prefix-run"),
+        pytest.param("a_pass=" * (LONG // 7), id="pass-segment-names"),
+    ],
+)
+def test_name_and_quote_rules_are_linear_on_long_lines(text: str) -> None:
     started = time.perf_counter()
     re_.redact_shapes(text)
     assert time.perf_counter() - started < 1.0
