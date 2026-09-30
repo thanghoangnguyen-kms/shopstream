@@ -145,6 +145,11 @@ def test_jwt_shaped_string_is_masked() -> None:
     assert out == "got REDACTED back"
 
 
+def test_a_jwt_glued_after_a_dash_is_masked() -> None:
+    value = jwt_like()
+    assert re_.redact_shapes(f"id-{value} x-{value}") == "id-REDACTED x-REDACTED"
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -817,6 +822,7 @@ LONG = 64 * 1024
         pytest.param("a://:x@" * (LONG // 7), id="dsn-repeats"),
         pytest.param("a.-" * (LONG // 3), id="dot-dash-run"),
         pytest.param("v1.-rc" * (LONG // 6), id="version-dot-dash-run"),
+        pytest.param("eyJ-" * (LONG // 4), id="jwt-dash-run"),
     ],
 )
 def test_layer1_is_linear_on_long_lines(text: str) -> None:
@@ -879,6 +885,7 @@ def best_of_three(text: str) -> float:
         pytest.param("", "a.-", id="dot-dash"),
         pytest.param("", "v1.-rc", id="version-dot-dash"),
         pytest.param(CLIENT + " ", "a.-", id="dot-dash-in-context"),
+        pytest.param("", "eyJ-", id="jwt-dash"),
     ],
 )
 def test_layer1_time_grows_linearly_with_the_input(prefix: str, unit: str) -> None:
