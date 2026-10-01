@@ -308,4 +308,59 @@ Not run.
 
 ## Item 15: PySpark version
 
-Not run.
+Recorded 2026-10-01.
+
+Verdict: fallback. Maven Central has no Iceberg runtime for Spark 4.2 (iceberg-spark-runtime-4.2_2.13), in 1.11.0 or in 1.12.0, so Shopstream stays on PySpark 4.1 (4.1.3), which G4 names as a v3 writer.
+
+### Versions
+
+- Iceberg 1.11.0 is the pin in ADR-001's Version matrix. Iceberg 1.12.0 went GA on 2026-09-30 (GitHub release timestamp 2026-09-30T01:52:18Z), and its release script, `dev/stage-binaries.sh` at the `apache-iceberg-1.12.0` tag, stages Spark 3.5, 4.0 and 4.1 only. Neither release publishes a Spark 4.2 runtime, so the two releases are recorded separately here and neither stands in for the other.
+- The 4.1 runtime artifact lists 1.11.0 and 1.12.0, in the order `maven-metadata.xml` gives them, so a rerun of the same lookup produces the same listing.
+- PySpark 4.1.3 (2026-07-15) is the newest 4.1.x release. PySpark 4.2.0 exists (2026-07-14), but no Iceberg runtime does for it.
+- Absence is shown by HTTP 404 on all four Spark 4.2 artifact paths plus `numFound` 0 from the search API, not by an empty listing alone.
+
+### Commands and output
+
+The lookups ran from the host, without a container, on 2026-10-01. The capture went to a temporary file outside both trees and through `scripts/redact_evidence.py`; it holds only public registry data, and the redactor changed nothing.
+
+```text
+$ curl -fsS https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/maven-metadata.xml | grep -E '<version>|<lastUpdated>'
+<version>1.11.0</version>
+<version>1.12.0</version>
+<lastUpdated>20260930021942</lastUpdated>
+$ curl -s -o /dev/null -w '%{http_code}' https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.2_2.13/maven-metadata.xml
+404
+$ curl -s -o /dev/null -w '%{http_code}' https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.2_2.13/1.11.0/iceberg-spark-runtime-4.2_2.13-1.11.0.jar
+404
+$ curl -s -o /dev/null -w '%{http_code}' https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.2_2.13/1.12.0/iceberg-spark-runtime-4.2_2.13-1.12.0.jar
+404
+$ curl -s -o /dev/null -w '%{http_code}' https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-4.2_2.13/maven-metadata.xml
+404
+$ curl -s 'https://search.maven.org/solrsearch/select?q=g:org.apache.iceberg+AND+a:iceberg-spark-runtime-4.2_2.13&rows=20&wt=json' | python3 -c 'import json,sys; print("numFound", json.load(sys.stdin)["response"]["numFound"])'
+numFound 0
+$ gh api repos/apache/iceberg/releases/tags/apache-iceberg-1.12.0 --jq .published_at
+2026-09-30T01:52:18Z
+$ gh api 'repos/apache/iceberg/contents/dev/stage-binaries.sh?ref=apache-iceberg-1.12.0' --jq .content | base64 -d | grep -m1 '^SPARK_VERSIONS='
+SPARK_VERSIONS=3.5,4.0,4.1
+$ curl -s https://pypi.org/pypi/pyspark/json (4.1.x and 4.2.x releases: version, upload date)
+4.1.0 2025-12-16
+4.1.0.dev1 2025-07-14
+4.1.0.dev2 2025-09-28
+4.1.0.dev3 2025-10-30
+4.1.0.dev4 2025-11-20
+4.1.1 2026-01-09
+4.1.2 2026-05-21
+4.1.3 2026-07-15
+4.2.0 2026-07-14
+4.2.0.dev1 2026-01-12
+4.2.0.dev2 2026-02-08
+4.2.0.dev3 2026-03-12
+4.2.0.dev4 2026-04-10
+4.2.0.dev5 2026-05-02
+```
+
+### Consequences
+
+- ADR-001's go criterion 15 has two halves: Maven Central has a Spark 4.2 runtime, and item 2 passes on it. The first half fails, so the second has nothing to run, and item 2 runs on PySpark 4.1.3.
+- The Version matrix pins stay as ADR-001 fixes them: Iceberg 1.11.0 and PySpark 4.1.x. A newer Iceberg release does not move a pin; moving to Iceberg 1.12 is an owner decision after the spike.
+- AGENTS.md G4 is unchanged. PROV-02 updates it only if item 15 is go, and this item is fallback.
