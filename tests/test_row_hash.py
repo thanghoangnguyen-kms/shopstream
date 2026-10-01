@@ -328,3 +328,8 @@ def test_other_types_inside_a_parsed_object_are_unsupported(bad: object) -> None
     with pytest.raises(row_hash.UnsupportedValueError) as info:
         row_hash.row_digest({"payload_col": bad}, ["payload_col"], {"payload_col"})
     assert "payload_col" in str(info.value)
+
+
+def test_lone_surrogate_escape_in_json_text_is_unsupported() -> None:
+    with pytest.raises(row_hash.UnsupportedValueError, match="payload_col"):
+        row_hash.row_digest({"payload_col": '"\\ud800"'}, ["payload_col"], {"payload_col"})

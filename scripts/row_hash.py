@@ -71,16 +71,62 @@ _MICROSECOND = timedelta(microseconds=1)
 
 
 def canonical_json(value: object, *, column: str = "") -> str:
-    """Parse JSON text (or take a parsed object) and write it back with sorted keys."""
+    """Write JSON text, or a parsed object, as canonical JSON.
+
+    Keys are sorted and nothing is padded; non-ASCII text is kept as written. Numbers are
+    read as exact decimals and written without an exponent or trailing zeros, so 1, 1.0,
+    1.00 and 1e0 are one value. `column` only labels errors.
+    """
     parsed = _parse(value, column) if isinstance(value, str) else value
-    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return _write(parsed, column)
 
 
 def _parse(text: str, column: str) -> object:
+    def reject_constant(_name: str) -> object:
+        raise UnsupportedValueError(f"column {column!r}: unsupported non-finite JSON number")
+
     try:
-        return json.loads(text)
+        return json.loads(
+            text, parse_float=Decimal, parse_int=Decimal, parse_constant=reject_constant
+        )
     except json.JSONDecodeError:
         raise InvalidJSONError(f"column {column!r}: invalid JSON text") from None
+
+
+def _write(value: object, column: str) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, int | float | Decimal):
+        return _write_number(value, column)
+    if isinstance(value, list):
+        return "[" + ",".join(_write(item, column) for item in value) + "]"
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise _unsupported(column, value)
+        pairs = (
+            f"{json.dumps(key, ensure_ascii=False)}:{_write(value[key], column)}"
+            for key in sorted(value)
+        )
+        return "{" + ",".join(pairs) + "}"
+    raise _unsupported(column, value)
+
+
+def _write_number(number: int | float | Decimal, column: str) -> str:
+    exact = Decimal(repr(number)) if isinstance(number, float) else Decimal(number)
+    sign, digits, exponent = exact.as_tuple()
+    if not isinstance(exponent, int):  # NaN or an infinity
+        raise _unsupported(column, number)
+    trimmed = list(digits)
+    while trimmed and trimmed[-1] == 0:
+        trimmed.pop()
+        exponent += 1
+    if not trimmed:
+        return "0"
+    return format(Decimal((sign, tuple(trimmed), exponent)), "f")
 
 
 def _cell(tag: bytes, payload: bytes) -> bytes:
@@ -98,7 +144,11 @@ def encode(value: object, *, json_column: bool, column: str = "") -> bytes:
     if value is None:
         return _cell(NULL_SENTINEL, b"")
     if json_column:
-        return _cell(_JSON, canonical_json(value, column=column).encode("utf-8"))
+        text = canonical_json(value, column=column)
+        try:
+            return _cell(_JSON, text.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise _unsupported(column, text) from None
     if isinstance(value, bool):
         return _cell(_BOOLEAN, b"true" if value else b"false")
     if isinstance(value, int):
