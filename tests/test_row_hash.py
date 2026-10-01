@@ -217,3 +217,114 @@ def test_arrow_table_digest_delegates_to_to_pylist() -> None:
 
 def test_json_column_text_is_independent_of_key_order() -> None:
     assert cell('{"b":1,"a":2}', json=True) == cell('{"a":2,"b":1}', json=True)
+
+
+def test_json_text_ignores_key_order_and_whitespace() -> None:
+    texts = ['{"b":1,"a":2}', '{"a":2,"b":1}', '{ "a" : 2, "b" : 1 }']
+    assert len({cell(text, json=True) for text in texts}) == 1
+
+
+@pytest.mark.parametrize(
+    "spellings",
+    [
+        ["[1]", "[1.0]", "[1.00]", "[1e0]"],
+        ["[0.1]", "[0.10]"],
+        ["[-0]", "[0]", "[0.0]", "[-0.000]"],
+        ["[1e2]", "[100]", "[1.0E+2]"],
+    ],
+)
+def test_json_numbers_with_one_value_hash_alike(spellings: list[str]) -> None:
+    assert len({cell(text, json=True) for text in spellings}) == 1
+
+
+def test_json_integers_stay_exact_beyond_float_range() -> None:
+    assert cell("[9007199254740993]", json=True) != cell("[9007199254740992]", json=True)
+    long_a = "[12345678901234567890123456789012345]"
+    long_b = "[12345678901234567890123456789012346]"
+    assert cell(long_a, json=True) != cell(long_b, json=True)
+    assert row_hash.canonical_json(long_a) == long_a
+    fractional = "[1.000000000000000000000000000001]"
+    assert row_hash.canonical_json(fractional) == fractional
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{ "b" : [1, 2.50, null, true] , "a" : "x" }', '{"a":"x","b":[1,2.5,null,true]}'),
+        ('{"b":{"y":1,"x":2},"a":1}', '{"a":1,"b":{"x":2,"y":1}}'),
+        ("1e2", "100"),
+        ("-0.0", "0"),
+        ("1E-7", "0.0000001"),
+        ('{"k":"\\u00e9"}', '{"k":"é"}'),
+        ("[]", "[]"),
+    ],
+)
+def test_canonical_json_text(text: str, expected: str) -> None:
+    assert row_hash.canonical_json(text) == expected
+
+
+def test_parsed_float_equals_the_same_json_number() -> None:
+    assert cell({"n": 1.5}, json=True) == cell('{"n":1.5}', json=True)
+    assert cell({"n": Decimal("1.50")}, json=True) == cell('{"n":1.5}', json=True)
+    assert cell({"n": 2}, json=True) == cell('{"n":2.0}', json=True)
+
+
+def test_json_true_false_and_null_stay_distinct() -> None:
+    assert cell("[true]", json=True) != cell("[1]", json=True)
+    assert cell("[false]", json=True) != cell("[0]", json=True)
+    assert cell("[null,1]", json=True) != cell("[1]", json=True)
+    assert cell([True], json=True) == cell("[true]", json=True)
+
+
+def test_json_escapes_resolve_on_parse() -> None:
+    assert cell('"\\u00e9"', json=True) == cell('"é"', json=True)
+    assert cell('"é"', json=True) != cell('"e"', json=True)
+
+
+def test_one_payload_hashes_alike_in_every_engine_encoding() -> None:
+    # Assumption-delta invariant: VARIANT text from Spark, from DuckDB, the JSON-string
+    # fallback and a parsed object are one value, so they must be one digest.
+    spark_text = '{"k":1,"n":null,"t":["x","y"]}'
+    duckdb_text = '{"k":1,"t":["x","y"],"n":null}'
+    string_column = '{"t": ["x", "y"], "k": 1, "n": null}'
+    parsed = {"k": 1, "n": None, "t": ["x", "y"]}
+    columns = ["id", "payload"]
+    digests = {
+        row_hash.table_digest([{"id": 1, "payload": payload}], columns, {"payload"})
+        for payload in (spark_text, duckdb_text, string_column, parsed)
+    }
+    assert len(digests) == 1
+
+
+def test_sql_null_and_json_null_differ_in_a_json_column() -> None:
+    assert cell(None, json=True) != cell("null", json=True)
+    assert cell(None, json=True) == cell(None)
+
+
+def test_invalid_json_text_names_the_column_only() -> None:
+    with pytest.raises(row_hash.InvalidJSONError) as info:
+        row_hash.row_digest({"payload_col": "leaky-secret{"}, ["payload_col"], {"payload_col"})
+    assert "payload_col" in str(info.value)
+    assert "leaky-secret" not in str(info.value)
+
+
+@pytest.mark.parametrize("text", ["[NaN]", "[Infinity]", "[-Infinity]"])
+def test_non_finite_json_number_is_unsupported(text: str) -> None:
+    with pytest.raises(row_hash.UnsupportedValueError):
+        cell(text, json=True)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), Decimal("NaN")])
+def test_non_finite_parsed_number_is_unsupported(bad: object) -> None:
+    with pytest.raises(row_hash.UnsupportedValueError):
+        cell([bad], json=True)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{1: "a"}, {"k": {1, 2}}, {"k": (1, 2)}, {"k": datetime(2026, 1, 1, tzinfo=UTC)}, [object()]],
+)
+def test_other_types_inside_a_parsed_object_are_unsupported(bad: object) -> None:
+    with pytest.raises(row_hash.UnsupportedValueError) as info:
+        row_hash.row_digest({"payload_col": bad}, ["payload_col"], {"payload_col"})
+    assert "payload_col" in str(info.value)
