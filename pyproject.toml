@@ -67,6 +67,8 @@ ignore = ["E501"]
 "scripts/probe_scope.py" = ["S310"]
 # Origin-allowlisted Lakekeeper GETs (S310), SQL built from the script's own constants and integer snapshot ids (S608), and the container's /tmp tmpfs as Spark scratch (S108).
 "scripts/spark_v3_job.py" = ["S108", "S310", "S608"]
+# SQL built from the job's own table names and integer snapshot ids.
+"scripts/read_v3.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.13"
