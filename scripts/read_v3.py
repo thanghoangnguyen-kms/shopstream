@@ -31,16 +31,23 @@ from spark_v3_job import COLUMNS, DEFAULT_LAKEKEEPER_URL, JSON_COLUMNS, WAREHOUS
 READERS = ("spark", "duckdb", "pyiceberg", "polars")
 DUCKDB_EXTENSIONS = "/opt/duckdb/extensions"
 ERROR_LIMIT = 200
+# Values shorter than this are not scrubbed: a storage option such as `true` would blank ordinary
+# words, and no vended key, secret or session token is this short.
+MIN_SECRET_CHARS = 8
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # ADR-001 spike item 2's two fixed fallbacks, in its own wording.
 FALLBACK_JSON = "JSON string column"
 FALLBACK_V2 = "v2 with position deletes"
 
 
-def error_text(exc: BaseException) -> str:
-    """The exception's type name, a colon and the first line of its message, at most 200 chars."""
+def error_text(exc: BaseException, secrets: Sequence[str] = ()) -> str:
+    """The exception's type name, a colon and the first line of its message, at most 200 chars.
+
+    Every value in `secrets` is scrubbed from the first line before it is truncated, so a key that
+    straddles the 200-character cut leaks no prefix (WR-01).
+    """
     lines = str(exc).splitlines()
-    first = lines[0] if lines else ""
+    first = scrub_values(lines[0] if lines else "", secrets)
     return f"{type(exc).__name__}: {first}"[:ERROR_LIMIT]
 
 
@@ -150,9 +157,12 @@ def polars_storage_options(properties: Mapping[str, str]) -> dict[str, str]:
 
 
 def scrub_values(text: str, values: Sequence[str]) -> str:
-    """`text` with every non-empty value in `values` replaced, so no credential reaches output."""
+    """`text` with every value in `values` replaced, so no credential reaches output.
+
+    Values shorter than MIN_SECRET_CHARS (including the empty string) are left alone.
+    """
     for value in values:
-        if value:
+        if len(value) >= MIN_SECRET_CHARS:
             text = text.replace(value, "<redacted>")
     return text
 
@@ -403,7 +413,7 @@ def read_polars(job: Mapping[str, Any]) -> list[dict[str, Any]]:
 
     Polars loads tables through PyIceberg, so a table PyIceberg cannot load is cannot-load here
     too, and the error says so. The storage options hold the vended credentials: they stay in a
-    local variable, and any error text is scrubbed of their values before it is kept.
+    local variable, and any error text is scrubbed of their values before it is truncated.
     """
     import polars as pl
 
@@ -426,7 +436,7 @@ def read_polars(job: Mapping[str, Any]) -> list[dict[str, Any]]:
             count, digest = row_hash.arrow_table_digest(frame.to_arrow(), COLUMNS, JSON_COLUMNS)
             rows.append(loaded(table, "polars", count, digest, current_snapshot_id(iceberg_table)))
         except Exception as exc:
-            message = scrub_values(error_text(exc), list(options.values()))
+            message = error_text(exc, list(options.values()))
             rows.append(cannot_load(table, "polars", message))
     return rows
 
