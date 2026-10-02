@@ -264,10 +264,11 @@ services:
     mem_limit: 3g
     memswap_limit: 3g
 
-  # Item 3 and 9's dbt runner, never started by `just up`. No infra/.env key reaches it:
+  # Items 3, 9, 4 and 7's dbt runner, never started by `just up`. No infra/.env key reaches it:
   # Lakekeeper vends the storage credentials to DuckDB. The analytics tree is mounted read-write
-  # because dbt writes its git-ignored target/ and logs/ there. The /tmp tmpfs is exec because dbt
-  # loads the ADBC driver and the DuckDB extensions it downloads into HOME on first run.
+  # because dbt writes its git-ignored target/ and logs/ there and DuckDB's Iceberg writer makes an
+  # empty data/ directory. The /tmp tmpfs is exec because DuckDB loads the extensions it downloads
+  # into HOME.
   dbt-job:
     <<: *defaults
     build:
@@ -280,7 +281,7 @@ services:
       HOME: /tmp
       DO_NOT_TRACK: "1"
       AWS_EC2_METADATA_DISABLED: "true"
-    working_dir: /work/analytics/dbt/lakekeeper
+    working_dir: /work/analytics/dbt
     volumes:
       - ../analytics:/work/analytics
       - ../scripts:/app:ro

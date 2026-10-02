@@ -1,6 +1,6 @@
 {{ config(
     materialized='incremental',
-    catalog_name=var('catalog', none),
+    iceberg_catalog=var('catalog', none),
     schema='silver_spike',
     iceberg_version=3,
     incremental_strategy='iceberg_merge',

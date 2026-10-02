@@ -2,8 +2,9 @@
     {{ custom_schema_name if custom_schema_name is not none else target.schema }}
 {%- endmacro %}
 
-{#- Overrides dbt-duckdb's macro to add the format-version clause dbt 2.0.6 ignores. Keeps the
-    full dbt-duckdb 1.11.0 signature so the same file works on the dbt-core fallback. -#}
+{#- Overrides dbt-duckdb's macro. dbt-duckdb emits a plain create table and never sets the format
+    version, so this adds the WITH clause only on the catalog the model names. Keeps the full
+    dbt-duckdb 1.11.0 signature. -#}
 {% macro duckdb__create_table_as(
     temporary,
     relation,
@@ -13,7 +14,7 @@
     sorted_by=none
 ) -%}
     {%- set fv = config.get('iceberg_version', none) -%}
-    {%- set cat = config.get('catalog_name', none) -%}
+    {%- set cat = config.get('iceberg_catalog', none) -%}
     {%- set versioned = fv and cat and not temporary and relation.database == cat -%}
     create {% if temporary %}temporary {% endif %}table
     {{ relation.include(database=(not temporary), schema=(not temporary)) }}

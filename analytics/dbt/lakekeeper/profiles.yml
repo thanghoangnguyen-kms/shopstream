@@ -1,7 +1,0 @@
-shopstream:
-  target: lk
-  outputs:
-    lk:
-      type: duckdb
-      path: ":memory:"
-      threads: 1

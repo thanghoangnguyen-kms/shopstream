@@ -1,0 +1,20 @@
+shopstream:
+  target: lk
+  outputs:
+    lk:
+      type: duckdb
+      path: ":memory:"
+      database: lk
+      threads: 1
+      extensions: [iceberg, httpfs]
+      attach:
+        - path: spike
+          alias: lk
+          type: iceberg
+          options:
+            endpoint: "http://lakekeeper:8181/catalog"
+            authorization_type: none
+    ci:
+      type: duckdb
+      path: ":memory:"
+      threads: 1

@@ -349,6 +349,7 @@ def test_the_dbt_job_is_built_from_the_dbt_dockerfile_and_locked_down() -> None:
     service = SERVICES["dbt-job"]
     assert "image" not in service
     assert service["build"] == {"context": "..", "dockerfile": "infra/dbt/Dockerfile"}
+    assert service["working_dir"] == "/work/analytics/dbt"
     assert service["read_only"] is True
     assert service["user"] == "65534:65534"
     (entry,) = service["tmpfs"]
