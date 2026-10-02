@@ -457,7 +457,7 @@ Recorded 2026-10-02.
 
 Verdict: fallback. The owner chose ADR-001's fixed fallback (dbt-core 1.x with dbt-duckdb on standalone DuckDB 1.5.5) over dbt 2.0.6 for building Iceberg v3 tables, on the tested rule's `inconclusive` result: dbt 2.0.6 built the table at format-version 3 and merged the second batch, but its bundled DuckDB 1.5.4 writes deletion vectors that a second engine, DuckDB 1.5.5, rejects with "Deletion vector file is not a valid Puffin file (bad trailing magic)".
 
-What this page does not show: the fallback runtime has not been run in this repo yet, so item 3's go criterion on the fallback is pending a Phase 3 replan, and stage 3's idempotency is unproven on a second reader. Research ran the same macro file on dbt-core 1.12.5 with dbt-duckdb 1.11.0 on 2026-10-02; that is a research observation, not evidence recorded here.
+What this section's dbt 2.0.6 record does not show is a second reader's read of stages 2 and 3, because DuckDB 1.5.5 rejected them. The fallback runtime was run afterwards, and the Fallback runtime subsection below records it.
 
 ### Versions
 
@@ -529,11 +529,92 @@ merge into "lk"."silver_spike"."inc_v3" as d
 
 ### Consequences
 
-- Silver and gold are not built by dbt 2.0.6. ADR-001's fixed fallback replaces it for building Iceberg v3 tables: dbt-core 1.x with dbt-duckdb on standalone DuckDB 1.5.5. The fallback has not been run in this phase, and its package pins are not yet approved. Item 3's go criterion on the fallback is pending the Phase 3 replan, so items 9 and 4 are replanned on it, not run on dbt 2.0.6.
+- Silver and gold are not built by dbt 2.0.6. ADR-001's fixed fallback replaces it for building Iceberg v3 tables: dbt-core 1.x with dbt-duckdb on standalone DuckDB 1.5.5. The Fallback runtime subsection below records that runtime and the rule's result on it, so items 9 and 4 run on the fallback, not on dbt 2.0.6.
 - G11 (`sqlfluff-templater-dbt` needs dbt-core 1.x) is affected by the fallback: dbt-core 1.x is the runtime the fallback provides.
 - dbt 2.0.6 ignores `iceberg_version` and `tblproperties` for DuckDB, so v3 comes from the project macro `duckdb__create_table_as`, which adds the `with ('format-version' = 3)` clause. The incremental strategy issues two MERGE INTO statements because DuckDB's Iceberg MERGE takes one UPDATE-or-DELETE action (dbt-labs/dbt#16018 tracks the DuckDB feature work).
-- The macro file keeps dbt-duckdb 1.11.0's full macro signature, and research ran the same file on dbt-core 1.12.5 with dbt-duckdb 1.11.0 on 2026-10-02. That run is research and was not rerun here.
+- The macro file keeps dbt-duckdb 1.11.0's full macro signature, and research ran the same file on dbt-core 1.12.5 with dbt-duckdb 1.11.0 on 2026-10-02. The Fallback runtime subsection below reruns it in this repo.
 - The bundled DuckDB version (1.5.4, measured) and the Version matrix's 1.5.5 differ, an owner hand-off. Phase 6 mirrors this verdict into ADR-001's Results table.
+
+### Fallback runtime
+
+Recorded 2026-10-02. The tested rule returned go on ADR-001's fixed fallback, dbt-core 1.12.5 with dbt-duckdb 1.11.0 on DuckDB 1.5.5, quoted in the Rule paragraph below.
+
+#### Versions and licences
+
+- `dbt --version` prints `installed: 1.12.5` for the core and `duckdb: 1.11.0` for the plugin. dbt's own `select version()` on the `lk` target prints `v1.5.5`, so the DuckDB inside dbt-duckdb is the Version matrix's 1.5.5, where dbt 2.0.6's bundled one was 1.5.4.
+- Licences: dbt-core and dbt-duckdb are Apache-2.0, DuckDB is MIT. dbt 2.0.6 left the build, so the owner's earlier condition on the dbt Product Licensing Agreement no longer applies.
+- dbt image `shopstream-dbt-job`: id `sha256:83a2dab73350ec6e33c0cb7e40fd5c9a941761802e246bad1fd62e9c4ba094a4`, 174707961 bytes. Base image `python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b`, uv `0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc`.
+- The spark-job image reads the finished table with Spark 4.1.3 and Iceberg 1.11.0, and with PyIceberg 0.12.0. Lakekeeper 0.13.6, SeaweedFS 4.47.
+- One transitive package is an sdist that downloads a binary at build time. dbt-core 1.12.5 requires `dbt-core-experimental-parser` 2.0.5, a 4.8 KB sdist with no wheel on PyPI, whose build backend downloads a platform wheel from the github.com/dbt-labs/dbt releases and fails on a sha256 that differs from the one inside the sdist. The lock pins the sdist's hash, and the image build and an uncached CI sync need outbound github.com. The owner approved this before the lock was written.
+
+#### Project
+
+One dbt project at `analytics/dbt`, in place of dbt 2's wrapper directory and `catalogs.yml`. Its `profiles.yml` has two targets. `lk` is an in-memory DuckDB that attaches the spike warehouse as alias `lk` (type `iceberg`, the Lakekeeper catalog endpoint, no authorization, vended credentials), and `ci` is in-memory with no attach and no extension. The model config key is `iceberg_catalog`: dbt-core reads the key `catalog_name` as the name of a catalog integration and stops with "Catalog not found" before any SQL runs. v3 still comes from the project macro `duckdb__create_table_as`, because dbt-duckdb emits a plain `create table`. The one incremental model is the same `silver_spike.inc_v3`, keyed on `id`, fed from a seed with a `batch` column.
+
+#### Command
+
+One sequence ran in order, each build selecting `+inc_v3` so it never touches other models. `inspect` reads `metadata.json` itself from SeaweedFS with the key `loadTable` vends, and keeps no credential in its output. The captures went through `scripts/redact_evidence.py`.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job python /app/dbt_v3_check.py reset
+{"reset": 204}
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T dbt-job /opt/dbt/bin/dbt build --target lk --select +inc_v3 --project-dir /work/analytics/dbt --profiles-dir /work/analytics/dbt --vars '{batch: 1}'
+1 seed loaded, 1 incremental model created, 2 data tests ok (4 of 4 steps)
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job python /app/dbt_v3_check.py inspect     (stage 1)
+$ ... dbt build ... --vars '{batch: 2}'     (4 of 4 steps ok)
+$ ... dbt_v3_check.py inspect     (stage 2)
+$ ... dbt build ... --vars '{batch: 2}'     (4 of 4 steps ok, the rerun)
+$ ... dbt_v3_check.py inspect     (stage 3)
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job python /app/dbt_v3_check.py engines
+$ uv run --frozen python scripts/dbt_v3_check.py verdict stage1.json stage2.json stage3.json engines.json
+```
+
+#### Stages
+
+All three stages share table uuid `01a0fd53` and read `"format-version": 3` in `metadata.json`, agreeing with `loadTable`. DuckDB 1.5.5 read every stage without an error.
+
+| Stage | Snapshot operations, in sequence-number order | DuckDB 1.5.5 rows |
+| --- | --- | --- |
+| 1, batch 1 | append | (1, a), (2, b), (3, c) |
+| 2, batch 2 | append, delete, overwrite | (1, a), (2, b-updated) |
+| 3, batch 2 again | append, delete, overwrite, overwrite | (1, a), (2, b-updated) |
+
+The stage 1 append is the first snapshot in all three stages and the table uuid never changes, so the run merged into the table and did not recreate it. In stage 2 the delete snapshot added 1 delete file and 1 position delete (total-records 3), and the overwrite added 1 data file, 1 record, 1 delete file and 2 position deletes (total-records 4). Stage 3's extra overwrite added 1 data file, 1 record, 1 delete file and 1 position delete (total-records 5). Key 2 is updated in place, key 3 is deleted, key 1 is untouched, and dbt's `unique` and `not_null` tests on `id` ran in every build and succeeded, so no key appears twice. Running the merge a second time leaves the same two rows.
+
+#### Second engines
+
+Spark 4.1.3 with Iceberg 1.11.0 and PyIceberg 0.12.0 each read exactly (1, a, false) and (2, b-updated, false) from the table at stage 3. PyIceberg listed two delete files, and the script read each one's bytes through the table's own file access.
+
+| Delete file | Format | Content | Size | PFA1 at the start | PFA1 at the end |
+| --- | --- | --- | --- | --- | --- |
+| 1 | PUFFIN | 1 | 336 bytes | yes | yes |
+| 2 | PUFFIN | 1 | 338 bytes | yes | yes |
+
+Every deletion vector is a valid Puffin file. dbt 2.0.6 wrote 42- and 44-byte raw blobs with no Puffin header or footer, which is what DuckDB 1.5.5 rejected above.
+
+#### MERGE statements
+
+dbt-core writes the compiled statements for the batch-2 build to `target/run/shopstream/models/silver_spike/inc_v3.sql`. The temporary table's name suffix is dbt's run id.
+
+```sql
+merge into "lk"."silver_spike"."inc_v3" as d using "inc_v3__dbt_tmp<run-id>" as s on (s.id = d.id)
+    when matched and s.is_deleted then delete;
+merge into "lk"."silver_spike"."inc_v3" as d
+    using (select * from "inc_v3__dbt_tmp<run-id>" where not is_deleted) as s
+    on (s.id = d.id)
+    when matched then update by name
+    when not matched then insert by name
+```
+
+#### Rule
+
+The rule's output with the engines line as its fourth input, verbatim (exit 0):
+
+```text
+{"verdict": "go", "reasons": ["all three stages hold: format-version 3 in metadata.json, the append then the delete and overwrite merge commits, exactly (1, a), (2, b-updated), unchanged by the rerun", "a second engine family agrees: Spark with Iceberg and PyIceberg read exactly (1, a), (2, b-updated), and every deletion vector is a Puffin file with PFA1 magic at both ends"]}
+```
+
+The three-stage rule alone also returned go on the same three stage lines. The page's `Verdict: fallback.` line stays: it records the owner's choice of ADR-001's fallback over dbt 2.0.6, and this subsection records that the fallback meets item 3's criteria.
 
 ## Item 4: Semantic layer
 
