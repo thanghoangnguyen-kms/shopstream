@@ -1,8 +1,9 @@
 """Unit tests for scripts/probe_scope.py. No Docker, no boto3: every seam is replaced by a fake.
 
 The fakes model a small world: a bucket of keys, a Lakekeeper catalog that vends one credential
-per table, and a vended credential that reaches only its own table's prefix. Fake secrets come
-from secrets.token_hex so nothing credential-shaped sits in the file.
+per table, and a vended credential that reaches only its own table's prefix. The catalog can also
+vend without the delegation header, as Lakekeeper 0.13.6 does. Fake secrets come from
+secrets.token_hex so nothing credential-shaped sits in the file.
 """
 
 from __future__ import annotations
@@ -50,9 +51,18 @@ class FakeClientError(Exception):
 class World:
     """The bucket, the catalog and every credential the probe will be handed."""
 
-    def __init__(self, *, vended_read_only: bool = False, vended_reaches_all: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        vended_read_only: bool = False,
+        vended_reaches_all: bool = False,
+        vends_without_header: bool = False,
+        no_header_prefix: str | None = None,
+    ) -> None:
         self.vended_read_only = vended_read_only
         self.vended_reaches_all = vended_reaches_all
+        self.vends_without_header = vends_without_header
+        self.no_header_prefix = no_header_prefix
         self.objects: set[str] = set()
         self.tables: dict[str, str] = {}
         self.namespace = False
@@ -141,11 +151,15 @@ class World:
             "metadata": {"location": location},
             "config": {},
         }
-        if headers.get("X-Iceberg-Access-Delegation") == "vended-credentials":
+        delegated = headers.get("X-Iceberg-Access-Delegation") == "vended-credentials"
+        if delegated or self.vends_without_header:
             expires = str(int((NOW + 3600) * 1000))
+            prefix = (
+                location if delegated or self.no_header_prefix is None else self.no_header_prefix
+            )
             document["storage-credentials"] = [
                 {
-                    "prefix": location,
+                    "prefix": prefix,
                     "config": {
                         "s3.access-key-id": self.vended_pair[0],
                         "s3.secret-access-key": self.vended_pair[1],
@@ -154,6 +168,12 @@ class World:
                     },
                 }
             ]
+        if self.vends_without_header and not delegated:
+            document["config"] = {
+                "s3.access-key-id": self.vended_pair[0],
+                "s3.secret-access-key": self.vended_pair[1],
+                "s3.session-token": self.vended_session,
+            }
         return 200, document
 
     def _management(self, path: str) -> tuple[int, dict[str, Any] | None]:
@@ -320,6 +340,8 @@ def good_result(*, read_only: bool = False) -> dict[str, Any]:
         "vending": {
             "with_header": True,
             "without_header": False,
+            "without_header_prefix_matches_location": None,
+            "without_header_config_vends": False,
             "expires_in_s": 3600,
             "prefix_matches_location": True,
         },
@@ -637,7 +659,6 @@ def test_verdict_is_inconclusive_when_a_control_or_a_status_cannot_be_trusted(
 @pytest.mark.parametrize(
     "vending",
     [
-        {"without_header": True},
         {"expires_in_s": 3661},
         {"expires_in_s": 0},
         {"expires_in_s": -20},
@@ -649,6 +670,34 @@ def test_verdict_is_inconclusive_when_the_vending_checks_fail(vending: dict[str,
     result = good_result()
     result["vending"].update(vending)
     assert ps.verdict(result)[0] == "inconclusive"
+
+
+ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    "vending",
+    [
+        {"without_header": True},
+        {"without_header": False},
+        {"without_header": None},
+        {"without_header": ABSENT},
+        {"without_header": True, "without_header_prefix_matches_location": True},
+        {"without_header": True, "without_header_prefix_matches_location": False},
+        {"without_header": True, "without_header_prefix_matches_location": None},
+        {"without_header_prefix_matches_location": ABSENT, "without_header_config_vends": ABSENT},
+        {"without_header": True, "without_header_config_vends": True},
+        {"without_header": False, "without_header_config_vends": False},
+    ],
+)
+def test_the_no_header_result_never_moves_the_verdict(vending: dict[str, Any]) -> None:
+    result = good_result()
+    for name, value in vending.items():
+        if value is ABSENT:
+            result["vending"].pop(name, None)
+        else:
+            result["vending"][name] = value
+    assert ps.verdict(result) == ("go", ps.GO_BRANCH)
 
 
 def test_verdict_is_inconclusive_without_any_positive_control() -> None:
@@ -725,6 +774,84 @@ def test_a_queue_that_only_the_openapi_paths_name_still_counts() -> None:
     assert ps.classify_queues(INFO, paths)["expire_snapshots"] == "present"
 
 
+# --- the no-header observation -----------------------------------------------------------------------
+
+LOCATION = "s3://warehouse/0190aaaa"
+
+
+def key_fields(**changes: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "s3.access-key-id": secrets.token_hex(8),
+        "s3.secret-access-key": secrets.token_hex(16),
+        "s3.session-token": secrets.token_hex(24),
+    }
+    fields.update(changes)
+    return fields
+
+
+def no_header_response(prefix: object, config: object) -> dict[str, Any]:
+    entry = {"prefix": prefix, "config": key_fields()}
+    return {"storage-credentials": [entry], "config": config}
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"config": {}}, (False, None, False)),
+        ({}, (False, None, False)),
+        ({"storage-credentials": []}, (False, None, False)),
+        (no_header_response(LOCATION, {}), (True, True, False)),
+        (no_header_response(LOCATION + "/", {}), (True, True, False)),
+        (no_header_response(LOCATION + "//", {}), (True, False, False)),
+        (no_header_response("s3://warehouse", {}), (True, False, False)),
+        (no_header_response("s3://warehouse/0190aaaax", {}), (True, False, False)),
+        (no_header_response(None, {}), (True, False, False)),
+        (no_header_response(LOCATION, key_fields()), (True, True, True)),
+        (no_header_response(LOCATION, key_fields(**{"s3.session-token": ""})), (True, True, False)),
+        (
+            no_header_response(LOCATION, key_fields(**{"s3.secret-access-key": 7})),
+            (True, True, False),
+        ),
+        (no_header_response(LOCATION, "not a mapping"), (True, True, False)),
+        (
+            {
+                "storage-credentials": [{"prefix": LOCATION}],
+                "config": key_fields(),
+            },
+            (False, True, True),
+        ),
+    ],
+)
+def test_no_header_observation(
+    response: dict[str, Any], expected: tuple[bool, bool | None, bool]
+) -> None:
+    observed = ps.no_header_observation(response, LOCATION)
+    assert list(observed) == [
+        "without_header",
+        "without_header_prefix_matches_location",
+        "without_header_config_vends",
+    ]
+    assert tuple(observed.values()) == expected
+
+
+def test_no_header_observation_without_a_config_vends_only_when_all_three_fields_are_there() -> (
+    None
+):
+    config = key_fields()
+    del config["s3.access-key-id"]
+    observed = ps.no_header_observation(no_header_response(LOCATION, config), LOCATION)
+    assert observed["without_header_config_vends"] is False
+
+
+def test_the_no_header_field_names_are_not_credential_names() -> None:
+    for name in (
+        "without_header",
+        "without_header_prefix_matches_location",
+        "without_header_config_vends",
+    ):
+        assert not redact_evidence.is_secret_name(name)
+
+
 # --- main end to end ----------------------------------------------------------------------------------
 
 
@@ -754,14 +881,61 @@ def test_main_prints_one_json_line_with_the_go_verdict_and_leaks_no_secret(
     assert document["vending"] == {
         "with_header": True,
         "without_header": False,
+        "without_header_prefix_matches_location": None,
+        "without_header_config_vends": False,
         "expires_in_s": 3600,
         "prefix_matches_location": True,
     }
+    assert list(document["vending"]) == [
+        "with_header",
+        "without_header",
+        "without_header_prefix_matches_location",
+        "without_header_config_vends",
+        "expires_in_s",
+        "prefix_matches_location",
+    ]
     assert world.handed_out
     for secret in world.handed_out:
         assert secret not in out
         assert secret not in err
     assert not [key for key in keys_of(document) if redact_evidence.is_secret_name(key)]
+
+
+def test_main_is_go_when_lakekeeper_vends_without_the_delegation_header(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = World(vends_without_header=True)
+    install(monkeypatch, fake)
+    code, out, err = run_main(capsys, "--json")
+    assert code == 0
+    document = json.loads(out)
+    assert (document["verdict"], document["branch"]) == ("go", ps.GO_BRANCH)
+    assert document["vending"] == {
+        "with_header": True,
+        "without_header": True,
+        "without_header_prefix_matches_location": True,
+        "without_header_config_vends": True,
+        "expires_in_s": 3600,
+        "prefix_matches_location": True,
+    }
+    assert all(row["ok"] for row in document["matrix"] + document["assume_role"])
+    assert fake.handed_out
+    for secret in fake.handed_out:
+        assert secret not in out
+        assert secret not in err
+    assert not [key for key in keys_of(document) if redact_evidence.is_secret_name(key)]
+
+
+def test_a_no_header_entry_for_another_prefix_is_recorded_and_still_go(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install(monkeypatch, World(vends_without_header=True, no_header_prefix="s3://warehouse"))
+    code, out, _ = run_main(capsys, "--json")
+    document = json.loads(out)
+    assert code == 0
+    assert (document["verdict"], document["branch"]) == ("go", ps.GO_BRANCH)
+    assert document["vending"]["without_header"] is True
+    assert document["vending"]["without_header_prefix_matches_location"] is False
 
 
 def test_the_garbage_key_is_built_at_run_time_and_is_not_one_of_the_real_keys(

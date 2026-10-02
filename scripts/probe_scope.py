@@ -311,6 +311,12 @@ def vended_config(load_table_json: Mapping[str, Any]) -> Mapping[str, Any] | Non
     return config if isinstance(config, Mapping) else None
 
 
+def no_header_observation(
+    load_table_json: Mapping[str, Any], location: str
+) -> dict[str, bool | None]:
+    raise NotImplementedError
+
+
 def expires_in_s(config: Mapping[str, Any], at: float) -> int | None:
     """Seconds from `at` to the credential's expiry; None when the field is absent or unreadable."""
     raw = config.get("s3.session-token-expires-at-ms")
