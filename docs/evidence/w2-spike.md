@@ -997,7 +997,99 @@ Research ran `sqlfluff-templater-dbt` 4.3.0 beside `sqlfluff` 4.3.0, dbt-core 1.
 
 ## Item 10: FX offline
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: go. Frankfurter 2.5.1, seeded online once from an empty volume with ECB only and the backfill confirmed complete, served the dlt pipeline through the v2 API with providers=ECB while the loader's network had no route out, and the loaded rates skip every weekend and every TARGET closing day. The full load covered 1999-01-04 to 2026-10-02 (the ECB end date on the seed day): 270,096 rows, 7,106 distinct non-EUR dates, 0 weekend rows, and the 134 weekdays with no rows are exactly the 134 TARGET closing weekdays, with 0 mismatches either way.
+
+### Versions
+
+- Frankfurter image: `docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32` (image id `sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32`). The seed, the offline server and the volume owner use the same string as the core service.
+- The loader runs in the spike image: dlt 1.30.0, DuckDB 1.5.5, Python 3.13.15, all read from the loader's own output.
+
+### Seed
+
+The seed is the `frankfurter-seed` one-shot on the empty `frankfurter-fx-data` volume, the only service with a route to the ECB. It runs once, online, as uid 1000 under a 640m limit, after `frankfurter-fx-init` has chowned the volume, and it exits before `frankfurter-offline` starts.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T frankfurter-seed
+  entrypoint: sh -c "bundle exec rake db:setup && bundle exec rake 'backfill[ECB]'"
+I, [2026-10-02T16:48:29.433202 #9]  INFO -- : ECB: backfilling from 1999-01-04
+I, [2026-10-02T16:48:32.439572 #9]  INFO -- : ECB: inserted 8840 rates
+  ... 26 more chunks, one per year of 5,700 to 11,100 rates ...
+I, [2026-10-02T16:50:56.637662 #9]  INFO -- : ECB: inserted 7620 rates
+exit 0, wall time 2:32.35 (the first chunk logged 16:48:29, the last 16:51:00)
+```
+
+`db:setup` and `backfill[ECB]` both worked on the fresh volume with no extra task to register providers. Memory peak from `just mem-report` over the 33 frames sampled during the seed (one every 5 s, so a short peak can fall between samples): the seed container peaked at 126.7 MiB against its 640 MiB limit. The report's exit code was 1, because the core frankfurter container was OOM-killed in an earlier run and was not running to be sampled (see Observations); that was expected and was not changed.
+
+```text
+service                 peak MiB  mem_limit MiB
+seaweedfs                  180.7          768.0
+postgres                   131.1          512.0
+frankfurter-seed-run       126.7              -
+lakekeeper                  33.0          256.0
+```
+
+Completeness is read from `GET /v2/providers`, not from the root route (which is healthy long before a backfill ends). The ECB entry after the seed:
+
+```text
+name: European Central Bank
+start_date: 1999-01-04
+end_date: 2026-10-02
+publishes_missed: 0
+```
+
+The loader refuses to load unless the start date is 1999-01-04, `publishes_missed` is 0 and the end date is at most 4 days before the run date (no ECB publication gap since 1999 is longer than 4 days).
+
+### Network cut
+
+`fx_offline` is a Compose network with `internal: true`. Only `fx-load` and the web-only `frankfurter-offline` (puma without the scheduler, network alias `frankfurter`, no published port) sit on it; no other service sets a network. The loader shows the cut from inside its own container before it loads, and reads the providers entry through the Frankfurter on the same network:
+
+```text
+dns_blocked: true   getaddrinfo for data-api.ecb.europa.eu: [Errno -3] Temporary failure in name resolution
+ip_blocked: true    TCP connect to 1.1.1.1 port 443 (5 s timeout): [Errno 101] Network is unreachable
+http://frankfurter:8080/v2/providers answered with the ECB entry above
+```
+
+### Load
+
+The loader is `scripts/fx_load.py`, run as the `fx-load` one-shot. It fetches `GET /v2/rates?providers=ECB&from=<year start>&to=<year end>` once per calendar year, drops each range's carry-in anchor row (a range that starts on a non-publication day also returns the previous publication date), and loads into DuckDB with dlt (pipeline `fx`, dataset `bronze`, table `fx_rates`, merge on date, base and quote). dlt telemetry is off. No random seed exists for this script; the seed command above is its other input.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T fx-load python /app/fx_load.py --from 2025-01-01
+from 2025-01-01 to 2026-10-02: rows 13695, distinct non-EUR dates 448, min date 2025-01-02, max date 2026-10-02, weekend rows 0, load 0.83 s
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T fx-load python /app/fx_load.py
+from 1999-01-04 to 2026-10-02: rows 270096, distinct non-EUR dates 7106, min date 1999-01-04, max date 2026-10-02, weekend rows 0, load 12.66 s
+```
+
+The first run's minimum date is 2025-01-02, so the anchor row dated 2024-12-31 did not survive. `--api v1` was not needed, so the v1 path (`/v1/<from>..<to>`, ECB only) was not run.
+
+### Gaps
+
+Over the full range the loader compares the distinct non-EUR dates (the EUR/EUR identity record is left out) with the weekdays of the range and the TARGET calendar:
+
+```text
+weekdays in range: 7240
+missing weekdays: 134
+TARGET closing weekdays in range: 134
+missing weekdays that are not closing days: []
+closing days that hold rows: []
+```
+
+The calendar rule is 1 January, 25 and 26 December every year; Good Friday, Easter Monday (from the date of Easter via `dateutil.easter`, already in the lock through pandas) and 1 May from 2000; 31 December through 2001. Easter was not a closing day in 1999, so 1999-04-02 and 1999-04-05 hold rows. This rule is inferred from the data and general TARGET knowledge, not read from an ECB page, which is why the check prints every mismatch both ways instead of assuming the rule. No holiday package was added.
+
+### Observations
+
+- The core `frankfurter` container's current state: `exited, OOMKilled=true, RestartCount=0`. It was left untouched.
+- An earlier look on 2026-10-02 found the core service, which runs every provider's scheduler, OOM-killed twice on its filled volume and never finishing the ECB backfill (about 1.3 GB of SQLite plus a 133 MB WAL). The cause is assumed, not isolated. The seed here fetched ECB only and finished in 2.5 minutes under a peak of 126.7 MiB.
+- Web-only Frankfurter (`frankfurter-offline`): 88.5 MiB peak against its 256 MiB limit, from `just mem-report` over 7 frames (30 s) during a full-range load. The loader container peaked at 887.3 MiB against its 1g limit in the same report; docker stats counts the DuckDB file on the `/tmp` tmpfs and the page cache, so the loader has little headroom if the range or the table grows.
+- `frankfurter-offline` was removed (`rm -sf`) before the seed and after every load, so the SQLite file never had two writers, and the core frankfurter never mounts `frankfurter-fx-data`.
+
+### Consequences
+
+- ADR-001 item 10: go. v2 with `providers=ECB` works; v1 was not needed, so no fallback line applies.
+- The knob "FX weekend and holiday gaps" reaches `bronze.fx_rates` through dlt, here in the loader's own DuckDB file. How dlt writes to Lakekeeper is a Week 9 decision.
+- Phase 6 mirrors this verdict into ADR-001's Results table.
 
 ## Item 11: Two clocks
 
