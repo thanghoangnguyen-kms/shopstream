@@ -10,8 +10,12 @@ cannot resolve. One run is one probe at a time: it first drops whatever an inter
      operations on table `b`'s existing keys, on the look-alike prefix `<a>x/` and at the
      warehouse root (GET, PUT, DELETE and both list forms). Every denial has a positive control:
      the same operation on the same existing key with the lakekeeper static key must be 2xx.
-  2. Vending. `loadTable` with the delegation header returns `storage-credentials` for the table
-     location, without the header it returns none, and the expiry fits the warehouse's 3600 s.
+  2. Vending. `loadTable` with the delegation header returns `storage-credentials` whose prefix
+     is the table location, and the expiry fits the warehouse's 3600 s. The same call without the
+     header is recorded as three vending observations (whether it vends, whether its prefix is the
+     table location, and whether its top-level config carries the key fields), never as a gate:
+     Lakekeeper 0.13.6 vends with or without the header, and ADR-001 go criterion 1 asks only
+     about the header path (owner decision, 2026-10-02).
   3. Trust. AssumeRole of LakekeeperVendedRole, by its full ARN, succeeds for lakekeeper (the
      control) and is denied with HTTP 403 for probe-other, admin and a run-time garbage key. A
      400 is never counted as a denial.
@@ -314,7 +318,28 @@ def vended_config(load_table_json: Mapping[str, Any]) -> Mapping[str, Any] | Non
 def no_header_observation(
     load_table_json: Mapping[str, Any], location: str
 ) -> dict[str, bool | None]:
-    raise NotImplementedError
+    """What `loadTable` without the delegation header held, as booleans and null only.
+
+    Recorded under the owner's 2026-10-02 decision and never a verdict input. Values are read only
+    to test their type and emptiness; none is returned, printed or logged. The prefix match is
+    None when the response has no storage-credentials entry.
+    """
+    entry = _first_credentials(load_table_json)
+    prefix = entry.get("prefix") if entry is not None else None
+    prefix_matches = (
+        None
+        if entry is None
+        else isinstance(prefix, str) and _strip_one_slash(prefix) == _strip_one_slash(location)
+    )
+    config = load_table_json.get("config")
+    config_vends = isinstance(config, Mapping) and all(
+        isinstance(config.get(field), str) and bool(config.get(field)) for field in VENDED_FIELDS
+    )
+    return {
+        "without_header": vended_config(load_table_json) is not None,
+        "without_header_prefix_matches_location": prefix_matches,
+        "without_header_config_vends": config_vends,
+    }
 
 
 def expires_in_s(config: Mapping[str, Any], at: float) -> int | None:
@@ -375,8 +400,6 @@ def _verdict_inconclusive(reason: str) -> tuple[str, str]:
 
 
 def _vending_problem(vending: Mapping[str, Any]) -> str | None:
-    if vending.get("without_header") is not False:
-        return "loadTable without the delegation header returned credentials"
     if vending.get("prefix_matches_location") is not True:
         return "the storage-credentials prefix is not the table location"
     expires = vending.get("expires_in_s")
@@ -601,7 +624,7 @@ def _scope_leg(
     prefix = entry.get("prefix") if entry is not None else None
     vending: dict[str, Any] = {
         "with_header": usable,
-        "without_header": vended_config(plain_a) is not None,
+        **no_header_observation(plain_a, location_a),
         "expires_in_s": expires_in_s(config, now()) if config is not None else None,
         "prefix_matches_location": isinstance(prefix, str)
         and _strip_one_slash(prefix) == _strip_one_slash(location_a),
