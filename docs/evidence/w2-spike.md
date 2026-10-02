@@ -252,7 +252,116 @@ Phase 1 took these deviations from ADR-001, the requirements and the plans. ADR-
 
 ## Item 1: Credential scope
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: go. Figure 1 branch: "All engines: vended credentials", because vended credentials are scoped to their own table on Lakekeeper 0.13.6 and SeaweedFS 4.47, and only lakekeeper can assume the vended role.
+
+### Versions
+
+- Lakekeeper 0.13.6, `quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5`.
+- SeaweedFS 4.47, `docker.io/chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882`.
+- Probe image base `python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b`, with uv 0.12.18 (`sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc`) installing the locked `spike` group.
+- boto3 1.43.103, from `docker run --rm --entrypoint python shopstream-probe -c "import boto3; print(boto3.__version__)"`.
+
+### Commands
+
+The probe runs inside the Compose network, because Lakekeeper vends an S3 endpoint that the macOS host cannot resolve. It needs both profiles, because `probe` depends on `lakekeeper`. The script is bind-mounted, so the image holds no probe code and no key.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike build probe
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T probe
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T probe python /app/probe_scope.py
+$ COMPOSE_PROFILES=spike uv run just up
+```
+
+The first run prints one JSON line and the second prints the matrix below. Both gave verdict go on one stack, one at a time. The last command exited 0 and created no probe service container, so the `spike` profile stays out of `just up`.
+
+### Allow and deny matrix
+
+Redacted output of the second run. Each denial is a 403 AccessDenied with a 2xx lakekeeper control on the same existing key.
+
+```text
+vended own put status=200 error=- expected=allow ok=True
+vended own get status=200 error=- expected=allow ok=True
+vended own list status=200 error=- expected=allow ok=True
+vended own delete status=204 error=- expected=allow ok=True
+vended own multipart status=200 error=- expected=allow ok=True
+vended sibling get_metadata status=403 error=AccessDenied expected=deny ok=True
+vended sibling get status=403 error=AccessDenied expected=deny ok=True
+vended sibling put status=403 error=AccessDenied expected=deny ok=True
+vended sibling list status=403 error=AccessDenied expected=deny ok=True
+vended sibling multipart status=403 error=AccessDenied expected=deny ok=True
+vended sibling delete status=403 error=AccessDenied expected=deny ok=True
+vended lookalike put status=403 error=AccessDenied expected=deny ok=True
+vended root get status=403 error=AccessDenied expected=deny ok=True
+vended root put status=403 error=AccessDenied expected=deny ok=True
+vended root list_prefix_empty status=403 error=AccessDenied expected=deny ok=True
+vended root list_no_prefix status=403 error=AccessDenied expected=deny ok=True
+vended root delete status=403 error=AccessDenied expected=deny ok=True
+lakekeeper sibling get_metadata status=200 error=- expected=allow ok=True
+lakekeeper sibling put status=200 error=- expected=allow ok=True
+lakekeeper sibling get status=200 error=- expected=allow ok=True
+lakekeeper sibling list status=200 error=- expected=allow ok=True
+lakekeeper sibling multipart status=200 error=- expected=allow ok=True
+lakekeeper sibling delete status=204 error=- expected=allow ok=True
+lakekeeper root put status=200 error=- expected=allow ok=True
+lakekeeper root get status=200 error=- expected=allow ok=True
+lakekeeper root list_prefix_empty status=200 error=- expected=allow ok=True
+lakekeeper root list_no_prefix status=200 error=- expected=allow ok=True
+lakekeeper root delete status=204 error=- expected=allow ok=True
+lakekeeper LakekeeperVendedRole assume_role status=200 error=- expected=allow ok=True
+probe-other LakekeeperVendedRole assume_role status=403 error=AccessDenied expected=deny ok=True
+admin LakekeeperVendedRole assume_role status=403 error=AccessDenied expected=deny ok=True
+garbage LakekeeperVendedRole assume_role status=403 error=- expected=deny ok=True
+observation vended own list_no_slash status=403 error=AccessDenied observed=deny
+observation vended bucket list_buckets status=200 error=- observed=allow
+vending with_header=True without_header=True without_header_prefix_matches_location=True without_header_config_vends=True expires_in_s=3600 prefix_matches_location=True
+queues version=0.13.6 license_type=Apache-2.0 listed=['tabular_expiration', 'tabular_purge', 'task_log_cleanup'] openapi_queue_paths=['tabular_expiration', 'tabular_purge', 'task_log_cleanup'] expire_snapshots=absent orphan_removal=absent delete_profile=hard any_name_route_status=200
+verdict: go (All engines: vended credentials)
+```
+
+The first run's verdict line, trimmed to its verdict and vending block:
+
+```text
+{"verdict":"go","branch":"All engines: vended credentials","vending":{"with_header":true,"without_header":true,"without_header_prefix_matches_location":true,"without_header_config_vends":true,"expires_in_s":3599,"prefix_matches_location":true}}
+```
+
+### Observations
+
+- ListBuckets answers 200 with vended credentials. That exposes bucket names only; go criterion 1 concerns object access, which was denied.
+- The list without the trailing slash is denied even inside the table, so only the trailing-slash list is scored.
+- The credential expiry was 3599 s in the first run and 3600 s in the second, against the warehouse's 3600 s.
+- The look-alike PUT to the key of table a followed by `x/probe.bin` is denied, so adjacent prefixes stay separate.
+
+### loadTable without the delegation header
+
+Without `X-Iceberg-Access-Delegation`, Lakekeeper 0.13.6 still returns `storage-credentials`. Its one entry's prefix is the table location (`without_header` true and `without_header_prefix_matches_location` true in the matrix block above). The top-level `config` also carries the three credential fields (`without_header_config_vends` true). No value was captured.
+
+The probe records this as an observation, not a gate. ADR-001 go criterion 1 asks that `loadTable` with `vended-credentials` returns `storage-credentials`, and says nothing about the request without it.
+
+An earlier run treated the no-header result as a gate and stopped as inconclusive. On 2026-10-02 the owner dropped that gate, and the probe was re-run with every other control unchanged.
+
+Whether no-header vending matters for ADR-001 is the owner's question. This page does not change the ADR.
+
+### Lakekeeper maintenance queues (PLAT-11)
+
+`GET /management/v1/info`, reduced to its version, queues and license type:
+
+```text
+{"version": "0.13.6", "queues": ["tabular_expiration", "tabular_purge", "task_log_cleanup"], "license-type": "Apache-2.0"}
+```
+
+The expire-snapshots and orphan-removal queues are absent from Lakekeeper 0.13.6 (Apache-2.0; they are Lakekeeper+ features), so both are off: the queues are tabular_expiration, tabular_purge and task_log_cleanup, and the spike warehouse's delete profile is hard.
+
+The per-name queue config route answered 200 for the made-up name `definitely_not_a_queue`, so that route proves nothing.
+
+ADR-001's Decided-now row says 0.13.x "still has" both queues, while the measurement shows they are absent. The wording is the owner's to amend, and this page does not change it.
+
+### FALL-01
+
+FALL-01: N/A. Item 1's verdict is go, so every engine keeps vended credentials; no credential-mode switch, per-layer warehouse or full-hierarchy layout is needed.
+
+Phase 6's settling PR mirrors this verdict into ADR-001's Results table.
 
 ## Item 2: Spark v3
 
