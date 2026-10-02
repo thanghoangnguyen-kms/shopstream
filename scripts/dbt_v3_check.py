@@ -20,6 +20,7 @@ live functions, so importing this module in CI is safe.
 
 from __future__ import annotations
 
+import enum
 import gzip
 import json
 import sys
@@ -40,6 +41,8 @@ EXPECTED_AFTER_MERGE: list[list[Any]] = [[1, "a", False], [2, "b-updated", False
 # After the stage-1 append, the two MERGE commits: the delete of id 3 and the overwrite for id 2.
 MERGE_OPERATIONS = ["append", "delete", "overwrite"]
 Finding = tuple[str, str]  # (kind, message); kind is `fallback` or `inconclusive`
+PUFFIN_MAGIC = b"PFA1"
+ENGINES_GO_REASON = ""
 DELEGATION_HEADER = {"X-Iceberg-Access-Delegation": "vended-credentials"}
 GZIP_MAGIC = b"\x1f\x8b"
 # The snapshot summary keys that show what each commit did, in the order they are reported.
@@ -275,7 +278,29 @@ def stage_findings(
     return findings
 
 
-def item3_verdict(stages: Mapping[int, Mapping[str, Any] | None]) -> dict[str, Any]:
+class Omitted(enum.Enum):
+    """Marks an engines argument that was not given, as against one that is None (missing)."""
+
+    OMITTED = enum.auto()
+
+
+def puffin_magic(raw: bytes) -> tuple[bool, bool]:
+    return (False, False)
+
+
+def engine_findings(engines: Mapping[str, Any] | None) -> list[Finding]:
+    return []
+
+
+def engines() -> dict[str, Any]:
+    return {}
+
+
+def item3_verdict(
+    stages: Mapping[int, Mapping[str, Any] | None],
+    *,
+    engines: Mapping[str, Any] | Omitted | None = Omitted.OMITTED,
+) -> dict[str, Any]:
     """ADR-001 item 3's verdict from the three stages; pure, and it never mutates `stages`.
 
     `go` only when every stage holds. Any inconclusive finding wins over a fallback finding.
