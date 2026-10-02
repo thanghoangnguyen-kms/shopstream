@@ -352,3 +352,15 @@ def test_the_hand_built_job_is_not_mutated_by_the_verdict() -> None:
     before = (copy.deepcopy(job), copy.deepcopy(matrix))
     rv.item2_verdict(job, matrix)
     assert (job, matrix) == before
+
+
+def test_scrub_values_removes_every_credential_value_from_an_error_text() -> None:
+    key_id, token = secrets.token_hex(8), secrets.token_hex(8)
+    text = f"PanicException: signing with {key_id} and {token} failed, again {key_id}"
+    scrubbed = rv.scrub_values(text, [key_id, "", token])
+    assert key_id not in scrubbed
+    assert token not in scrubbed
+    assert (
+        scrubbed
+        == "PanicException: signing with <redacted> and <redacted> failed, again <redacted>"
+    )

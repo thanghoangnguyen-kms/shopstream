@@ -133,11 +133,160 @@ def identifier(name: str) -> str:
 
 
 def polars_storage_options(properties: Mapping[str, str]) -> dict[str, str]:
-    raise NotImplementedError
+    """Polars' object-store options from PyIceberg's `table.io.properties`.
+
+    Polars does not reuse PyIceberg's vended credentials; without these it falls through to the
+    instance-metadata endpoint and hangs. The result holds credentials: keep it in a local
+    variable, never print or log it.
+    """
+    return {
+        "aws_access_key_id": properties["s3.access-key-id"],
+        "aws_secret_access_key": properties["s3.secret-access-key"],
+        "aws_session_token": properties["s3.session-token"],
+        "aws_endpoint_url": properties["s3.endpoint"].removesuffix("/"),
+        "aws_region": properties["s3.region"],
+        "aws_allow_http": "true",
+    }
+
+
+def scrub_values(text: str, values: Sequence[str]) -> str:
+    """`text` with every non-empty value in `values` replaced, so no credential reaches output."""
+    for value in values:
+        if value:
+            text = text.replace(value, "<redacted>")
+    return text
+
+
+# The table that isolates each feature (see the job's design): d_json has no VARIANT and no
+# deletes, b_json_dv adds deletion vectors, a_variant adds VARIANT, c_variant_dv has both.
+BASE_TABLE = "d_json"
+DELETES_TABLE = "b_json_dv"
+VARIANT_TABLE = "a_variant"
+BOTH_TABLE = "c_variant_dv"
+EXPECTED_TABLES = (VARIANT_TABLE, DELETES_TABLE, BOTH_TABLE, BASE_TABLE)
+TABLES_WITH_DELETES = (DELETES_TABLE, BOTH_TABLE)
+TABLES_WITHOUT_DELETES = (VARIANT_TABLE, BASE_TABLE)
+CHECKED_READERS = READERS[1:]
+
+
+def spark_writer_findings(tables: Mapping[str, Mapping[str, Any]]) -> tuple[list[str], list[str]]:
+    """Check the writer's own evidence: (problems that stop the verdict, deletion-vector gaps).
+
+    A digest that differs across the tables, or delete files on a table that should have none,
+    make a later mismatch unattributable. Format 3 on all four tables and an added-dvs snapshot
+    plus a PUFFIN delete file on b_json_dv and c_variant_dv are the deletion-vector evidence;
+    without it Spark itself takes ADR-001's `v2 with position deletes` fallback.
+    """
+    problems = []
+    if len({tables[name]["table_digest"] for name in EXPECTED_TABLES}) != 1:
+        problems.append("Spark's table digests differ across the four tables")
+    for name in TABLES_WITHOUT_DELETES:
+        if tables[name].get("delete_files"):
+            problems.append(f"{name} has delete files, so a mismatch could not be attributed")
+    gaps = []
+    for name in EXPECTED_TABLES:
+        if tables[name].get("format_version") != 3:
+            gaps.append(f"{name} is format-version {tables[name].get('format_version')}, not 3")
+    for name in TABLES_WITH_DELETES:
+        table = tables[name]
+        if not any(s.get("added_dvs", 0) >= 1 for s in table.get("snapshots", [])):
+            gaps.append(f"no snapshot of {name} has added-dvs of 1 or more")
+        if not any(
+            f.get("content") == 1 and f.get("file_format") == "PUFFIN"
+            for f in table.get("delete_files", [])
+        ):
+            gaps.append(f"{name} has no PUFFIN delete file")
+    return problems, gaps
+
+
+def reader_findings(reader: str, results: Mapping[str, str]) -> tuple[str | None, list[str], str]:
+    """Attribute one reader's four results: (problem or None, fallbacks it needs, a reason line).
+
+    d_json is the base read: a reader failing it fails for a reason neither rule explains.
+    c_variant_dv has both features, so it must match exactly when a_variant and b_json_dv do.
+    """
+    shown = ", ".join(f"{name} {results[name]}" for name in EXPECTED_TABLES)
+    if results[BASE_TABLE] != "match":
+        return (
+            f"{reader} does not match Spark on {BASE_TABLE}, the plain table with no VARIANT and "
+            f"no deletes ({shown}), so no failure can be attributed",
+            [],
+            "",
+        )
+    variant_ok = results[VARIANT_TABLE] == "match"
+    deletes_ok = results[DELETES_TABLE] == "match"
+    both_ok = results[BOTH_TABLE] == "match"
+    if both_ok != (variant_ok and deletes_ok):
+        return (
+            f"{reader}'s results ({shown}) fit neither a VARIANT failure nor a deletion-vector "
+            f"failure",
+            [],
+            "",
+        )
+    if variant_ok and deletes_ok:
+        return None, [], f"{reader} matches Spark on all four tables"
+    fallbacks = []
+    parts = []
+    if not variant_ok:
+        fallbacks.append(FALLBACK_JSON)
+        parts.append(
+            f"cannot take the VARIANT tables ({shown}), so it reads the payload as a "
+            f"{FALLBACK_JSON}"
+        )
+    if not deletes_ok:
+        fallbacks.append(FALLBACK_V2)
+        parts.append(f"does not apply the deletion vectors ({shown}), so it takes {FALLBACK_V2}")
+    return None, fallbacks, f"{reader} " + "; ".join(parts)
 
 
 def item2_verdict(job: Mapping[str, Any], matrix: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    raise NotImplementedError
+    """Map the parity matrix onto ADR-001 item 2's two fixed fallbacks.
+
+    Returns `verdict` (go, fallback or inconclusive), `fallbacks` (reader and fallback, only
+    ever ADR-001's two wordings) and `reasons`. Anything the two rules cannot attribute, or any
+    missing cell, is inconclusive with no fallback named: the owner decides.
+    """
+    tables = {str(t["table"]): t for t in job["tables"]}
+    cells = {(str(c["table"]), str(c["reader"])): c for c in matrix}
+    problems = [f"the job has no {name} table" for name in EXPECTED_TABLES if name not in tables]
+    problems += [
+        f"the matrix has no {reader} cell for {name}"
+        for name in EXPECTED_TABLES
+        for reader in READERS
+        if (name, reader) not in cells
+    ]
+    if problems:
+        return {"verdict": "inconclusive", "fallbacks": [], "reasons": problems}
+    writer_problems, deletion_vector_gaps = spark_writer_findings(tables)
+    problems += writer_problems
+    fallbacks: list[dict[str, str]] = []
+    reasons: list[str] = []
+    if deletion_vector_gaps:
+        fallbacks.append({"reader": "spark", "fallback": FALLBACK_V2})
+        reasons.append(
+            "Spark lacks deletion-vector evidence (" + "; ".join(deletion_vector_gaps) + f"), "
+            f"so it takes {FALLBACK_V2}"
+        )
+    else:
+        reasons.append(
+            "Spark wrote format-version 3 on all four tables, with added-dvs and PUFFIN delete "
+            f"files on {DELETES_TABLE} and {BOTH_TABLE}"
+        )
+    for reader in CHECKED_READERS:
+        results = {name: str(cells[(name, reader)]["result"]) for name in EXPECTED_TABLES}
+        problem, needed, reason = reader_findings(reader, results)
+        if problem:
+            problems.append(problem)
+            continue
+        fallbacks += [{"reader": reader, "fallback": fallback} for fallback in needed]
+        reasons.append(reason)
+    if problems:
+        return {"verdict": "inconclusive", "fallbacks": [], "reasons": problems}
+    return {
+        "verdict": "fallback" if fallbacks else "go",
+        "fallbacks": fallbacks,
+        "reasons": reasons,
+    }
 
 
 def duckdb_connect() -> Any:
@@ -195,6 +344,93 @@ def read_duckdb(job: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def pyiceberg_tables(job: Mapping[str, Any]) -> list[tuple[Mapping[str, Any], Any, str | None]]:
+    """Load the catalog once, then each table: (job table, PyIceberg table or None, error or None).
+
+    A table with a VARIANT column fails here with a ValidationError ("Unsupported field type:
+    'variant'"): PyIceberg 0.12.0 has no VariantType, so the whole table is unreadable. The vended
+    credentials stay inside the returned table objects.
+    """
+    from pyiceberg.catalog import load_catalog
+
+    namespace = identifier(str(job["namespace"]))
+    try:
+        catalog = load_catalog(
+            "rest",
+            uri=f"{lakekeeper_url()}/catalog",
+            warehouse=WAREHOUSE,
+            **{"header.X-Iceberg-Access-Delegation": "vended-credentials"},
+        )
+    except Exception as exc:
+        return [(t, None, error_text(exc)) for t in job["tables"]]
+    found: list[tuple[Mapping[str, Any], Any, str | None]] = []
+    for table in job["tables"]:
+        try:
+            name = identifier(str(table["table"]))
+            found.append((table, catalog.load_table(f"{namespace}.{name}"), None))
+        except Exception as exc:
+            found.append((table, None, error_text(exc)))
+    return found
+
+
+def current_snapshot_id(iceberg_table: Any) -> int | None:
+    snapshot = iceberg_table.current_snapshot()
+    return int(snapshot.snapshot_id) if snapshot is not None else None
+
+
+def read_pyiceberg(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """PyIceberg's cell for each table: `scan(snapshot_id=...)` at Spark's snapshot id."""
+    rows = []
+    for table, iceberg_table, error in pyiceberg_tables(job):
+        if iceberg_table is None:
+            rows.append(cannot_load(table, "pyiceberg", error or "unknown error"))
+            continue
+        try:
+            arrow = iceberg_table.scan(
+                snapshot_id=int(table["snapshot_id"]), selected_fields=COLUMNS
+            ).to_arrow()
+            count, digest = row_hash.arrow_table_digest(arrow, COLUMNS, JSON_COLUMNS)
+            rows.append(
+                loaded(table, "pyiceberg", count, digest, current_snapshot_id(iceberg_table))
+            )
+        except Exception as exc:
+            rows.append(cannot_load(table, "pyiceberg", error_text(exc)))
+    return rows
+
+
+def read_polars(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Polars' cell for each table: `scan_iceberg(table, snapshot_id=...)` with storage options.
+
+    Polars loads tables through PyIceberg, so a table PyIceberg cannot load is cannot-load here
+    too, and the error says so. The storage options hold the vended credentials: they stay in a
+    local variable, and any error text is scrubbed of their values before it is kept.
+    """
+    import polars as pl
+
+    rows = []
+    for table, iceberg_table, error in pyiceberg_tables(job):
+        if iceberg_table is None:
+            message = f"PyIceberg load failed ({error})"[:ERROR_LIMIT]
+            rows.append(cannot_load(table, "polars", message))
+            continue
+        options: dict[str, str] = {}
+        try:
+            options = polars_storage_options(iceberg_table.io.properties)
+            frame = (
+                pl.scan_iceberg(
+                    iceberg_table, snapshot_id=int(table["snapshot_id"]), storage_options=options
+                )
+                .select(list(COLUMNS))
+                .collect()
+            )
+            count, digest = row_hash.arrow_table_digest(frame.to_arrow(), COLUMNS, JSON_COLUMNS)
+            rows.append(loaded(table, "polars", count, digest, current_snapshot_id(iceberg_table)))
+        except Exception as exc:
+            message = scrub_values(error_text(exc), list(options.values()))
+            rows.append(cannot_load(table, "polars", message))
+    return rows
+
+
 def duckdb_extension_version() -> str:
     """The loaded iceberg extension's version, or the error text if it will not load."""
     try:
@@ -218,6 +454,9 @@ def reader_versions() -> dict[str, str]:
     return {
         "duckdb": package_version("duckdb"),
         "duckdb_iceberg_extension": duckdb_extension_version(),
+        "pyiceberg": package_version("pyiceberg"),
+        "polars": package_version("polars"),
+        "pyarrow": package_version("pyarrow"),
     }
 
 
@@ -245,12 +484,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not isinstance(job, dict) or not isinstance(job.get("tables"), list):
         print("read_v3: the job file has no tables list", file=sys.stderr)
         return 2
-    report: dict[str, Any] = {
-        "versions": reader_versions(),
-        "matrix": build_matrix(job, read_duckdb(job)),
-    }
+    reader_rows = [*read_duckdb(job), *read_pyiceberg(job), *read_polars(job)]
+    matrix = build_matrix(job, reader_rows)
+    verdict = item2_verdict(job, matrix)
+    report: dict[str, Any] = {"versions": reader_versions(), "matrix": matrix, **verdict}
     print(json.dumps(report, ensure_ascii=False))
-    return 0
+    return 1 if verdict["verdict"] == "inconclusive" else 0
 
 
 if __name__ == "__main__":
