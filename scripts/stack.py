@@ -153,11 +153,15 @@ def render_identity(template_text: str, env: Mapping[str, str]) -> str:
 
 
 def parse_profiles(env: Mapping[str, str]) -> list[str]:
-    """`core` plus the caller's COMPOSE_PROFILES, without `bootstrap` and `*`."""
+    """`core` plus the caller's COMPOSE_PROFILES, without `bootstrap`, `spike` and `*`.
+
+    `bootstrap` and `spike` hold one-shots that only an explicit `run` may start, so neither
+    `just up` nor `just mem-report` ever activates them.
+    """
     profiles = ["core"]
     for raw in env.get("COMPOSE_PROFILES", "").split(","):
         name = raw.strip()
-        if not name or name in {"*", "bootstrap"} or name in profiles:
+        if not name or name in {"*", "bootstrap", "spike"} or name in profiles:
             continue
         if not PROFILE_NAME.match(name):
             raise ValueError(f"invalid compose profile name: {name!r}")

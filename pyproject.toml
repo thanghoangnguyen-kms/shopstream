@@ -63,6 +63,8 @@ ignore = ["E501"]
 "scripts/stack.py" = ["S603", "S607"]
 "scripts/mem_report.py" = ["S603", "S607"]
 "scripts/lakekeeper_bootstrap.py" = ["S310"]
+# urllib calls to the origin-allowlisted in-network Lakekeeper, like the bootstrap script.
+"scripts/probe_scope.py" = ["S310"]
 
 [tool.mypy]
 python_version = "3.13"
