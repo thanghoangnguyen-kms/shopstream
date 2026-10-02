@@ -188,6 +188,18 @@ def test_both_comparisons_matching_with_both_clis_on_1_12_is_go() -> None:
     assert reasons
 
 
+def test_a_failing_dbt_parse_is_inconclusive_not_fallback() -> None:
+    result, reasons = sc.item4_verdict(
+        parse_exit=2,
+        validate_exit=1,
+        query_exits=(1, 1),
+        comparisons=(),
+        cli_versions=VERSIONS,
+    )
+    assert result == "inconclusive"
+    assert any("dbt parse" in reason for reason in reasons)
+
+
 def test_a_failing_validate_configs_is_fallback() -> None:
     assert verdict(validate_exit=1)[0] == "fallback"
 
