@@ -640,6 +640,8 @@ def test_write_identity_leaves_no_temp_file_when_the_replace_fails(
         ("streaming,orchestration", ["core", "streaming", "orchestration"]),
         (" streaming , ,orchestration,streaming", ["core", "streaming", "orchestration"]),
         ("bootstrap,*,core,streaming", ["core", "streaming"]),
+        ("spike,streaming", ["core", "streaming"]),
+        ("bootstrap,spike,*", ["core"]),
     ],
 )
 def test_parse_profiles(value: str | None, expected: list[str]) -> None:
