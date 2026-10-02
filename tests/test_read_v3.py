@@ -364,3 +364,29 @@ def test_scrub_values_removes_every_credential_value_from_an_error_text() -> Non
         scrubbed
         == "PanicException: signing with <redacted> and <redacted> failed, again <redacted>"
     )
+
+
+# Typed loosely so this file type-checks before the `secrets` parameter exists (the RED commit).
+error_text_with_secrets: Any = rv.error_text
+
+
+def test_error_text_scrubs_a_secret_that_straddles_the_cut_before_truncating() -> None:
+    secret = secrets.token_hex(20)
+    exc = RuntimeError("x" * 190 + secret)
+    text = error_text_with_secrets(exc, [secret])
+    assert len(text) <= 200
+    assert secret[:6] not in text
+    assert "<redacted>" in text
+
+
+def test_error_text_without_secrets_keeps_the_type_and_first_line_at_200_characters() -> None:
+    exc = ValueError("first line\nsecond line")
+    assert error_text_with_secrets(exc, []) == "ValueError: first line"
+    assert len(error_text_with_secrets(RuntimeError("y" * 500), ())) == 200
+
+
+def test_scrub_values_leaves_short_values_alone_and_replaces_long_ones() -> None:
+    value = secrets.token_hex(8)
+    assert len(value) == 16
+    text = f"it is true that {value} leaked"
+    assert rv.scrub_values(text, [value, "true", ""]) == "it is true that <redacted> leaked"
