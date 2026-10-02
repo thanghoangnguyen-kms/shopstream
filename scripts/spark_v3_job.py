@@ -200,7 +200,7 @@ def drop_table(name: str) -> None:
     """Drop one table and have Lakekeeper purge its files; a missing table is fine.
 
     `DROP TABLE ... PURGE` in Spark also reads the dropped table's manifests on the client, and
-    Lakekeeper's own purge worker can delete them first, which failed about one run in four. The
+    Lakekeeper's own purge worker can delete them first, which failed one run in five. The
     REST drop with purgeRequested leaves the purge to Lakekeeper alone, so a rerun is stable.
     """
     url = (

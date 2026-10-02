@@ -413,7 +413,96 @@ Not run.
 
 ## Item 14: Spark on Python 3.13
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: go. An image whose Dockerfile FROM is pinned by digest (python:3.13.15-slim-trixie) plus Debian's OpenJDK 21 JRE and PySpark 4.1.3 from uv.lock ran item 2's job, and the driver and a Python UDF both reported Python 3.13.15.
+
+### Versions
+
+- Base image: `docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b`; uv: `ghcr.io/astral-sh/uv:0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc`. Both are copied from the Plan 02-03 Dockerfile, which the policy gate checks.
+- JVM: runtime 21.0.12.1+1-1-deb13u1-Debian, vendor Debian (package `openjdk-21-jre-headless` from the Debian archive; apt is not hermetic, so the job prints the runtime version and a drift shows on a rerun).
+- PySpark 4.1.3 installed by `uv sync --frozen --only-group spike --only-group spark`; Spark 4.1.3; Iceberg 1.11.0 (item 15 recorded why 4.1 and not 4.2).
+- Jars, each added with `ADD --checksum=sha256:...` so a mismatch fails the build: `iceberg-spark-runtime-4.1_2.13-1.11.0.jar` `d6ea6c5d099288daeb7d5a92061bd3d7d8f296492632b42378e5f2f0e3066242`, `iceberg-aws-bundle-1.11.0.jar` `38f01da7e96850cdd05e6616d758b77b43314b712a8808e3f9a824d56976162f`. The build succeeded on the first try, so the plan's curl and `sha256sum -c` fallback was not needed.
+- DuckDB 1.5.5 with the iceberg, httpfs and avro extensions baked into `/opt/duckdb/extensions` at build time, so no reader downloads one at run time.
+
+### Image
+
+The Dockerfile keeps the digest-pinned python:3.13.15-slim-trixie base. `docker image inspect` reports 948140818 B for the image; the VM disk readings below show what the build cost on disk. The jars and extensions are readable by uid 65534, the user the job runs as. The page's runtime section says the VM disk is 40 GiB, but `df` inside the VM shows a 59 GiB `/var/lib/docker` shared with unrelated images, so item 12 should use the `df` figure.
+
+```text
+$ grep -n ^FROM infra/spike/Dockerfile
+5:FROM docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+$ docker image inspect shopstream-spark-job --format {{.Id}} {{.Size}}
+sha256:dc4a42f28a22492611bec28d32be471ad9023555535935463a7e1a4d25d91545 948140818
+$ docker run --rm --user 65534:65534 --entrypoint sh shopstream-spark-job (sha256sum of the jars, baked extensions, Python)
+38f01da7e96850cdd05e6616d758b77b43314b712a8808e3f9a824d56976162f  /opt/venv/lib/python3.13/site-packages/pyspark/jars/iceberg-aws-bundle-1.11.0.jar
+d6ea6c5d099288daeb7d5a92061bd3d7d8f296492632b42378e5f2f0e3066242  /opt/venv/lib/python3.13/site-packages/pyspark/jars/iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+avro.duckdb_extension
+httpfs.duckdb_extension
+iceberg.duckdb_extension
+Python 3.13.15
+65534
+$ colima ssh -- df -h /var/lib/docker   (before the build)
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb1        59G   30G   27G  54% /var/lib/docker
+$ colima ssh -- df -h /var/lib/docker   (after the build)
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb1        59G   34G   22G  61% /var/lib/docker
+```
+
+### Command and output
+
+The one-shot runs as uid 65534 on a read-only root filesystem with a 512 MiB `/tmp` tmpfs, a 3g memory limit and no key from `infra/.env` in its environment: Lakekeeper vends the storage credentials to the JVM. Both profiles are named because the job depends on Lakekeeper, which sits in `core`. The `/tmp` tmpfs is mounted `exec`: the Iceberg REST client decodes Lakekeeper's zstd-compressed responses with zstd-jni, which extracts a native library into `/tmp` and maps it, and a default noexec tmpfs refuses that. Tables are dropped through Lakekeeper's REST purge, because Spark's `DROP TABLE ... PURGE` also reads the dropped table's manifests on the client and lost a race with Lakekeeper's purge worker in one of five consecutive runs. Item 2's deletion-vector evidence (snapshot summaries and Puffin delete files) is in the Item 2 section; this section only needs the job to run.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job | tail -n 1   (fields of the JSON line)
+spark_version: 4.1.3
+iceberg_version: 1.11.0
+pyspark_version: 4.1.3
+java_version: 21.0.12.1+1-1-deb13u1-Debian
+java_vendor: Debian
+python_driver: 3.13.15
+python_udf: 3.13.15
+namespace: spike_v3
+a_variant: format_version=3 snapshot_id=8839512430188009726 row_count=4 table_digest=73e1c20d49efc16984df4fea2be2e99e7d3429d113fd5183e80eee0e447afa8b
+b_json_dv: format_version=3 snapshot_id=2055015646909726714 row_count=4 table_digest=73e1c20d49efc16984df4fea2be2e99e7d3429d113fd5183e80eee0e447afa8b
+c_variant_dv: format_version=3 snapshot_id=4574780516556525914 row_count=4 table_digest=73e1c20d49efc16984df4fea2be2e99e7d3429d113fd5183e80eee0e447afa8b
+d_json: format_version=3 snapshot_id=8304982815868503292 row_count=4 table_digest=73e1c20d49efc16984df4fea2be2e99e7d3429d113fd5183e80eee0e447afa8b
+```
+
+The four digests are equal: a VARIANT column read as JSON text and a JSON string column hash alike, and the two tables that went through a MERGE and a DELETE hash like the two that did not. Two consecutive runs, repeated three times, left the digests unchanged and changed the snapshot ids, so the job drops and recreates its tables.
+
+### Memory
+
+The job container, started with `docker compose run`, appears as `spark-job-run-<id>` in mem-report's per-service table with no `mem_limit` (the table only knows compose service names); its limit is the 3g pair in the compose file. It peaked at 845.1 MiB of 3 GiB, the peak summed sample over all sampled containers was 1.91 GiB, and mem-report exited 0. The job was not OOM-killed and exited 0, so the raise to 4g was not needed. Five frames, one every 5 s, covered the job; docker stats counts page cache and a short peak can fall between frames. This is input for item 8, which reruns this job in Phase 5. Mem-report's inspect scope (`core` plus `bootstrap`) does not include spike containers, so item 8's OOM and restart check needs them added.
+
+```text
+$ uv run just mem-report   (sampler: uv run just mem-sample --duration 300, stopped with SIGTERM when the job exited)
+mem-report: 5 frames with container rows, 2026-10-02T03:08:53Z to 2026-10-02T03:09:13Z; 0 lines skipped, 0 frames without container rows
+service                 peak MiB  mem_limit MiB
+spark-job-run-caa6fe3afa63     845.1              -
+seaweedfs                  515.6          768.0
+frankfurter                383.4          640.0
+postgres                   158.1          512.0
+lakekeeper                  58.5          256.0
+peak summed sample: 1.91 GiB at 2026-10-02T03:09:13Z (budget 10.00 GiB)
+sum(mem_limit) for profiles core: 2.28 GiB
+sum(mem_limit) with the 384 MiB W05 reserve: 2.66 GiB
+VM MemTotal 11.66 GiB, minus 1 GiB leaves 10.66 GiB: limits ok
+OOMKilled and RestartCount per container:
+  bootstrap: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  frankfurter: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  frankfurter-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  lakekeeper: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  lakekeeper-migrate: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  postgres: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  seaweedfs: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+mem-report: ok
+```
+
+### FALL-04
+
+FALL-04: N/A. Item 14's verdict is go, so the official Spark image is not needed.
 
 ## Item 15: PySpark version
 
