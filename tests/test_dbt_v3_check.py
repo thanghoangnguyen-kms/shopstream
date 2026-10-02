@@ -14,11 +14,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import dbt_v3_check as _module
+import dbt_v3_check as chk
 import pytest
-
-# Typed loosely so this file type-checks before the verdict rule exists (the RED commit).
-chk: Any = _module
 
 UUID = "01a0fc18-37c4-7131-ad1c-1b7ca9efba02"
 FIRST_SNAPSHOT = 7144986360310025750

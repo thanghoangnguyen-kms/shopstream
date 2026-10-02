@@ -1,6 +1,8 @@
 """Item 3's check on silver_spike.inc_v3, the table dbt 2.0.6 builds through Lakekeeper.
 
 A spike script run inside the `spark-job` one-shot: `python /app/dbt_v3_check.py reset|inspect`.
+`verdict <stage1> <stage2> <stage3>` runs anywhere (it reads three saved `inspect` lines) and
+judges them with the tested rule `item3_verdict`.
 `reset` has Lakekeeper purge the table so the next dbt run starts from no table. `inspect` loads
 the table from Lakekeeper's REST catalog and prints its format version, table uuid, metadata
 location and snapshots sorted by sequence number, and reads the table's metadata.json itself from
@@ -11,8 +13,9 @@ one compact JSON line, the last line of stdout. The loadTable body, its `config`
 every error passes `read_v3.error_text` with those values as secrets, so only status codes and the
 parsed metadata fields leave this script.
 
-This is a spike script (ADR-001 Evidence rules): it needs a live stack and has no unit tests. The
-heavy import (duckdb) sits inside `inspect`, so importing this module in CI is safe.
+This is a spike script (ADR-001 Evidence rules): the live functions need a stack, while the stage
+rule and the verdict are pure and unit-tested. The heavy imports (duckdb, boto3) sit inside the
+live functions, so importing this module in CI is safe.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import json
 import sys
 import urllib.parse
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import probe_scope
@@ -30,6 +34,12 @@ import spark_v3_job
 
 NAMESPACE = "silver_spike"
 TABLE = "inc_v3"
+# ADR-001 item 3's rows: batch 1 inserts ids 1-3; batch 2 updates id 2 and deletes id 3.
+EXPECTED_BATCH_1: list[list[Any]] = [[1, "a", False], [2, "b", False], [3, "c", False]]
+EXPECTED_AFTER_MERGE: list[list[Any]] = [[1, "a", False], [2, "b-updated", False]]
+# After the stage-1 append, the two MERGE commits: the delete of id 3 and the overwrite for id 2.
+MERGE_OPERATIONS = ["append", "delete", "overwrite"]
+Finding = tuple[str, str]  # (kind, message); kind is `fallback` or `inconclusive`
 DELEGATION_HEADER = {"X-Iceberg-Access-Delegation": "vended-credentials"}
 GZIP_MAGIC = b"\x1f\x8b"
 # The snapshot summary keys that show what each commit did, in the order they are reported.
@@ -198,10 +208,149 @@ def inspect() -> dict[str, Any]:
     return result
 
 
+def operations(result: Mapping[str, Any]) -> list[Any]:
+    return [snapshot.get("operation") for snapshot in result.get("file_snapshots") or []]
+
+
+def first_snapshot_id(result: Mapping[str, Any]) -> Any:
+    snapshots = result.get("file_snapshots") or []
+    return snapshots[0].get("snapshot_id") if snapshots else None
+
+
+def stage_findings(
+    stage: int, result: Mapping[str, Any] | None, first: Mapping[str, Any] | None
+) -> list[Finding]:
+    """What is wrong with one stage, as (kind, message) pairs; an empty list means it holds.
+
+    `first` is stage 1's result (None for stage 1 itself). `inconclusive` means the stage cannot
+    be judged (missing, errored, or the file and the catalog disagree); `fallback` means it was
+    judged and fails ADR-001 go criterion 3. The format version is read from metadata.json itself.
+    """
+    label = f"stage {stage}"
+    if result is None:
+        return [("inconclusive", f"{label} is missing")]
+    if result.get("error"):
+        return [("inconclusive", f"{label} carries an error: {result['error']}")]
+    file_version, catalog_version = (
+        result.get("file_format_version"),
+        result.get("catalog_format_version"),
+    )
+    if file_version != catalog_version:
+        return [
+            (
+                "inconclusive",
+                f"{label}: metadata.json says format-version {file_version} but loadTable says "
+                f"{catalog_version}",
+            )
+        ]
+    findings: list[Finding] = []
+    if file_version != 3:
+        findings.append(
+            ("fallback", f"{label}: metadata.json has format-version {file_version}, not 3")
+        )
+    ops = operations(result)
+    if stage == 1:
+        if ops != ["append"]:
+            findings.append(("fallback", f"{label}: snapshot operations are {ops}, not ['append']"))
+        if result.get("rows") != EXPECTED_BATCH_1:
+            findings.append(
+                ("fallback", f"{label}: rows are {result.get('rows')}, not {EXPECTED_BATCH_1}")
+            )
+        return findings
+    if first is not None:
+        if result.get("file_table_uuid") != first.get("file_table_uuid"):
+            findings.append(
+                ("fallback", f"{label}: the table uuid changed, so the run recreated the table")
+            )
+        if first_snapshot_id(result) != first_snapshot_id(first) or (ops[:1] != ["append"]):
+            findings.append(("fallback", f"{label}: the first snapshot is not stage 1's append"))
+    if stage == 2 and ops != MERGE_OPERATIONS:
+        findings.append(
+            ("fallback", f"{label}: snapshot operations are {ops}, not {MERGE_OPERATIONS}")
+        )
+    if result.get("rows") != EXPECTED_AFTER_MERGE:
+        findings.append(
+            ("fallback", f"{label}: rows are {result.get('rows')}, not {EXPECTED_AFTER_MERGE}")
+        )
+    return findings
+
+
+def item3_verdict(stages: Mapping[int, Mapping[str, Any] | None]) -> dict[str, Any]:
+    """ADR-001 item 3's verdict from the three stages; pure, and it never mutates `stages`.
+
+    `go` only when every stage holds. Any inconclusive finding wins over a fallback finding.
+    Stage 3 (the rerun of batch 2) must hold the same rows as stage 2: a rerun that changes them
+    is inconclusive, because ADR-001 criterion 3 does not cover idempotency and the owner decides.
+    """
+    first = stages.get(1)
+    findings: list[Finding] = []
+    for stage in (1, 2, 3):
+        findings.extend(stage_findings(stage, stages.get(stage), None if stage == 1 else first))
+    second, third = stages.get(2), stages.get(3)
+    if (
+        second is not None
+        and third is not None
+        and not second.get("error")
+        and not third.get("error")
+        and second.get("rows") != third.get("rows")
+    ):
+        findings.append(
+            (
+                "inconclusive",
+                "stage 3: the rerun changed the rows stage 2 held (idempotency failed)",
+            )
+        )
+    if not findings:
+        return {
+            "verdict": "go",
+            "reasons": [
+                "all three stages hold: format-version 3 in metadata.json, the append then the "
+                "delete and overwrite merge commits, exactly (1, a), (2, b-updated), unchanged "
+                "by the rerun"
+            ],
+        }
+    verdict = "inconclusive" if any(kind == "inconclusive" for kind, _ in findings) else "fallback"
+    reasons = [message for kind, message in findings if kind == verdict]
+    return {"verdict": verdict, "reasons": reasons}
+
+
+def last_json_line(path: str) -> Mapping[str, Any] | None:
+    """The last line of the file that is a JSON object, or None if the file has none."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if line.startswith("{"):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+def verdict_command(paths: Sequence[str]) -> int:
+    """`verdict <stage1> <stage2> <stage3>`: print the verdict line; exit 0 only for go."""
+    stages = {number: last_json_line(path) for number, path in enumerate(paths, start=1)}
+    result = item3_verdict(stages)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["verdict"] == "go" else 1
+
+
 def main(argv: Sequence[str]) -> int:
-    if len(argv) != 1 or argv[0] not in {"reset", "inspect"}:
-        print("usage: dbt_v3_check.py reset|inspect", file=sys.stderr)
+    usage_ok = (len(argv) == 1 and argv[0] in {"reset", "inspect"}) or (
+        len(argv) == 4 and argv[0] == "verdict"
+    )
+    if not usage_ok:
+        print(
+            "usage: dbt_v3_check.py reset|inspect | verdict <stage1> <stage2> <stage3>",
+            file=sys.stderr,
+        )
         return 2
+    if argv[0] == "verdict":
+        return verdict_command(argv[1:])
     try:
         result = reset() if argv[0] == "reset" else inspect()
     except Exception as exc:
