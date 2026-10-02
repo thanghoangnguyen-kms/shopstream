@@ -1,27 +1,33 @@
-"""Item 3's check on silver_spike.inc_v3, the table dbt 2.0.6 builds through Lakekeeper.
+"""Item 3's check on silver_spike.inc_v3, the table dbt builds through Lakekeeper.
 
-A spike script run inside the `spark-job` one-shot: `python /app/dbt_v3_check.py reset|inspect`.
-`verdict <stage1> <stage2> <stage3>` runs anywhere (it reads three saved `inspect` lines) and
-judges them with the tested rule `item3_verdict`.
+dbt-core 1.12.5 with dbt-duckdb builds the table on ADR-001's item 3 fallback; Plans 03-01 and
+03-02 ran dbt 2.0.6, whose record stays in the evidence. A spike script run inside the `spark-job`
+one-shot: `python /app/dbt_v3_check.py reset|inspect|engines`.
+`verdict <stage1> <stage2> <stage3> [<engines>]` runs anywhere (it reads the saved `inspect` lines
+and, optionally, the `engines` line) and judges them with the tested rule `item3_verdict`.
 `reset` has Lakekeeper purge the table so the next dbt run starts from no table. `inspect` loads
 the table from Lakekeeper's REST catalog and prints its format version, table uuid, metadata
 location and snapshots sorted by sequence number, and reads the table's metadata.json itself from
 SeaweedFS with the key loadTable vends (gzip-aware), reporting the file's format version, table uuid
-and snapshots beside the catalog's. It also prints the rows DuckDB reads, sorted by id. Both print
-one compact JSON line, the last line of stdout. The loadTable body, its `config`, its
-`storage-credentials` and the vended key are never printed: the key lives in local variables, and
-every error passes `read_v3.error_text` with those values as secrets, so only status codes and the
-parsed metadata fields leave this script.
+and snapshots beside the catalog's. It also prints the rows DuckDB reads, sorted by id. `engines`
+reads the finished table with a second engine family: Spark with Iceberg and PyIceberg each read
+the rows, and every deletion-vector file PyIceberg lists is read as bytes and checked for the
+Puffin magic `PFA1` at both ends. Each subcommand prints one compact JSON line, the last line of
+stdout. The loadTable body, its `config`, its `storage-credentials`, the vended key and any file
+path are never printed: the key lives in local variables or inside PyIceberg's FileIO, and every
+error passes `read_v3.error_text` with those values as secrets, so only status codes, parsed
+metadata fields, rows, versions, file formats, sizes and magic booleans leave this script.
 
 This is a spike script (ADR-001 Evidence rules): the live functions need a stack, while the stage
-rule and the verdict are pure and unit-tested. The heavy imports (duckdb, boto3) sit inside the
-live functions, so importing this module in CI is safe.
+rule and the verdict are pure and unit-tested. The heavy imports (duckdb, boto3, pyiceberg) sit
+inside the live functions, so importing this module in CI is safe.
 """
 
 from __future__ import annotations
 
 import enum
 import gzip
+import importlib.metadata
 import json
 import sys
 import urllib.parse
@@ -42,7 +48,15 @@ EXPECTED_AFTER_MERGE: list[list[Any]] = [[1, "a", False], [2, "b-updated", False
 MERGE_OPERATIONS = ["append", "delete", "overwrite"]
 Finding = tuple[str, str]  # (kind, message); kind is `fallback` or `inconclusive`
 PUFFIN_MAGIC = b"PFA1"
-ENGINES_GO_REASON = ""
+ENGINES_GO_REASON = (
+    "a second engine family agrees: Spark with Iceberg and PyIceberg read exactly (1, a), "
+    "(2, b-updated), and every deletion vector is a Puffin file with PFA1 magic at both ends"
+)
+STAGES_GO_REASON = (
+    "all three stages hold: format-version 3 in metadata.json, the append then the "
+    "delete and overwrite merge commits, exactly (1, a), (2, b-updated), unchanged "
+    "by the rerun"
+)
 DELEGATION_HEADER = {"X-Iceberg-Access-Delegation": "vended-credentials"}
 GZIP_MAGIC = b"\x1f\x8b"
 # The snapshot summary keys that show what each commit did, in the order they are reported.
@@ -285,28 +299,141 @@ class Omitted(enum.Enum):
 
 
 def puffin_magic(raw: bytes) -> tuple[bool, bool]:
-    return (False, False)
+    """Whether `raw` starts and ends with the Puffin magic; anything under 8 bytes is neither."""
+    if len(raw) < 2 * len(PUFFIN_MAGIC):
+        return (False, False)
+    return (raw.startswith(PUFFIN_MAGIC), raw.endswith(PUFFIN_MAGIC))
 
 
 def engine_findings(engines: Mapping[str, Any] | None) -> list[Finding]:
-    return []
+    """What is wrong with the second-engine leg, as (kind, message) pairs; [] means it holds.
+
+    `inconclusive` means the leg cannot be judged (missing, errored, or no deletion vector to
+    check); `fallback` means it was judged and a second engine disagrees with the merged rows or a
+    deletion vector is not a valid Puffin file.
+    """
+    if engines is None:
+        return [("inconclusive", "the second-engine leg is missing")]
+    if engines.get("error"):
+        return [
+            ("inconclusive", f"the second-engine leg carries an error: {engines['error']}"),
+        ]
+    findings: list[Finding] = []
+    for name, field in (("Spark", "spark_rows"), ("PyIceberg", "pyiceberg_rows")):
+        if engines.get(field) != EXPECTED_AFTER_MERGE:
+            findings.append(
+                (
+                    "fallback",
+                    f"{name} read {engines.get(field)}, not {EXPECTED_AFTER_MERGE}",
+                )
+            )
+    delete_files = engines.get("delete_files") or []
+    if not delete_files:
+        findings.append(("inconclusive", "no deletion vector was listed, so none could be checked"))
+    for entry in delete_files:
+        if (
+            entry.get("file_format") != "PUFFIN"
+            or entry.get("head_magic") is not True
+            or entry.get("tail_magic") is not True
+        ):
+            findings.append(
+                (
+                    "fallback",
+                    f"a deletion vector is not a valid Puffin file: format "
+                    f"{entry.get('file_format')}, {entry.get('size')} bytes, PFA1 at the start "
+                    f"{entry.get('head_magic')} and at the end {entry.get('tail_magic')}",
+                )
+            )
+    return findings
+
+
+def pyiceberg_leg(result: dict[str, Any]) -> None:
+    """PyIceberg's rows and the Puffin check of each deletion-vector file, into `result`.
+
+    The vended key sits inside the table's FileIO. Only the file format, content type, byte length
+    and the two magic booleans of each delete file are recorded, never its path.
+    """
+    from pyiceberg.catalog import load_catalog
+
+    secrets: list[str] = []
+    try:
+        catalog = load_catalog(
+            "rest",
+            uri=f"{spark_v3_job.lakekeeper_url()}/catalog",
+            warehouse=spark_v3_job.WAREHOUSE,
+            **{"header.X-Iceberg-Access-Delegation": "vended-credentials"},
+        )
+        table = catalog.load_table(f"{NAMESPACE}.{TABLE}")
+        secrets = [
+            value
+            for name, value in table.io.properties.items()
+            if isinstance(value, str) and any(word in name for word in ("key", "secret", "token"))
+        ]
+        result["pyiceberg_version"] = importlib.metadata.version("pyiceberg")
+        arrow = table.scan(selected_fields=("id", "name", "is_deleted")).to_arrow()
+        records = sorted(arrow.to_pylist(), key=lambda record: record["id"])
+        result["pyiceberg_rows"] = [
+            [record["id"], record["name"], record["is_deleted"]] for record in records
+        ]
+        found = []
+        for row in table.inspect.delete_files().to_pylist():
+            stream = table.io.new_input(row["file_path"]).open()
+            try:
+                raw = stream.read()
+            finally:
+                stream.close()
+            head, tail = puffin_magic(raw)
+            found.append(
+                {
+                    "file_format": str(row["file_format"]),
+                    "content": int(row["content"]),
+                    "size": len(raw),
+                    "head_magic": head,
+                    "tail_magic": tail,
+                }
+            )
+        result["delete_files"] = sorted(
+            found, key=lambda item: (item["file_format"], item["content"], item["size"])
+        )
+    except Exception as exc:
+        result["error"] = read_v3.error_text(exc, secrets)
 
 
 def engines() -> dict[str, Any]:
-    return {}
+    """Spark's and PyIceberg's reads of the merged table, and its deletion-vector files' magic.
 
-
-def item3_verdict(
-    stages: Mapping[int, Mapping[str, Any] | None],
-    *,
-    engines: Mapping[str, Any] | Omitted | None = Omitted.OMITTED,
-) -> dict[str, Any]:
-    """ADR-001 item 3's verdict from the three stages; pure, and it never mutates `stages`.
-
-    `go` only when every stage holds. Any inconclusive finding wins over a fallback finding.
-    Stage 3 (the rerun of batch 2) must hold the same rows as stage 2: a rerun that changes them
-    is inconclusive, because ADR-001 criterion 3 does not cover idempotency and the owner decides.
+    A failed step sets `error` and keeps what was gathered before it.
     """
+    result: dict[str, Any] = {
+        "table": f"{NAMESPACE}.{TABLE}",
+        "spark_version": None,
+        "iceberg_version": None,
+        "spark_rows": None,
+        "pyiceberg_version": None,
+        "pyiceberg_rows": None,
+        "delete_files": None,
+        "error": None,
+    }
+    try:
+        spark = spark_v3_job.spark_session()
+        try:
+            name = f"{spark_v3_job.CATALOG}.{read_v3.identifier(NAMESPACE)}.{read_v3.identifier(TABLE)}"
+            rows = spark.sql(f"SELECT id, name, is_deleted FROM {name} ORDER BY id").collect()
+            result["spark_rows"] = [list(row) for row in rows]
+            result["spark_version"] = str(spark.version)
+            jvm = spark.sparkContext._jvm
+            result["iceberg_version"] = str(jvm.org.apache.iceberg.IcebergBuild.version())
+        finally:
+            spark.stop()
+    except Exception as exc:
+        result["error"] = read_v3.error_text(exc)
+        return result
+    pyiceberg_leg(result)
+    return result
+
+
+def stages_findings(stages: Mapping[int, Mapping[str, Any] | None]) -> list[Finding]:
+    """Every finding of the three stages, including the rerun's idempotency check."""
     first = stages.get(1)
     findings: list[Finding] = []
     for stage in (1, 2, 3):
@@ -325,15 +452,32 @@ def item3_verdict(
                 "stage 3: the rerun changed the rows stage 2 held (idempotency failed)",
             )
         )
+    return findings
+
+
+def item3_verdict(
+    stages: Mapping[int, Mapping[str, Any] | None],
+    *,
+    engines: Mapping[str, Any] | Omitted | None = Omitted.OMITTED,
+) -> dict[str, Any]:
+    """ADR-001 item 3's verdict from the three stages, and the second engine leg if given.
+
+    Pure, and it never mutates its inputs. `go` only when every stage holds and, when `engines`
+    is given, `engine_findings` is empty. Any inconclusive finding, from either source, wins over
+    a fallback finding. Stage 3 (the rerun of batch 2) must hold the same rows as stage 2: a rerun
+    that changes them is inconclusive, because ADR-001 criterion 3 does not cover idempotency and
+    the owner decides. Without `engines` the rule is the three-input rule of Plan 03-02; an
+    `engines` of None (the line is missing or unreadable) is inconclusive.
+    """
+    findings = stages_findings(stages)
+    judged_engines = not isinstance(engines, Omitted)
+    if not isinstance(engines, Omitted):
+        findings.extend(engine_findings(engines))
     if not findings:
-        return {
-            "verdict": "go",
-            "reasons": [
-                "all three stages hold: format-version 3 in metadata.json, the append then the "
-                "delete and overwrite merge commits, exactly (1, a), (2, b-updated), unchanged "
-                "by the rerun"
-            ],
-        }
+        reasons = [STAGES_GO_REASON]
+        if judged_engines:
+            reasons.append(ENGINES_GO_REASON)
+        return {"verdict": "go", "reasons": reasons}
     verdict = "inconclusive" if any(kind == "inconclusive" for kind, _ in findings) else "fallback"
     reasons = [message for kind, message in findings if kind == verdict]
     return {"verdict": verdict, "reasons": reasons}
@@ -357,27 +501,33 @@ def last_json_line(path: str) -> Mapping[str, Any] | None:
 
 
 def verdict_command(paths: Sequence[str]) -> int:
-    """`verdict <stage1> <stage2> <stage3>`: print the verdict line; exit 0 only for go."""
-    stages = {number: last_json_line(path) for number, path in enumerate(paths, start=1)}
-    result = item3_verdict(stages)
+    """`verdict <stage1> <stage2> <stage3> [<engines>]`: print the verdict; exit 0 only for go."""
+    stages = {number: last_json_line(path) for number, path in enumerate(paths[:3], start=1)}
+    if len(paths) == 4:
+        result = item3_verdict(stages, engines=last_json_line(paths[3]))
+    else:
+        result = item3_verdict(stages)
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["verdict"] == "go" else 1
 
 
+USAGE = (
+    "usage: dbt_v3_check.py reset|inspect|engines | verdict <stage1> <stage2> <stage3> [<engines>]"
+)
+
+
 def main(argv: Sequence[str]) -> int:
-    usage_ok = (len(argv) == 1 and argv[0] in {"reset", "inspect"}) or (
-        len(argv) == 4 and argv[0] == "verdict"
+    usage_ok = (len(argv) == 1 and argv[0] in {"reset", "inspect", "engines"}) or (
+        len(argv) in {4, 5} and argv[0] == "verdict"
     )
     if not usage_ok:
-        print(
-            "usage: dbt_v3_check.py reset|inspect | verdict <stage1> <stage2> <stage3>",
-            file=sys.stderr,
-        )
+        print(USAGE, file=sys.stderr)
         return 2
     if argv[0] == "verdict":
         return verdict_command(argv[1:])
+    commands = {"reset": reset, "inspect": inspect, "engines": engines}
     try:
-        result = reset() if argv[0] == "reset" else inspect()
+        result = commands[argv[0]]()
     except Exception as exc:
         result = {"error": read_v3.error_text(exc)}
     print(json.dumps(result, ensure_ascii=False))
