@@ -81,6 +81,31 @@ FINAL_ROWS: tuple[Mapping[str, str], ...] = (
     },
 )
 
+# b_json_dv and c_variant_dv reach FINAL_ROWS the long way: ids 1 to 4, then a MERGE that updates
+# id 2 and inserts id 5, then a DELETE of id 4. Both steps run under merge-on-read, which commits
+# Puffin deletion vectors. a_variant and d_json get FINAL_ROWS in one INSERT and have none.
+INITIAL_ROWS: tuple[Mapping[str, str], ...] = (
+    FINAL_ROWS[0],
+    {
+        "id": "2",
+        "name": "b",
+        "amount": "2.00",
+        "ts": "2026-01-02 00:00:00",
+        "payload": '{"k":2}',
+    },
+    FINAL_ROWS[2],
+    {
+        "id": "4",
+        "name": "d",
+        "amount": "4.00",
+        "ts": "2026-01-04 00:00:00",
+        "payload": '{"k":4}',
+    },
+)
+MERGE_SOURCE: tuple[Mapping[str, str], ...] = (FINAL_ROWS[1], FINAL_ROWS[3])
+DELETED_ID = 4
+WITH_DELETES = frozenset({"b_json_dv", "c_variant_dv"})
+
 
 def check_url(url: str) -> None:
     """Refuse any URL that is not plain http to an allowed in-network origin."""
@@ -162,11 +187,36 @@ def select_rows(rows: tuple[Mapping[str, str], ...], payload_type: str) -> str:
     return " UNION ALL ".join(selects)
 
 
+def catalog_prefix() -> str:
+    """The warehouse's REST path prefix, read from Lakekeeper's catalog config."""
+    base = lakekeeper_url()
+    status, body = http_request("GET", f"{base}/catalog/v1/config?warehouse={WAREHOUSE}", {}, None)
+    if status != 200:
+        raise RuntimeError(f"catalog config returned HTTP {status}")
+    return str(json.loads(body)["defaults"]["prefix"])
+
+
+def drop_table(name: str) -> None:
+    """Drop one table and have Lakekeeper purge its files; a missing table is fine.
+
+    `DROP TABLE ... PURGE` in Spark also reads the dropped table's manifests on the client, and
+    Lakekeeper's own purge worker can delete them first, which failed about one run in four. The
+    REST drop with purgeRequested leaves the purge to Lakekeeper alone, so a rerun is stable.
+    """
+    url = (
+        f"{lakekeeper_url()}/catalog/v1/{catalog_prefix()}/namespaces/{NAMESPACE}"
+        f"/tables/{name}?purgeRequested=true"
+    )
+    status, _ = http_request("DELETE", url, {}, None)
+    if status not in {204, 404}:
+        raise RuntimeError(f"dropping {name} returned HTTP {status}")
+
+
 def create_table(spark: Any, name: str, payload_type: str) -> str:
     """Drop and recreate one table as v3 with merge-on-read, so every run starts clean."""
     full = f"{CATALOG}.{NAMESPACE}.{name}"
     column = "VARIANT" if payload_type == "variant" else "STRING"
-    spark.sql(f"DROP TABLE IF EXISTS {full} PURGE")
+    drop_table(name)
     spark.sql(
         f"CREATE TABLE {full} (id BIGINT, name STRING, amount DECIMAL(10,2), "
         f"ts TIMESTAMP, payload {column}) USING iceberg TBLPROPERTIES ({TABLE_PROPERTIES})"
@@ -178,21 +228,24 @@ def write_tables(spark: Any) -> list[str]:
     """Create the tables and write their rows; returns the names written, in TABLES order."""
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{NAMESPACE}")
     written = []
-    for name, payload_type in TABLES[:1]:
+    for name, payload_type in TABLES:
         full = create_table(spark, name, payload_type)
-        spark.sql(f"INSERT INTO {full} {select_rows(FINAL_ROWS, payload_type)}")
+        if name in WITH_DELETES:
+            spark.sql(f"INSERT INTO {full} {select_rows(INITIAL_ROWS, payload_type)}")
+            spark.sql(
+                f"MERGE INTO {full} t USING ({select_rows(MERGE_SOURCE, payload_type)}) s "
+                f"ON t.id = s.id WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *"
+            )
+            spark.sql(f"DELETE FROM {full} WHERE id = {DELETED_ID}")
+        else:
+            spark.sql(f"INSERT INTO {full} {select_rows(FINAL_ROWS, payload_type)}")
         written.append(name)
     return written
 
 
 def format_version(name: str) -> int:
     """The table's format-version as Lakekeeper's loadTable response reports it."""
-    base = lakekeeper_url()
-    status, body = http_request("GET", f"{base}/catalog/v1/config?warehouse={WAREHOUSE}", {}, None)
-    if status != 200:
-        raise RuntimeError(f"catalog config returned HTTP {status}")
-    prefix = json.loads(body)["defaults"]["prefix"]
-    url = f"{base}/catalog/v1/{prefix}/namespaces/{NAMESPACE}/tables/{name}"
+    url = f"{lakekeeper_url()}/catalog/v1/{catalog_prefix()}/namespaces/{NAMESPACE}/tables/{name}"
     status, body = http_request("GET", url, {}, None)
     if status != 200:
         raise RuntimeError(f"loadTable returned HTTP {status} for {name}")
