@@ -38,8 +38,10 @@ CORE = {
     "frankfurter",
 }
 BOOTSTRAP = {"bootstrap", "warehouse"}
-SPIKE = {"probe", "spark-job"}
+SPIKE = {"probe", "spark-job", "dbt-job"}
+SPIKE_IMAGE_SERVICES = {"probe", "spark-job"}
 SPIKE_DOCKERFILE = INFRA / "spike" / "Dockerfile"
+DBT_DOCKERFILE = INFRA / "dbt" / "Dockerfile"
 DOCKERIGNORE = REPO / ".dockerignore"
 PYTHON_IMAGE_DIGEST = "sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b"
 MIB = 2**20
@@ -185,6 +187,7 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
         ),
         ("probe", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
         ("spark-job", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
+        ("dbt-job", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
     ],
 )
 def test_start_order_is_enforced_by_depends_on_conditions(
@@ -317,17 +320,18 @@ def test_each_one_shot_sees_only_its_own_key_pair() -> None:
     }
     # Lakekeeper vends the storage credentials to the JVM, so the job holds no static key.
     assert secrets_of("spark-job") == set()
+    assert secrets_of("dbt-job") == set()
 
 
 # --- the spike one-shots ----------------------------------------------------------------------
 
 
-def dockerfile_lines() -> list[str]:
-    text = SPIKE_DOCKERFILE.read_text(encoding="utf-8")
+def dockerfile_lines(path: Path = SPIKE_DOCKERFILE) -> list[str]:
+    text = path.read_text(encoding="utf-8")
     return [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
 
 
-@pytest.mark.parametrize("name", sorted(SPIKE))
+@pytest.mark.parametrize("name", sorted(SPIKE_IMAGE_SERVICES))
 def test_each_spike_service_is_built_from_the_spike_dockerfile_and_locked_down(name: str) -> None:
     service = SERVICES[name]
     assert "image" not in service
@@ -339,6 +343,22 @@ def test_each_spike_service_is_built_from_the_spike_dockerfile_and_locked_down(n
     ]
     assert service["volumes"] == ["../scripts:/app:ro"]
     assert "ports" not in service
+
+
+def test_the_dbt_job_is_built_from_the_dbt_dockerfile_and_locked_down() -> None:
+    service = SERVICES["dbt-job"]
+    assert "image" not in service
+    assert service["build"] == {"context": "..", "dockerfile": "infra/dbt/Dockerfile"}
+    assert service["read_only"] is True
+    assert service["user"] == "65534:65534"
+    (entry,) = service["tmpfs"]
+    mount, _, options = entry.partition(":")
+    assert PurePosixPath(mount).parts == ("/", "tmp")
+    assert options.split(",") == ["size=512m", "exec"]
+    assert service["volumes"] == ["../analytics:/work/analytics", "../scripts:/app:ro"]
+    assert "ports" not in service
+    assert service["mem_limit"] == "1g"
+    assert service["memswap_limit"] == "1g"
 
 
 def test_the_probe_has_no_ambient_aws_configuration() -> None:
@@ -407,6 +427,23 @@ def test_every_add_is_checksum_verified_and_the_sync_names_both_groups() -> None
             r"https://repo1\.maven\.org/maven2/org/apache/iceberg/\S+-1\.11\.0\.jar", line
         )
     assert "uv sync --frozen --only-group spike --only-group spark" in text
+
+
+def test_the_dbt_dockerfile_pins_the_base_syncs_the_lock_and_keeps_dbt_off_the_path() -> None:
+    lines = dockerfile_lines(DBT_DOCKERFILE)
+    froms = [line for line in lines if line.startswith("FROM ")]
+    assert len(froms) == 1
+    assert froms[0].endswith(f"@{PYTHON_IMAGE_DIGEST}")
+    assert ":3.13" in froms[0]
+    assert not [line for line in lines if line.startswith("ADD ")]
+    allowed = {"analytics/dbt/pyproject.toml", "analytics/dbt/uv.lock"}
+    for line in lines:
+        if line.startswith("COPY ") and "--from=" not in line:
+            assert set(line.split()[1:-1]) <= allowed, line
+    text = DBT_DOCKERFILE.read_text(encoding="utf-8")
+    assert "uv sync --frozen --project /src/dbt" in text
+    # dbt is called by absolute path: no ENV line may put a venv on PATH or name /opt/dbt.
+    assert not [line for line in lines if line.startswith("ENV ") and "/opt/dbt" in line]
 
 
 # --- frankfurter ------------------------------------------------------------------------------

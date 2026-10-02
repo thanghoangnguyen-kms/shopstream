@@ -264,6 +264,38 @@ services:
     mem_limit: 3g
     memswap_limit: 3g
 
+  # Item 3 and 9's dbt runner, never started by `just up`. No infra/.env key reaches it:
+  # Lakekeeper vends the storage credentials to DuckDB. The analytics tree is mounted read-write
+  # because dbt writes its git-ignored target/ and logs/ there. The /tmp tmpfs is exec because dbt
+  # loads the ADBC driver and the DuckDB extensions it downloads into HOME on first run.
+  dbt-job:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/dbt/Dockerfile
+    profiles: [spike]
+    command: ["/opt/dbt/bin/dbt", "--version"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      DO_NOT_TRACK: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    working_dir: /work/analytics/dbt/lakekeeper
+    volumes:
+      - ../analytics:/work/analytics
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,exec
+    user: "65534:65534"
+    mem_limit: 1g
+    memswap_limit: 1g
+
 volumes:
   postgres-data:
   seaweedfs-data:

@@ -1,0 +1,10 @@
+catalogs:
+  - name: lk
+    type: iceberg_rest
+    table_format: iceberg
+    config:
+      duckdb:
+        warehouse: spike
+        endpoint: "http://lakekeeper:8181/catalog"
+        authorization_type: NONE
+        access_delegation_mode: VENDED_CREDENTIALS

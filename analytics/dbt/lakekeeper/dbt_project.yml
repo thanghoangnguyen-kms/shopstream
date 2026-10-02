@@ -1,0 +1,10 @@
+name: shopstream
+version: "1.0"
+profile: shopstream
+model-paths: ["../models"]
+macro-paths: ["../macros"]
+seed-paths: ["../seeds"]
+flags:
+  use_catalogs_v2: true
+vars:
+  catalog: lk
