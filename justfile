@@ -58,5 +58,11 @@ mem-sample *args:
 mem-report *args:
     uv run python scripts/mem_report.py report "$@"
 
+# Build and document the dbt project on the offline ci target with no dbt login: what CI's test job runs
+dbt-ci:
+    uv sync --locked --project analytics/dbt
+    DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt build --target ci --project-dir analytics/dbt --profiles-dir analytics/dbt
+    DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt docs generate --target ci --static --project-dir analytics/dbt --profiles-dir analytics/dbt
+
 # Everything CI runs, in one command: a local pass predicts a CI pass
-check: tools lint test secrets-scan
+check: tools lint test dbt-ci secrets-scan
