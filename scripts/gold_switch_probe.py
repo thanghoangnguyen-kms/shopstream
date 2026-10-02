@@ -154,21 +154,93 @@ def check_state(con: Any) -> dict[str, Any]:
     return {"ok": not problems, "state": state, "problems": problems}
 
 
-def precheck(con: Any) -> None:
+def precheck(con: Any) -> dict[str, Any]:
     """Refuse to start unless gold holds A, gold_candidate holds B and gold_retired is empty.
 
-    On failure print the state found and the reset to run, then exit 1.
+    Returns the state found. On failure print it and the reset to run, then exit 1.
     """
     ensure_namespace(gold_switch.RETIRED)
     found = check_state(con)
     if found["ok"]:
-        return
+        return found
     print(json.dumps({"precheck": "failed", **found}), flush=True)
     print(
         f"precheck failed: {'; '.join(found['problems'])}\nReset with: {RESET_HINT}",
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+VIEW_NAMESPACE = "gold_view_probe"
+VIEW_NAME = "v"
+
+
+def view_check(con: Any) -> dict[str, Any]:
+    """Create a view through Lakekeeper's REST API, list it, try to read it in DuckDB, drop it.
+
+    Returns view_created, view_listed, duckdb_reads_view and duckdb_error (None when DuckDB read
+    it), plus the REST statuses. The view and its namespace are dropped afterwards, even on error.
+    """
+    namespace = identifier(VIEW_NAMESPACE)
+    name = identifier(VIEW_NAME)
+    result: dict[str, Any] = {
+        "view_created": False,
+        "view_listed": False,
+        "duckdb_reads_view": False,
+        "duckdb_error": None,
+        "create_status": None,
+        "list_status": None,
+    }
+    ensure_namespace(namespace)
+    request = {
+        "name": name,
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "x", "required": False, "type": "int"}],
+        },
+        "view-version": {
+            "version-id": 1,
+            "timestamp-ms": int(time.time() * 1000),
+            "schema-id": 0,
+            "summary": {"operation": "create"},
+            "representations": [{"type": "sql", "sql": "SELECT 1 AS x", "dialect": "duckdb"}],
+            "default-namespace": [namespace],
+        },
+        "properties": {},
+    }
+    views_url = f"{rest_base()}/namespaces/{namespace}/views"
+    try:
+        status, _ = http_request("POST", views_url, JSON_HEADERS, json.dumps(request).encode())
+        result["create_status"] = status
+        result["view_created"] = status == 200
+        status, body = http_request("GET", views_url, {}, None)
+        result["list_status"] = status
+        if status == 200:
+            listed = json.loads(body).get("identifiers") or []
+            result["view_listed"] = any(
+                item.get("name") == name and list(item.get("namespace", [])) == [namespace]
+                for item in listed
+            )
+        try:
+            con.execute(f"SELECT * FROM lk.{namespace}.{name}").fetchall()
+            result["duckdb_reads_view"] = True
+        except Exception as exc:
+            result["duckdb_error"] = error_text(exc)
+    finally:
+        http_request("DELETE", f"{views_url}/{name}", {}, None)
+        http_request("DELETE", f"{rest_base()}/namespaces/{namespace}", {}, None)
+    return result
+
+
+def versions(con: Any) -> dict[str, str | None]:
+    """DuckDB's version and its iceberg extension's version."""
+    import duckdb
+
+    row = con.execute(
+        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'iceberg'"
+    ).fetchone()
+    return {"duckdb": duckdb.__version__, "iceberg_extension": str(row[0]) if row else None}
 
 
 def run_switches(
@@ -259,6 +331,9 @@ def run_switches(
     return {
         "label": label,
         "switches": switches,
+        "retry_ms": retry_ms,
+        "transitions": gold_switch.transitions("".join(sequence)),
+        "timing": gold_switch.interval_stats(starts, durations_ms),
         "a_to_b": a_to_b,
         "b_to_a": b_to_a,
         "gap_ms": gap_ms,
@@ -296,10 +371,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     con = attach_connection()
     print(f"max_table_staleness={MAX_TABLE_STALENESS}", file=sys.stderr, flush=True)
-    precheck(con)
+    viewed = None if args.no_view_check else view_check(con)
+    before = precheck(con)
+    columns_ok = all(
+        cell.get("has_publish_id_column") is True
+        for namespace in (gold_switch.GOLD, gold_switch.CANDIDATE)
+        for cell in before["state"][namespace].values()
+    )
     runs: dict[str, dict[str, Any]] = {}
-    natural = run_switches("natural", args.switches, 0, args.period_ms, args.retry_ms, args.hold_ms)
-    runs["natural"] = natural
+    runs["natural"] = run_switches(
+        "natural", args.switches, 0, args.period_ms, args.retry_ms, args.hold_ms
+    )
     if args.control_switches:
         runs["control"] = run_switches(
             "control",
@@ -311,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     end = check_state(con)
     report: dict[str, Any] = {
+        "versions": versions(con),
         "settings": {
             "period_ms": args.period_ms,
             "retry_ms": args.retry_ms,
@@ -324,8 +407,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     if not end["ok"]:
         report["end_state"] = end
+    exit_code = 0 if end["ok"] else 1
+    if viewed is not None:
+        report["view_check"] = viewed
+        report["verdict"] = gold_switch.item7_verdict(
+            viewed,
+            runs["natural"],
+            runs.get("control"),
+            columns_ok=columns_ok,
+            end_state_ok=bool(end["ok"]),
+        )
+        if report["verdict"]["verdict"] == "inconclusive":
+            exit_code = 1
     print(json.dumps(report, ensure_ascii=False))
-    return 0 if end["ok"] else 1
+    return exit_code
 
 
 if __name__ == "__main__":
