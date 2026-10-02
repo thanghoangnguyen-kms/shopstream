@@ -105,3 +105,25 @@ def rename_steps(obj: str) -> list[tuple[tuple[str, str], tuple[str, str]]]:
         ((CANDIDATE, obj), (GOLD, obj)),
         ((RETIRED, obj), (CANDIDATE, obj)),
     ]
+
+
+def transitions(ids: Sequence[str]) -> int:
+    raise NotImplementedError
+
+
+def interval_stats(
+    poll_starts_s: Sequence[float], switch_ms: Sequence[float]
+) -> dict[str, dict[str, float | None]]:
+    raise NotImplementedError
+
+
+def item7_verdict(
+    view_check: Mapping[str, Any],
+    natural: Mapping[str, Any],
+    control: Mapping[str, Any] | None,
+    expected_switches: int = 40,
+    *,
+    columns_ok: bool,
+    end_state_ok: bool,
+) -> dict[str, Any]:
+    raise NotImplementedError
