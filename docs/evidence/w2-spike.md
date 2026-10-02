@@ -638,7 +638,188 @@ Not run.
 
 ## Item 9: dbt login
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: go. On the item 3 fallback runtime (dbt-core 1.12.5 with dbt-duckdb 1.11.0), dbt build and docs lite ran in CI's required test job with no dbt login and no CI secret, and the dbt project's SQL is linted by the existing sqlfluff hook in the required lint job, because dbt-core has no lint and no login command.
+
+ADR-001's criterion 9 is written in dbt 2.0 terms, and the build runs on dbt-core 1.12.5 since item 3's `fallback`. So this section maps each term onto the runtime in use, records what ran in CI and with no network, and keeps what a dbt 2 login sends apart from what was measured.
+
+### Versions
+
+- dbt-core 1.12.5 and dbt-duckdb 1.11.0 (`dbt --version`), DuckDB 1.5.5 (pinned in the `analytics/dbt` lock), sqlfluff 4.3.0, uv 0.12.18.
+- CI: GitHub's `ubuntu-24.04` x86_64 runner, CPython 3.13.15. Local: macOS 27.0.1 on arm64, CPython 3.13.14.
+- No-network runs: the `shopstream-dbt-job` image (`sha256:83a2dab73350ec6e33c0cb7e40fd5c9a941761802e246bad1fd62e9c4ba094a4`, the Item 3 fallback image), dbt-core 1.12.5 in `/opt/dbt`.
+- Licences: dbt-core and dbt-duckdb are Apache-2.0, DuckDB and sqlfluff are MIT. No dbt licence condition applies, since dbt 2.0.6 left the build.
+
+### Mapping
+
+| ADR-001 criterion 9 term | On dbt-core 1.12.5 | Evidence below |
+| --- | --- | --- |
+| `dbt build` | `dbt build --target ci`: the in-memory `ci` target, no attach and no extension, so it needs no catalog and no stack | 4 of 4 steps ok locally, in CI and with `--network none` |
+| `dbt lint` | does not exist: `dbt lint` prints `Error: No such command 'lint'.` The lint leg is the repo's sqlfluff hook (jinja templater, duckdb dialect) in the required lint job | the No such command line, the lint job's hook line |
+| docs lite | `dbt docs generate --target ci --static`: `static_index.html` is 2429579 bytes locally, `catalog.json` is valid JSON with a `nodes` key holding 0 nodes, and `manifest.json` lists `model.shopstream.inc_v3`. Every dbt invocation opens a fresh in-memory DuckDB, so the catalog step connects and finds no built table | the target facts below |
+| no login | there is no login: `dbt login` prints `Error: No such command 'login'. Did you mean 'clone'?`, no `dbt_cloud.yml` or `catalogs.yml` is tracked, and no workflow references a secret | the No such command line, the CI shape below |
+
+### CI shape
+
+One added step in the existing `test` job runs `uv run just dbt-ci`, the same recipe `just check` runs after `just test`. The required checks stay `lint`, `test`, `secrets` and `pr-title`, and no job starts Docker or the Compose stack. The `ci` target has no attach, so CI needs only pypi.org, files.pythonhosted.org and github.com (the experimental-parser wheel, see Consequences). `DO_NOT_TRACK=1` prefixes every dbt command in the recipe. `tests/test_ci_workflow.py` pins all of this: the four job names, no `pull_request_target` trigger, no `secrets.` expression and no `DBT_CLOUD` variable, the test job's three `run` steps in order, no Docker or Compose step, the `--target ci` and `DO_NOT_TRACK=1` prefix on each dbt line, and no tracked `dbt_cloud.yml` or `catalogs.yml`.
+
+### Command
+
+```text
+dbt-ci:
+    uv sync --locked --project analytics/dbt
+    DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt build --target ci --project-dir analytics/dbt --profiles-dir analytics/dbt
+    DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt docs generate --target ci --static --project-dir analytics/dbt --profiles-dir analytics/dbt
+```
+
+The local run's output, trimmed (the 59-line package list and the harmless `VIRTUAL_ENV` warning that `uv run just` prints are cut):
+
+```text
+$ uv run just dbt-ci
+Installed 59 packages in 218ms
+16:04:45  Running with dbt=1.12.5
+16:04:45  Registered adapter: duckdb=1.11.0
+16:04:46  Found 1 model, 1 seed, 2 data tests, 503 macros
+16:04:46  Concurrency: 1 threads (target='ci')
+16:04:46  1 of 4 OK loaded seed file main.changes ........................................ [INSERT 5 in 0.02s]
+16:04:46  2 of 4 OK created sql incremental model silver_spike.inc_v3 .................... [OK in 0.02s]
+16:04:46  3 of 4 PASS not_null_inc_v3_id ................................................. [PASS in 0.01s]
+16:04:46  4 of 4 PASS unique_inc_v3_id ................................................... [PASS in 0.01s]
+16:04:46  Completed successfully
+16:04:47  Running with dbt=1.12.5
+16:04:47  Building catalog
+16:04:47  Catalog written to <repo>/analytics/dbt/target/catalog.json
+```
+
+The state it left, read from `analytics/dbt`:
+
+```text
+catalog.json bytes 326 nodes 0 sources 0
+static_index.html bytes 2429579
+manifest model nodes ['model.shopstream.inc_v3']
+user.yml exists False
+telemetry send lines in logs/dbt.log: 0
+```
+
+The two missing commands, with `DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt lint` and the same with `login`:
+
+```text
+Error: No such command 'lint'. (Did you mean one of: 'init', 'list'?)
+exit=2
+Error: No such command 'login'. Did you mean 'clone'?
+exit=2
+```
+
+`dbt --version` prints `installed: 1.12.5` and `duckdb: 1.11.0`. It also asks PyPI for the latest version, so it is a networked command and is not part of the recipe.
+
+### CI run
+
+- Run: https://github.com/thanghoangnguyen-kms/shopstream/actions/runs/37031844664, event `pull_request` on draft PR 8.
+- Head SHA: `26479b6a6d4b4f3b4b5d0345c28aa20d2c51868d`.
+- Conclusion: success for all four jobs. The `test` job passed, its `Run uv run just dbt-ci` step passed (the test job took 21 s), and the `lint` job's sqlfluff hook passed. The `test` job's step `Run uv run just test` also passed, with 1214 tests.
+- The first push was the only one: no CI run for this item failed and no fix was needed. An earlier run on the previous remote head (`5af4da96e4d9`) had also passed, before the dbt step existed.
+
+The `test` job's dbt step, trimmed to what dbt and uv printed (package list, download lines and timestamps cut):
+
+```text
+uv sync --locked --project analytics/dbt
+Using CPython 3.13.15
+Creating virtual environment at: analytics/dbt/.venv
+Resolved 62 packages in 0.74ms
+   Building dbt-core-experimental-parser==2.0.5
+      Built dbt-core-experimental-parser==2.0.5
+Installed 59 packages in 42ms
+DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt build --target ci --project-dir analytics/dbt --profiles-dir analytics/dbt
+16:08:25  Running with dbt=1.12.5
+16:08:25  Registered adapter: duckdb=1.11.0
+16:08:26  Found 1 model, 1 seed, 2 data tests, 503 macros
+16:08:26  Concurrency: 1 threads (target='ci')
+16:08:27  1 of 4 OK loaded seed file main.changes ........................................ [INSERT 5 in 0.05s]
+16:08:27  2 of 4 OK created sql incremental model silver_spike.inc_v3 .................... [OK in 0.05s]
+16:08:27  3 of 4 PASS not_null_inc_v3_id ................................................. [PASS in 0.03s]
+16:08:27  4 of 4 PASS unique_inc_v3_id ................................................... [PASS in 0.01s]
+16:08:27  Completed successfully
+DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt docs generate --target ci --static --project-dir analytics/dbt --profiles-dir analytics/dbt
+16:08:28  Running with dbt=1.12.5
+16:08:29  Building catalog
+16:08:29  Catalog written to /home/runner/work/shopstream/shopstream/analytics/dbt/target/catalog.json
+```
+
+The `lint` job's hook line: `sqlfluff lint............................................................Passed`.
+
+### No network
+
+Each run used `docker run --rm --network none --memory 1g --memory-swap 1g --user 65534:65534 -e HOME=/tmp -v "$PWD/analytics/dbt:/src:ro" --entrypoint sh shopstream-dbt-job -c '<script>'` from the repo root. The script first copies `dbt_project.yml`, `profiles.yml` and the models, macros and seeds directories from `/src` to `/tmp/p`, never the host's `.venv`, `target/` or `logs/`, so nothing was written into the repo (`git status` over `analytics` stayed empty).
+
+Build and docs, with `DO_NOT_TRACK=1`, `--project-dir /tmp/p --profiles-dir /tmp/p` and `--target ci`:
+
+```text
+$ /opt/dbt/bin/dbt build ...
+16:09:42  1 of 4 OK loaded seed file main.changes ........................................ [INSERT 5 in 0.02s]
+16:09:42  2 of 4 OK created sql incremental model silver_spike.inc_v3 .................... [OK in 0.03s]
+16:09:42  3 of 4 PASS not_null_inc_v3_id ................................................. [PASS in 0.01s]
+16:09:42  4 of 4 PASS unique_inc_v3_id ................................................... [PASS in 0.01s]
+build exit=0
+$ /opt/dbt/bin/dbt docs generate --static ...
+16:09:43  Building catalog
+16:09:43  Catalog written to /tmp/p/target/catalog.json
+docs exit=0
+-rw-r--r-- 1 nobody nogroup 2429838 Oct  2 16:09 /tmp/p/target/static_index.html
+```
+
+Telemetry, two `dbt parse --target ci` runs on fresh copies, both with `--network none`:
+
+| Run | Settings | Telemetry send lines in `logs/dbt.log` | `.user.yml` |
+| --- | --- | --- | --- |
+| opted out | `DO_NOT_TRACK=1` and the project's `send_anonymous_usage_stats: false`, as the recipe runs | 0 | absent |
+| control | `DO_NOT_TRACK` unset and the copy's `flags:` block deleted (on the copy, never the repo file) | 6 | created |
+
+The control logged these events, each a `Sending event` line, and then `An error was encountered while trying to flush usage events`, because the container has no network, so nothing left it:
+
+```text
+'action': 'invocation', 'label': 'start'
+'action': 'project_id', 'label': <project id>
+'action': 'adapter_info', 'label': <project id>
+'action': 'partial_parser', 'label': <project id>
+'action': 'load_project', 'label': <project id>
+'action': 'invocation', 'label': 'end'
+```
+
+Research's earlier unopted `dbt parse --target ci` logged 5 events (research, not a measurement here); this control measured 6.
+
+### What a login sends
+
+Measured on dbt-core 1.12.5, with no login. dbt-core sends anonymous usage statistics over HTTPS to a Snowplow collector, `fishtownanalytics.sinter-collect.com`, unless it is switched off. The control run above shows the events it prepares (6 for a `parse`, listed above) and the `.user.yml` file that holds its anonymous id. `DO_NOT_TRACK=1` and the project flag `send_anonymous_usage_stats: false` each gave 0 events and no `.user.yml`, and the recipe sets both. The generated `index.html` and `static_index.html` each contain the collector's hostname once. They were not opened in a browser, and whether opening them sends events was not tested.
+
+dbt 2.0 behaviour, not exercised. No dbt 2 login ran in CI or anywhere in this item, since no dbt 2 is in the build. Only these facts from the cited docs.getdbt.com pages are recorded, and nothing beyond them is claimed:
+
+- https://docs.getdbt.com/docs/deploy/dbt-state-about, "How is data stored in dbt State?": "dbt State sends the following metadata to dbt Labs servers: Last-modified timestamps: Used to determine whether upstream data has changed since the last run. SQL statement hashes: SQL statements are processed to detect and classify changes, then hashed. Only the hash is persisted for future comparisons. No actual data from your warehouse is transmitted."
+- https://docs.getdbt.com/reference/commands/login: `dbt login` "will open browser-based authentication where you can sign in to your existing dbt platform account or create a free one", is available in dbt v2.0 and later, "doesn't support non-interactive authentication", and for CI/CD jobs the page says to use a service token instead of `dbt login`.
+- The dbt Core v1 usage-stats text (the rendered docs.getdbt.com usage-stats page now shows only dbt 2 text) is in https://github.com/dbt-labs/docs.getdbt.com, `website/docs/reference/global-configs/usage-stats.md`. It says dbt Core v1 can be switched off with `flags: send_anonymous_usage_stats: false`, `DO_NOT_TRACK=1` or `DBT_SEND_ANONYMOUS_USAGE_STATS=False`.
+
+The brief's "a login sends project metadata to dbt Labs" maps onto the dbt State fact above (last-modified timestamps and SQL statement hashes). What else a free login sends, for example for strict static analysis or SQL comprehension, is not documented in the pages read, so this page does not say.
+
+### Linters
+
+The sqlfluff hook (jinja templater, duckdb dialect, `.sqlfluff` unchanged) runs over every tracked SQL file, which includes the two under `analytics/dbt` (`macros/iceberg.sql` and `models/silver_spike/inc_v3.sql`). Run over those tracked paths it reports no violation:
+
+```text
+$ uv run --frozen sqlfluff lint analytics/dbt/models analytics/dbt/macros analytics/dbt/seeds
+All Finished!
+exit=0
+```
+
+A bare `sqlfluff lint analytics/dbt` over a synced tree is not equivalent. It also walks the gitignored `analytics/dbt/.venv`, which holds dbt's own package macros, and fails there (`adapters.sql` is the first file, with LT02 and JJ01 findings). The hook never sees those files, because it lints tracked files only, so the lint job is unaffected.
+
+Research ran `sqlfluff-templater-dbt` 4.3.0 beside `sqlfluff` 4.3.0, dbt-core 1.12.5 and dbt-duckdb 1.11.0 in a throwaway virtual environment, with `templater = dbt` and the `ci` target, and it reported `violations: 0 status: PASS`. That is research, not rerun here, and it is Week 10's input. The templater is a new dependency, so adopting it needs an ADR first.
+
+### Consequences
+
+- No dbt token becomes a GitHub Actions secret, and no workflow references one. ADR-001's item 9 go branch, "No login and no CI secret", holds on the runtime in use.
+- Every uncached CI sync builds the `dbt-core-experimental-parser` sdist, which fetches a sha256-checked wheel from github.com. The run above did this in under a second and passed, so the dependency on github.com for the first uncached sync is measured on `ubuntu-24.04`, not only assumed.
+- The comment in `.sqlfluff` that names dbt 2.0 and G11 is now stale, because the fallback runtime is dbt-core 1.x. That is an owner decision for Week 10.
+- Phase 6 mirrors this verdict into ADR-001's Results table, where criterion 9's dbt 2 wording is read against the dbt-core mapping above.
 
 ## Item 10: FX offline
 
