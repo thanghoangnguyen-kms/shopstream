@@ -15,3 +15,9 @@ seeds:
         customer_id: integer
         order_date: date
         amount: decimal(10,2)
+  - name: customers
+    description: Three customers for item 7's gold switch, so dim_customers is the third switched object.
+    config:
+      column_types:
+        customer_id: integer
+        segment: varchar

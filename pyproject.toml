@@ -73,6 +73,8 @@ ignore = ["E501"]
 "scripts/dbt_v3_check.py" = ["S608"]
 # Fixed absolute-path argv lists (the dbt and mf CLIs), never shell strings.
 "scripts/semantic_check.py" = ["S603"]
+# SQL built from fixed namespace and object names through identifier().
+"scripts/gold_switch_probe.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.13"

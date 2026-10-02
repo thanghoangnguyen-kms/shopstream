@@ -43,3 +43,12 @@ models:
         granularity: day
       - name: publish_id
         description: The publish that built the row, which item 7 reads.
+  - name: dim_customers
+    description: One row per customer, the third gold object; item 7 switches it with the other two.
+    columns:
+      - name: customer_id
+        description: The customer's key.
+      - name: segment
+        description: The customer's segment, retail or wholesale.
+      - name: publish_id
+        description: The publish that built the row, which item 7 reads.
