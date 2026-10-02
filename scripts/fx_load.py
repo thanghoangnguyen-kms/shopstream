@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 DEFAULT_URL = "http://frankfurter:8080"
@@ -180,6 +180,21 @@ def load_stats(path: str = DB_PATH) -> dict[str, Any]:
     }
 
 
+def loaded_dates(path: str = DB_PATH) -> list[str]:
+    """The distinct non-EUR dates in the loaded table, as ISO strings in order."""
+    import duckdb
+
+    con = duckdb.connect(path, read_only=True)
+    try:
+        found = con.execute(
+            f"SELECT DISTINCT CAST(CAST(date AS DATE) AS VARCHAR) FROM {DATASET}.{TABLE} "
+            f"WHERE quote <> 'EUR' ORDER BY 1"
+        ).fetchall()
+    finally:
+        con.close()
+    return [str(row[0]) for row in found]
+
+
 def load(api: str, from_date: dt.date, to_date: dt.date) -> dict[str, Any]:
     """Load yearly ranges into the dlt DuckDB destination and return the table's counts."""
     import dlt
@@ -201,6 +216,69 @@ def load(api: str, from_date: dt.date, to_date: dt.date) -> dict[str, Any]:
     pipeline.run(resource)
     seconds = round(time.monotonic() - started, 2)
     return {**load_stats(), "load_seconds": seconds}
+
+
+def target_closing_days(year: int) -> set[dt.date]:
+    """TARGET closing days of one year, inferred from the data and general TARGET knowledge (A5).
+
+    1 January, 25 and 26 December every year; Good Friday, Easter Monday and 1 May from 2000
+    (Easter was not a closing day in 1999); 31 December through 2001. gap_check prints every
+    mismatch, so a wrong rule shows up instead of being assumed away.
+    """
+    from dateutil.easter import easter
+
+    days = {dt.date(year, 1, 1), dt.date(year, 12, 25), dt.date(year, 12, 26)}
+    if year >= 2000:
+        sunday = easter(year)
+        days |= {sunday - dt.timedelta(days=2), sunday + dt.timedelta(days=1), dt.date(year, 5, 1)}
+    if year <= 2001:
+        days.add(dt.date(year, 12, 31))
+    return days
+
+
+def gap_check(dates: Iterable[str], from_date: dt.date, to_date: dt.date) -> dict[str, Any]:
+    """Compare the loaded non-EUR dates with the weekdays and TARGET closing days of the range."""
+    have = {dt.date.fromisoformat(day) for day in dates}
+    span = [from_date + dt.timedelta(days=n) for n in range((to_date - from_date).days + 1)]
+    weekdays = [day for day in span if day.weekday() < 5]
+    closing: set[dt.date] = set()
+    for year in range(from_date.year, to_date.year + 1):
+        closing |= target_closing_days(year)
+    missing = [day for day in weekdays if day not in have]
+    closing_weekdays = [day for day in weekdays if day in closing]
+    return {
+        "weekdays_in_range": len(weekdays),
+        "missing_weekdays": [day.isoformat() for day in missing],
+        "closing_weekdays": [day.isoformat() for day in closing_weekdays],
+        "missing_not_closing": [day.isoformat() for day in missing if day not in closing],
+        "closing_with_rows": [day.isoformat() for day in closing_weekdays if day in have],
+    }
+
+
+def item10_verdict(result: Mapping[str, Any]) -> dict[str, Any]:
+    """go on v2, fallback on v1, inconclusive when any condition fails (reasons name each)."""
+    reasons: list[str] = []
+    providers = result.get("providers") or {}
+    if not providers.get("complete"):
+        reasons.append(f"the backfill is not complete: {providers.get('reason')}")
+    cut = result.get("network_cut") or {}
+    if not (cut.get("dns_blocked") and cut.get("ip_blocked")):
+        reasons.append("the network cut is not shown")
+    loaded = result.get("load") or {}
+    if not loaded.get("rows"):
+        reasons.append("no rows were loaded")
+    if loaded.get("weekend_rows") != 0:
+        reasons.append(f"weekend rows were loaded: {loaded.get('weekend_rows')}")
+    gaps = result.get("gaps") or {}
+    if gaps.get("missing_not_closing") != []:
+        reasons.append(
+            f"weekdays missing that the calendar rule does not explain: {gaps.get('missing_not_closing')}"
+        )
+    if gaps.get("closing_with_rows") != []:
+        reasons.append(f"closing days that hold rows: {gaps.get('closing_with_rows')}")
+    if reasons:
+        return {"verdict": "inconclusive", "reasons": reasons}
+    return {"verdict": "go" if result.get("api") == "v2" else "fallback", "reasons": []}
 
 
 def versions() -> dict[str, str]:
@@ -236,11 +314,14 @@ def main(argv: list[str] | None = None) -> int:
         refusal.append("the network cut is not shown")
     if refusal:
         report["refused"] = refusal
+        report["verdict"] = item10_verdict(report)
         print(json.dumps(report, ensure_ascii=False))
         return 1
     report["load"] = load(args.api, from_date, to_date)
+    report["gaps"] = gap_check(loaded_dates(), from_date, to_date)
+    report["verdict"] = item10_verdict(report)
     print(json.dumps(report, ensure_ascii=False))
-    return 0
+    return 0 if report["verdict"]["verdict"] in ("go", "fallback") else 1
 
 
 if __name__ == "__main__":
