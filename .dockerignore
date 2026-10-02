@@ -6,3 +6,5 @@
 !packages/generator/pyproject.toml
 !analytics/dbt/pyproject.toml
 !analytics/dbt/uv.lock
+!analytics/metricflow/pyproject.toml
+!analytics/metricflow/uv.lock

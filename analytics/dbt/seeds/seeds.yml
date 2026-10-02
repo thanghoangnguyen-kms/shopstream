@@ -7,3 +7,11 @@ seeds:
         name: varchar
         is_deleted: boolean
         batch: integer
+  - name: orders
+    description: Four orders on three days for item 4's semantic layer and item 7's gold switch.
+    config:
+      column_types:
+        order_id: integer
+        customer_id: integer
+        order_date: date
+        amount: decimal(10,2)

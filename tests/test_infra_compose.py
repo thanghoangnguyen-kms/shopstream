@@ -437,14 +437,24 @@ def test_the_dbt_dockerfile_pins_the_base_syncs_the_lock_and_keeps_dbt_off_the_p
     assert froms[0].endswith(f"@{PYTHON_IMAGE_DIGEST}")
     assert ":3.13" in froms[0]
     assert not [line for line in lines if line.startswith("ADD ")]
-    allowed = {"analytics/dbt/pyproject.toml", "analytics/dbt/uv.lock"}
+    allowed = {
+        "analytics/dbt/pyproject.toml",
+        "analytics/dbt/uv.lock",
+        "analytics/metricflow/pyproject.toml",
+        "analytics/metricflow/uv.lock",
+    }
     for line in lines:
         if line.startswith("COPY ") and "--from=" not in line:
             assert set(line.split()[1:-1]) <= allowed, line
     text = DBT_DOCKERFILE.read_text(encoding="utf-8")
     assert "uv sync --frozen --project /src/dbt" in text
-    # dbt is called by absolute path: no ENV line may put a venv on PATH or name /opt/dbt.
-    assert not [line for line in lines if line.startswith("ENV ") and "/opt/dbt" in line]
+    assert "uv sync --frozen --project /src/mf" in text
+    # Each CLI is called by absolute path: no ENV line may put a venv on PATH or name one.
+    assert not [
+        line
+        for line in lines
+        if line.startswith("ENV ") and ("/opt/dbt" in line or "/opt/mf" in line)
+    ]
 
 
 # --- frankfurter ------------------------------------------------------------------------------
