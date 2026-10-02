@@ -38,7 +38,7 @@ CORE = {
     "frankfurter",
 }
 BOOTSTRAP = {"bootstrap", "warehouse"}
-SPIKE = {"probe"}
+SPIKE = {"probe", "spark-job"}
 SPIKE_DOCKERFILE = INFRA / "spike" / "Dockerfile"
 DOCKERIGNORE = REPO / ".dockerignore"
 PYTHON_IMAGE_DIGEST = "sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b"
@@ -184,6 +184,7 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
             },
         ),
         ("probe", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
+        ("spark-job", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
     ],
 )
 def test_start_order_is_enforced_by_depends_on_conditions(
@@ -314,6 +315,8 @@ def test_each_one_shot_sees_only_its_own_key_pair() -> None:
         "SEAWEEDFS_ADMIN_KEY",
         "SEAWEEDFS_ADMIN_SECRET",
     }
+    # Lakekeeper vends the storage credentials to the JVM, so the job holds no static key.
+    assert secrets_of("spark-job") == set()
 
 
 # --- the spike one-shots ----------------------------------------------------------------------
@@ -351,6 +354,17 @@ def test_the_probe_has_no_ambient_aws_configuration() -> None:
         assert ambient not in environment
 
 
+def test_the_spark_job_limits_are_the_literal_three_gigabyte_pair() -> None:
+    service = SERVICES["spark-job"]
+    assert service["mem_limit"] == "3g"
+    assert service["memswap_limit"] == "3g"
+
+
+def test_the_spark_job_tmpfs_is_exec_because_zstd_jni_maps_a_native_library_from_it() -> None:
+    (entry,) = SERVICES["spark-job"]["tmpfs"]
+    assert entry.split(":")[1].split(",") == ["size=512m", "exec"]
+
+
 def test_the_dockerignore_denies_everything_but_the_lock_inputs() -> None:
     lines = [
         line
@@ -380,6 +394,19 @@ def test_the_spike_dockerfile_pins_the_python_base_and_copies_only_lock_inputs()
     for line in lines:
         if line.startswith("COPY ") and "--from=" not in line:
             assert set(line.split()[1:-1]) <= allowed, line
+
+
+def test_every_add_is_checksum_verified_and_the_sync_names_both_groups() -> None:
+    text = SPIKE_DOCKERFILE.read_text(encoding="utf-8")
+    adds = [line for line in dockerfile_lines() if line.startswith("ADD ")]
+    assert len(adds) == 2
+    for line in adds:
+        assert re.search(r"--checksum=sha256:[0-9a-f]{64}\b", line), line
+        assert "--chmod=644" in line, line
+        assert re.search(
+            r"https://repo1\.maven\.org/maven2/org/apache/iceberg/\S+-1\.11\.0\.jar", line
+        )
+    assert "uv sync --frozen --only-group spike --only-group spark" in text
 
 
 # --- frankfurter ------------------------------------------------------------------------------

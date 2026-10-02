@@ -232,6 +232,38 @@ services:
     mem_limit: 256m
     memswap_limit: 256m
 
+  # Item 2's Spark writer (readers come in Plan 02-05) and the job item 8 runs in Phase 5. Same
+  # image as probe. No infra/.env key reaches it: Lakekeeper vends the storage credentials to
+  # the JVM. Spark needs scratch space, hence the larger /tmp tmpfs on a read-only root. The tmpfs
+  # is mounted exec because the REST client decodes Lakekeeper's zstd responses with zstd-jni,
+  # which extracts a native library into /tmp and maps it (a default noexec tmpfs refuses that).
+  spark-job:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/spark_v3_job.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_EC2_METADATA_DISABLED: "true"
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,exec
+    user: "65534:65534"
+    mem_limit: 3g
+    memswap_limit: 3g
+
 volumes:
   postgres-data:
   seaweedfs-data:
