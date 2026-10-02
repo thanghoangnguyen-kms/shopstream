@@ -618,7 +618,86 @@ The three-stage rule alone also returned go on the same three stage lines. The p
 
 ## Item 4: Semantic layer
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: go. MetricFlow 0.213.0 (mf 0.15.0), in its own uv project and venv, served `total_revenue` from the semantic manifest dbt-core 1.12.5 wrote for the dbt project, and `mf query` returned the same rows as hand-written SQL over gold, for the metric grouped by day and for the total. Each venv's `dbt` CLI works and reports dbt-core 1.12.5.
+
+### Versions
+
+- dbt-core 1.12.5 and dbt-duckdb 1.11.0 in both venvs: `/opt/dbt` builds the project and `/opt/mf` holds MetricFlow. `dbt-metricflow` 0.15.0 and `metricflow` 0.213.0 are in the MetricFlow venv only. The check's own DuckDB is 1.5.5, the same version dbt-duckdb loads.
+- The MetricFlow venv comes from its own uv project (`analytics/metricflow`, 68 packages, a 175 KB lock) outside the workspace, synced with `uv sync --frozen`. The root workspace and its lock hold no dbt or MetricFlow package, and neither venv is on `PATH`: every CLI is called by its absolute path.
+- Lakekeeper 0.13.6, SeaweedFS 4.47.
+- dbt image `shopstream-dbt-job`: id `sha256:82737342b10cd6c2c2e6ba77b0dd99c8eae850894da88831b5543ab5ad861ac9`, 283952438 bytes (two venvs, against 174707961 for the one-venv image). Base image `python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b`, uv `0.12.18@sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc`.
+- Licences: dbt-core, dbt-duckdb, dbt-metricflow and MetricFlow are Apache-2.0, DuckDB is MIT.
+
+### Command
+
+Gold is two `incremental` models, `gold.fct_orders` and `gold.metricflow_time_spine`, each Iceberg format-version 3 with a `publish_id` column, built from a four-row `orders` seed into an empty `gold` namespace. A second build appends rather than replaces, so the sequence purges first. The semantic model `orders` and the metric `total_revenue` sit in `gold.yml` in the latest metrics spec, and `mf validate-configs` passed all seven stages. The captures went through `scripts/redact_evidence.py`.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job python /app/gold_reset.py gold
+{"purged": {"gold": ["fct_orders", "metricflow_time_spine"]}}
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T dbt-job /opt/dbt/bin/dbt build --target lk --select +tag:gold --project-dir /work/analytics/dbt --profiles-dir /work/analytics/dbt --vars '{publish_id: A}'
+1 seed loaded, 2 incremental models created (3 of 3 steps ok)
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T -e DBT_PROJECT_DIR=/work/analytics/dbt -e DBT_PROFILES_DIR=/work/analytics/dbt dbt-job /opt/mf/bin/python /app/semantic_check.py
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T -e DBT_PROJECT_DIR=/work/analytics/dbt -e DBT_PROFILES_DIR=/work/analytics/dbt dbt-job /opt/mf/bin/mf query --metrics total_revenue --group-by metric_time__day --order metric_time__day --explain
+```
+
+`semantic_check.py` ran once for the page. It runs `mf validate-configs` and two `mf query` calls that write `--csv` files (the metric grouped by `metric_time__day`, then the total), runs the same two queries as SQL over `lk.gold.fct_orders` in DuckDB 1.5.5, and compares them by day with values as decimals. The purge, the build and the check ran as three separate commands in that order, so the rows below come from one purged build.
+
+### Rows
+
+| Day | MetricFlow | Hand-written SQL |
+| --- | --- | --- |
+| 2026-09-01 | 100 | 100.00 |
+| 2026-09-02 | 75 | 75.00 |
+| 2026-09-03 | 75 | 75.00 |
+| Total | 250 | 250.00 |
+
+The grouped result is in date order here. `mf query --csv` is not ordered by itself, so the check keys both sides by day and ignores row order, and it compares values as decimals, where 250 equals 250.00 and 75 does not equal 75.01. A day with no orders, such as 2026-09-04, is in neither result, and an empty result on either side is a mismatch, never a pass. The check's output, verbatim (exit 0):
+
+```text
+{"versions": {"dbt_cli": "1.12.5", "mf_dbt_cli": "1.12.5", "mf": "0.15.0", "metricflow": "0.213.0", "dbt_metricflow": "0.15.0", "duckdb": "1.5.5"}, "dbt_parse": {"exit": 0}, "validate_configs": {"exit": 0, "successful_stages": 7}, "mf_rows": [["2026-09-01", "100.0"], ["2026-09-02", "75.0"], ["2026-09-03", "75.0"]], "sql_rows": [["2026-09-01", "100.00"], ["2026-09-02", "75.00"], ["2026-09-03", "75.00"]], "mf_total": [[null, "250.0"]], "sql_total": [[null, "250.00"]], "comparison": {"grouped": {"match": true, "empty": false, "missing_days": [], "extra_days": [], "differing": [], "duplicate_days": []}, "total": {"match": true, "empty": false, "missing_days": [], "extra_days": [], "differing": [], "duplicate_days": []}}, "errors": [], "verdict": "go", "reasons": ["validate-configs and both mf queries succeeded", "MetricFlow's grouped and total rows equal the hand-written SQL's", "both dbt CLIs report dbt-core 1.12.x"]}
+```
+
+### Generated SQL
+
+MetricFlow's `--explain` output for the grouped query, trimmed to the SQL. It reads `"lk"."gold"."fct_orders"`, the relation the dbt project built.
+
+```sql
+SELECT
+  DATE_TRUNC('day', order_date) AS metric_time__day
+  , SUM(amount) AS total_revenue
+FROM "lk"."gold"."fct_orders" orders_src_10000
+GROUP BY
+  DATE_TRUNC('day', order_date)
+ORDER BY metric_time__day
+```
+
+### Two dbt CLIs
+
+Both venvs keep a working `dbt` CLI, each called by its absolute path, trimmed to the version lines:
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T dbt-job sh -c '/opt/dbt/bin/dbt --version && /opt/mf/bin/dbt --version && /opt/mf/bin/mf --version'
+/opt/dbt/bin/dbt   Core installed: 1.12.5   Plugin duckdb: 1.11.0
+/opt/mf/bin/dbt    Core installed: 1.12.5   Plugin duckdb: 1.11.0
+mf, version 0.15.0
+```
+
+ADR-001's go criterion 4 names `dbt` 2.0 and MetricFlow's `dbt-core`. Item 3 fell back to dbt-core 1.12.5, so the image holds no dbt 2.0 and the dbt 2.0 half was not exercised. This page reads the clause as: each venv's `dbt` works and both report dbt-core 1.12.5 (the owner's reading, recorded 2026-10-02).
+
+Research history, from 2026-10-02 and not rerun: installing dbt 2.0.6 and `dbt-metricflow[dbt-duckdb]==0.15.0` into one venv (`uv pip install`) broke `dbt --version` with `ImportError: cannot import name 'ArtifactMixin' from 'dbt.artifacts.schemas.base'` and no resolver error. That is why MetricFlow keeps its own uv project and lock.
+
+### Consequences
+
+- MetricFlow stays in its own uv project with its own lock, ADR-001 item 4's go choice. The root workspace gains nothing, and a later move to one shared venv would be an owner decision, not a silent merge.
+- On dbt-core 1.12.5, `mf` shares the dbt project's `profiles.yml` and queries through its default target `lk`, so no separate MetricFlow profile exists. `mf` has no `--target` flag, and research found it follows the default target or `DBT_TARGET`.
+- `mf` reads `target/semantic_manifest.json`, which dbt-core writes. With no such file `mf query` stops with "Unable to load the semantic manifest", and any other target's run overwrites it: a `--target ci` run from `just check` left `"memory"."gold"."fct_orders"` in the manifest, and an earlier run of the check, before it refreshed the manifest, returned `fallback` on that. The check now runs `dbt parse --target lk --no-partial-parse` first, which rewrites the manifest for `lk` without building anything.
+- The semantic YAML uses the latest metrics spec (the semantic model nested under the model, the metric with `agg_time_dimension`). dbt-core 1.12.5 accepts it, and research found 1.11.15 builds an empty manifest from it. Validation is `mf validate-configs`.
+- The time spine sits in the same catalog as the gold models.
+- Gold is built `incremental` into an empty namespace and purged before every rebuild, because DuckDB's Iceberg cannot rename or replace a table inside the transaction that creates it, and `table` materialization does exactly that. The purge refuses every namespace outside gold, gold_candidate and gold_retired.
+- Phase 6 mirrors this verdict into ADR-001's Results table. The criterion's dbt 2.0 wording and the Version matrix's MetricFlow row (0.213.0 on dbt-core 1.12.5) are owner hand-offs.
 
 ## Item 5: CDC exactly-once
 
