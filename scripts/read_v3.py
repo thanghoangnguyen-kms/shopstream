@@ -32,6 +32,9 @@ READERS = ("spark", "duckdb", "pyiceberg", "polars")
 DUCKDB_EXTENSIONS = "/opt/duckdb/extensions"
 ERROR_LIMIT = 200
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# ADR-001 spike item 2's two fixed fallbacks, in its own wording.
+FALLBACK_JSON = "JSON string column"
+FALLBACK_V2 = "v2 with position deletes"
 
 
 def error_text(exc: BaseException) -> str:
@@ -127,6 +130,14 @@ def identifier(name: str) -> str:
     if not _IDENTIFIER.match(name):
         raise ValueError("not a plain SQL identifier")
     return name
+
+
+def polars_storage_options(properties: Mapping[str, str]) -> dict[str, str]:
+    raise NotImplementedError
+
+
+def item2_verdict(job: Mapping[str, Any], matrix: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    raise NotImplementedError
 
 
 def duckdb_connect() -> Any:
