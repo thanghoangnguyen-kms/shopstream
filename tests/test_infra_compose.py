@@ -38,8 +38,19 @@ CORE = {
     "frankfurter",
 }
 BOOTSTRAP = {"bootstrap", "warehouse"}
-SPIKE = {"probe", "spark-job", "dbt-job"}
-SPIKE_IMAGE_SERVICES = {"probe", "spark-job"}
+SPIKE = {
+    "probe",
+    "spark-job",
+    "dbt-job",
+    "frankfurter-fx-init",
+    "frankfurter-seed",
+    "frankfurter-offline",
+    "fx-load",
+}
+# The one spike service that stays up (item 10's web-only Frankfurter), so it has a healthcheck.
+SPIKE_LONG_RUNNING = {"frankfurter-offline"}
+SPIKE_IMAGE_SERVICES = {"probe", "spark-job", "fx-load"}
+FRANKFURTER_SPIKE = {"frankfurter-fx-init", "frankfurter-seed", "frankfurter-offline"}
 SPIKE_DOCKERFILE = INFRA / "spike" / "Dockerfile"
 DBT_DOCKERFILE = INFRA / "dbt" / "Dockerfile"
 DOCKERIGNORE = REPO / ".dockerignore"
@@ -140,13 +151,17 @@ def one_shots() -> set[str]:
         for dependency, spec in service.get("depends_on", {}).items()
         if spec["condition"] == "service_completed_successfully"
     }
-    return BOOTSTRAP | SPIKE | waited_on
+    return BOOTSTRAP | (SPIKE - SPIKE_LONG_RUNNING) | waited_on
 
 
 def test_the_one_shots_are_the_bootstrap_and_spike_profiles_and_the_completed_dependencies() -> (
     None
 ):
-    assert one_shots() == BOOTSTRAP | SPIKE | {"lakekeeper-migrate", "frankfurter-init"}
+    assert one_shots() == (
+        BOOTSTRAP
+        | (SPIKE - SPIKE_LONG_RUNNING)
+        | {"lakekeeper-migrate", "frankfurter-init", "frankfurter-fx-init"}
+    )
 
 
 @pytest.mark.parametrize("name", sorted(SERVICES))
@@ -188,6 +203,10 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
         ("probe", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
         ("spark-job", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
         ("dbt-job", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
+        ("frankfurter-fx-init", {}),
+        ("frankfurter-seed", {"frankfurter-fx-init": "service_completed_successfully"}),
+        ("frankfurter-offline", {}),
+        ("fx-load", {"frankfurter-offline": "service_healthy"}),
     ],
 )
 def test_start_order_is_enforced_by_depends_on_conditions(
@@ -306,7 +325,7 @@ def test_the_one_shots_run_locked_down_from_the_pinned_python_image(name: str) -
 
 def test_each_one_shot_sees_only_its_own_key_pair() -> None:
     def secrets_of(name: str) -> set[str]:
-        return {key for key in SERVICES[name]["environment"] if key in ENV_EXAMPLE}
+        return {key for key in SERVICES[name].get("environment", {}) if key in ENV_EXAMPLE}
 
     assert secrets_of("bootstrap") == {"SEAWEEDFS_ADMIN_KEY", "SEAWEEDFS_ADMIN_SECRET"}
     assert secrets_of("warehouse") == {"LAKEKEEPER_S3_KEY", "LAKEKEEPER_S3_SECRET"}
@@ -321,6 +340,8 @@ def test_each_one_shot_sees_only_its_own_key_pair() -> None:
     # Lakekeeper vends the storage credentials to the JVM, so the job holds no static key.
     assert secrets_of("spark-job") == set()
     assert secrets_of("dbt-job") == set()
+    for name in sorted(FRANKFURTER_SPIKE | {"fx-load"}):
+        assert secrets_of(name) == set(), name
 
 
 # --- the spike one-shots ----------------------------------------------------------------------
@@ -473,6 +494,55 @@ def test_the_frankfurter_volume_is_chowned_before_the_service_starts() -> None:
     assert init["user"] == "0:0"
     assert init["entrypoint"] == ["chown", "-R", "1000:1000", "/app/data"]
     assert bind_sources("frankfurter-init") == bind_sources("frankfurter") == ["frankfurter-data"]
+
+
+# --- item 10: the seeded volume and the cut network -------------------------------------------
+
+
+def test_the_fx_offline_network_is_internal() -> None:
+    assert COMPOSE["networks"]["fx_offline"]["internal"] is True
+    assert set(COMPOSE["networks"]) == {"fx_offline"}
+
+
+def test_only_fx_load_and_frankfurter_offline_set_networks_and_only_on_fx_offline() -> None:
+    assert SERVICES["fx-load"]["networks"] == ["fx_offline"]
+    assert SERVICES["frankfurter-offline"]["networks"] == {
+        "fx_offline": {"aliases": ["frankfurter"]}
+    }
+    setting = {name for name, service in SERVICES.items() if "networks" in service}
+    assert setting == {"fx-load", "frankfurter-offline"}
+    for name in ("fx-load", "frankfurter-offline"):
+        assert "ports" not in SERVICES[name], name
+
+
+def test_the_fx_volume_is_mounted_by_the_three_frankfurter_spike_services_only() -> None:
+    mounting = {name for name in SERVICES if "frankfurter-fx-data" in bind_sources(name)}
+    assert mounting == FRANKFURTER_SPIKE
+    assert "frankfurter-fx-data" in COMPOSE["volumes"]
+    # The core frankfurter never mounts the spike volume, so one SQLite file never has two writers.
+    assert bind_sources("frankfurter") == ["frankfurter-data"]
+    assert bind_sources("frankfurter-init") == ["frankfurter-data"]
+
+
+def test_the_frankfurter_spike_services_use_the_core_frankfurter_image() -> None:
+    for name in sorted(FRANKFURTER_SPIKE):
+        assert SERVICES[name]["image"] == SERVICES["frankfurter"]["image"], name
+
+
+def test_the_offline_frankfurter_is_web_only_and_has_a_healthcheck() -> None:
+    offline = SERVICES["frankfurter-offline"]
+    assert "healthcheck" in offline
+    entrypoint = " ".join(offline["entrypoint"])
+    assert "puma" in entrypoint
+    assert "foreman" not in entrypoint
+    assert "depends_on" not in offline
+
+
+def test_the_seed_is_an_online_one_shot_on_the_default_network() -> None:
+    seed = SERVICES["frankfurter-seed"]
+    assert "networks" not in seed
+    assert "backfill[ECB]" in " ".join(seed["entrypoint"])
+    assert "db:setup" in " ".join(seed["entrypoint"])
 
 
 # --- secrets ----------------------------------------------------------------------------------

@@ -75,6 +75,8 @@ ignore = ["E501"]
 "scripts/semantic_check.py" = ["S603"]
 # SQL built from fixed namespace and object names through identifier().
 "scripts/gold_switch_probe.py" = ["S608"]
+# Origin-allowlisted Frankfurter GETs (S310), the container's /tmp tmpfs (S108), and SQL over the loader's own table (S608).
+"scripts/fx_load.py" = ["S108", "S310", "S608"]
 
 [tool.mypy]
 python_version = "3.13"

@@ -297,7 +297,106 @@ services:
     mem_limit: 1g
     memswap_limit: 1g
 
+  # Item 10's spike volume owner. A copy of frankfurter-init for the dedicated frankfurter-fx-data
+  # volume, so the core frankfurter never shares a SQLite file with the item 10 services.
+  frankfurter-fx-init:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1000:1000", "/app/data"]
+    command: []
+    volumes:
+      - frankfurter-fx-data:/app/data
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  # Item 10's online-once seed: the only service that talks to the ECB. It fills the empty
+  # frankfurter-fx-data volume with ECB only (db:setup, then the ECB backfill) and exits, so the
+  # SQLite file never has two writers. The default network gives it a route out.
+  frankfurter-seed:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    user: "1000:1000"
+    entrypoint: ["sh", "-c", "bundle exec rake db:setup && bundle exec rake 'backfill[ECB]'"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+    volumes:
+      - frankfurter-fx-data:/app/data
+    depends_on:
+      frankfurter-fx-init:
+        condition: service_completed_successfully
+    mem_limit: 640m
+    memswap_limit: 640m
+
+  # Item 10's web-only Frankfurter: puma without foreman, so no scheduler and no provider fetches. It
+  # sits on the internal fx_offline network only, where it answers as http://frankfurter:8080. Stop it
+  # (rm -sf) before any reseed so one SQLite file never has two writers.
+  frankfurter-offline:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    init: true
+    entrypoint: ["sh", "-c", "bundle exec puma -C config/puma.rb"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+      WORKER_PROCESSES: "1"
+      MAX_THREADS: "3"
+    volumes:
+      - frankfurter-fx-data:/app/data
+    networks:
+      fx_offline:
+        aliases: [frankfurter]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      # The root route answers before the backfill finishes by design; completeness is the loader's check.
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
+
+  # Item 10's throwaway dlt loader, built from the spike image and attached to fx_offline only: it
+  # has no route to the internet and no published port. scripts/fx_load.py proves the cut before it
+  # loads. dlt telemetry is off so dlt makes no call on the cut network.
+  fx-load:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/fx_load.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      FRANKFURTER_URL: http://frankfurter:8080
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    networks:
+      - fx_offline
+    depends_on:
+      frankfurter-offline:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    user: "65534:65534"
+    mem_limit: 1g
+    memswap_limit: 1g
+
+networks:
+  # No route out: item 10's loader and web-only Frankfurter sit here and nothing else does.
+  fx_offline:
+    internal: true
+
 volumes:
   postgres-data:
   seaweedfs-data:
   frankfurter-data:
+  frankfurter-fx-data:
