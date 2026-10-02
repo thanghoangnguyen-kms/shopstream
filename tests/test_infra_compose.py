@@ -7,10 +7,11 @@ start order, the published ports, the secret mounts and the CDC-ready init.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -37,6 +38,9 @@ CORE = {
     "frankfurter",
 }
 BOOTSTRAP = {"bootstrap", "warehouse"}
+SPIKE = {"probe"}
+SPIKE_DOCKERFILE = INFRA / "spike" / "Dockerfile"
+DOCKERIGNORE = REPO / ".dockerignore"
 PYTHON_IMAGE_DIGEST = "sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b"
 MIB = 2**20
 W05_RESERVE = 384 * MIB
@@ -79,12 +83,13 @@ def test_the_project_is_named_and_uses_no_deploy_block() -> None:
     assert not [name for name, service in SERVICES.items() if "deploy" in service]
 
 
-def test_only_core_and_bootstrap_hold_services_and_the_sets_are_exact() -> None:
+def test_only_core_bootstrap_and_spike_hold_services_and_the_sets_are_exact() -> None:
     used = {profile for service in SERVICES.values() for profile in service.get("profiles", [])}
-    assert used == {"core", "bootstrap"}
-    assert set(SERVICES) == CORE | BOOTSTRAP
+    assert used == {"core", "bootstrap", "spike"}
+    assert set(SERVICES) == CORE | BOOTSTRAP | SPIKE
     assert profile_services("core") == CORE
     assert profile_services("bootstrap") == BOOTSTRAP
+    assert profile_services("spike") == SPIKE
     assert all(len(service["profiles"]) == 1 for service in SERVICES.values())
 
 
@@ -133,11 +138,13 @@ def one_shots() -> set[str]:
         for dependency, spec in service.get("depends_on", {}).items()
         if spec["condition"] == "service_completed_successfully"
     }
-    return BOOTSTRAP | waited_on
+    return BOOTSTRAP | SPIKE | waited_on
 
 
-def test_the_one_shots_are_the_bootstrap_profile_and_the_completed_dependencies() -> None:
-    assert one_shots() == BOOTSTRAP | {"lakekeeper-migrate", "frankfurter-init"}
+def test_the_one_shots_are_the_bootstrap_and_spike_profiles_and_the_completed_dependencies() -> (
+    None
+):
+    assert one_shots() == BOOTSTRAP | SPIKE | {"lakekeeper-migrate", "frankfurter-init"}
 
 
 @pytest.mark.parametrize("name", sorted(SERVICES))
@@ -176,6 +183,7 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
                 "seaweedfs": "service_healthy",
             },
         ),
+        ("probe", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
     ],
 )
 def test_start_order_is_enforced_by_depends_on_conditions(
@@ -298,6 +306,80 @@ def test_each_one_shot_sees_only_its_own_key_pair() -> None:
 
     assert secrets_of("bootstrap") == {"SEAWEEDFS_ADMIN_KEY", "SEAWEEDFS_ADMIN_SECRET"}
     assert secrets_of("warehouse") == {"LAKEKEEPER_S3_KEY", "LAKEKEEPER_S3_SECRET"}
+    assert secrets_of("probe") == {
+        "LAKEKEEPER_S3_KEY",
+        "LAKEKEEPER_S3_SECRET",
+        "PROBE_OTHER_KEY",
+        "PROBE_OTHER_SECRET",
+        "SEAWEEDFS_ADMIN_KEY",
+        "SEAWEEDFS_ADMIN_SECRET",
+    }
+
+
+# --- the spike one-shots ----------------------------------------------------------------------
+
+
+def dockerfile_lines() -> list[str]:
+    text = SPIKE_DOCKERFILE.read_text(encoding="utf-8")
+    return [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+
+@pytest.mark.parametrize("name", sorted(SPIKE))
+def test_each_spike_service_is_built_from_the_spike_dockerfile_and_locked_down(name: str) -> None:
+    service = SERVICES[name]
+    assert "image" not in service
+    assert service["build"] == {"context": "..", "dockerfile": "infra/spike/Dockerfile"}
+    assert service["read_only"] is True
+    assert service["user"] == "65534:65534"
+    assert [PurePosixPath(entry.split(":")[0]).parts for entry in service["tmpfs"]] == [
+        ("/", "tmp")
+    ]
+    assert service["volumes"] == ["../scripts:/app:ro"]
+    assert "ports" not in service
+
+
+def test_the_probe_has_no_ambient_aws_configuration() -> None:
+    environment = SERVICES["probe"]["environment"]
+    assert environment["AWS_CONFIG_FILE"] == "/dev/null"
+    assert environment["AWS_SHARED_CREDENTIALS_FILE"] == "/dev/null"
+    for ambient in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+    ):
+        assert ambient not in environment
+
+
+def test_the_dockerignore_denies_everything_but_the_lock_inputs() -> None:
+    lines = [
+        line
+        for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert lines[0] == "*"
+    assert lines[1:]
+    assert all(line.startswith("!") for line in lines[1:])
+    secrets = (
+        "infra/.env",
+        "infra/.generated/seaweedfs/iam.json",
+        ".git/config",
+        ".venv/bin/python",
+    )
+    for line in lines[1:]:
+        assert not [path for path in secrets if fnmatch.fnmatch(path, line[1:])], line
+
+
+def test_the_spike_dockerfile_pins_the_python_base_and_copies_only_lock_inputs() -> None:
+    lines = dockerfile_lines()
+    froms = [line for line in lines if line.startswith("FROM ")]
+    assert len(froms) == 1
+    assert froms[0].endswith(f"@{PYTHON_IMAGE_DIGEST}")
+    assert ":3.13" in froms[0]
+    allowed = {"pyproject.toml", "uv.lock", "packages/generator/pyproject.toml"}
+    for line in lines:
+        if line.startswith("COPY ") and "--from=" not in line:
+            assert set(line.split()[1:-1]) <= allowed, line
 
 
 # --- frankfurter ------------------------------------------------------------------------------

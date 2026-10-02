@@ -4,7 +4,8 @@ Files are found with `git ls-files --cached --others --exclude-standard`, so an 
 `infra/compose.*.yaml` is judged the moment it exists while a git-ignored copy never is.
 The gate enforces: images and Dockerfile bases pinned by an anchored sha256 digest, ports
 published on literal 127.0.0.1 only, a literal `mem_limit` equal to `memswap_limit`, a
-healthcheck on every long-running service, `restart: "no"` on every one-shot, no `include:`
+healthcheck on every long-running service, `restart: "no"` on every one-shot (a service in the
+`bootstrap` or `spike` profile, or one another service waits on to complete), no `include:`
 or `extends:` (each file is read on its own), and the generated identity file and memory
 samples kept out of git (D-08, D-15, D-16). Renovate's docker:pinDigests keeps digests fresh.
 """
@@ -42,6 +43,7 @@ SKIP_DIRS = frozenset(
 COMPOSE_NAMES = ("compose.y*ml", "compose.*.y*ml", "docker-compose.y*ml", "docker-compose.*.y*ml")
 DOCKERFILE_NAMES = ("Dockerfile", "Dockerfile.*", "*.Dockerfile", "Containerfile")
 
+ONE_SHOT_PROFILES = frozenset({"bootstrap", "spike"})
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 MEM = re.compile(r"\d+(?:[bkmg]|kb|mb|gb)?", re.IGNORECASE)
 MEM_UNITS = {"": 1, "b": 1, "k": 1024, "kb": 1024, "m": 1024**2, "mb": 1024**2}
@@ -244,7 +246,7 @@ def _one_shots(services: dict[str, dict[str, Any]]) -> set[str]:
     names: set[str] = set()
     for name, service in services.items():
         profiles = service.get("profiles")
-        if isinstance(profiles, list) and "bootstrap" in profiles:
+        if isinstance(profiles, list) and ONE_SHOT_PROFILES.intersection(profiles):
             names.add(name)
         depends = service.get("depends_on")
         if isinstance(depends, dict):
@@ -748,6 +750,25 @@ def test_a_service_with_a_healthcheck_passes(git_repo: Path) -> None:
 def test_a_bootstrap_profile_service_needs_restart_no(git_repo: Path) -> None:
     write_service(git_repo, '    profiles: [bootstrap]\n    restart: "no"\n')
     assert healthcheck_violations(git_repo) == []
+
+
+def test_a_spike_profile_service_needs_restart_no_and_no_healthcheck(git_repo: Path) -> None:
+    write_service(git_repo, '    profiles: [spike]\n    restart: "no"\n')
+    assert healthcheck_violations(git_repo) == []
+
+
+def test_a_spike_profile_service_missing_restart_is_reported(git_repo: Path) -> None:
+    write_service(git_repo, "    profiles: [spike]\n")
+    assert healthcheck_violations(git_repo) == [
+        'infra/compose.yaml: service web is a one-shot but restart is not "no"'
+    ]
+
+
+def test_a_streaming_profile_service_still_needs_a_healthcheck(git_repo: Path) -> None:
+    write_service(git_repo, '    profiles: [streaming]\n    restart: "no"\n')
+    assert healthcheck_violations(git_repo) == [
+        "infra/compose.yaml: service web is long-running but has no healthcheck"
+    ]
 
 
 def test_an_unquoted_restart_no_is_reported(git_repo: Path) -> None:

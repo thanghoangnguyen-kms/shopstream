@@ -1,0 +1,6 @@
+# Build-context allowlist for infra/spike/Dockerfile: deny everything, then re-include the three lock inputs.
+# Keeps .venv, .git, .planning, infra/.env and infra/.generated (mode-0600 secrets) out of the builder.
+*
+!pyproject.toml
+!uv.lock
+!packages/generator/pyproject.toml

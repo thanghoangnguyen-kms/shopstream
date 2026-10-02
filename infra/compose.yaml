@@ -195,6 +195,43 @@ services:
     mem_limit: 128m
     memswap_limit: 128m
 
+  # A spike one-shot that `just up` never starts. It holds the keys item 1's positive control and
+  # AssumeRole leg need. Built from infra/spike/Dockerfile, so the policy gate checks that file's
+  # FROM and COPY --from digests instead of an image: pin.
+  probe:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/probe_scope.py", "--json"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      AWS_EC2_METADATA_DISABLED: "true"
+      LAKEKEEPER_S3_KEY: ${LAKEKEEPER_S3_KEY:?run just up}
+      LAKEKEEPER_S3_SECRET: ${LAKEKEEPER_S3_SECRET:?run just up}
+      PROBE_OTHER_KEY: ${PROBE_OTHER_KEY:?run just up}
+      PROBE_OTHER_SECRET: ${PROBE_OTHER_SECRET:?run just up}
+      SEAWEEDFS_ADMIN_KEY: ${SEAWEEDFS_ADMIN_KEY:?run just up}
+      SEAWEEDFS_ADMIN_SECRET: ${SEAWEEDFS_ADMIN_SECRET:?run just up}
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    user: "65534:65534"
+    mem_limit: 256m
+    memswap_limit: 256m
+
 volumes:
   postgres-data:
   seaweedfs-data:
