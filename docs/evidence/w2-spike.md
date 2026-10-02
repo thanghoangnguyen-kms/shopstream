@@ -709,7 +709,102 @@ Not run.
 
 ## Item 7: Gold blue/green
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: fallback. Gold switches by table rename, because DuckDB 1.5.5 cannot read an Iceberg view that Lakekeeper lists; across 20 switches in each direction a DuckDB poller re-resolving every 100 ms with the publish-id rule's single retry never accepted a missing object or a mixed result, and PublishInProgress was 0.
+
+### Versions
+
+- DuckDB 1.5.5 with its iceberg extension (build `45163a28`) for the poller and the end-state checks.
+- dbt-core 1.12.5 with dbt-duckdb 1.11.0 for the two gold builds.
+- Lakekeeper 0.13.6, SeaweedFS 4.47.
+- spark-job image `shopstream-spark-job`: id `sha256:dc4a42f28a22492611bec28d32be471ad9023555535935463a7e1a4d25d91545`.
+
+### Command
+
+Three gold objects, `fct_orders`, `dim_customers` and `metricflow_time_spine`, are `incremental` models, each Iceberg format-version 3 with a `publish_id` column. They are built twice from empty namespaces: into `gold_candidate` with publish_id B, then into `gold` with publish_id A, so gold ends on A. A second `incremental` build over existing objects would append, so the sequence purges first. The probe checks all of this before it starts (gold holds A on every object, gold_candidate holds B, every object has the `publish_id` column, `gold_retired` is empty) and again at the end. The captures went through `scripts/redact_evidence.py`.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job python /app/gold_reset.py gold gold_candidate gold_retired
+{"purged": {"gold": ["dim_customers", "fct_orders", "metricflow_time_spine"], "gold_candidate": ["dim_customers", "fct_orders", "metricflow_time_spine"], "gold_retired": []}}
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T dbt-job /opt/dbt/bin/dbt build --target lk --select +tag:gold --project-dir /work/analytics/dbt --profiles-dir /work/analytics/dbt --vars '{publish_id: B, gold_schema: gold_candidate}'
+2 seeds loaded, 3 incremental models created (5 of 5 steps ok)
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T dbt-job /opt/dbt/bin/dbt build --target lk --select +tag:gold --project-dir /work/analytics/dbt --profiles-dir /work/analytics/dbt --vars '{publish_id: A}'
+2 seeds loaded, 3 incremental models created (5 of 5 steps ok)
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job python /app/gold_switch_probe.py
+```
+
+The probe ran once for this page, with its defaults: 40 natural switches, 10 control switches, a poll every 100 ms, a retry delay of 250 ms, a hold of 1000 ms after each switch, a gap of 60 ms between objects in the control run, `max_table_staleness` 0s and the three objects above. Each switch renames every object in the fixed order above through Lakekeeper's REST rename in three steps: `gold` to `gold_retired`, `gold_candidate` to `gold`, `gold_retired` to `gold_candidate`. DuckDB's own `ALTER TABLE ... RENAME TO` stays inside one namespace, so it cannot do this. The poller runs on its own DuckDB connection, attached with `max_table_staleness` 0s so every read re-resolves metadata, and reads every object's `publish_id` through the publish-id rule: a read that finds two ids or an absent object is retried once after 250 ms, and a second bad read is PublishInProgress. The poll times and switch times come from `time.monotonic`. A poll is scheduled at a fixed rate; a poll that retries takes 250 ms longer, and the next one then starts at once, which is why the longest poll interval is above 100 ms. The probe's output, verbatim (exit 0):
+
+```text
+{"versions": {"duckdb": "1.5.5", "iceberg_extension": "45163a28"}, "settings": {"period_ms": 100, "retry_ms": 250, "hold_ms": 1000, "control_gap_ms": 60, "max_table_staleness": "0s", "objects": ["fct_orders", "dim_customers", "metricflow_time_spine"]}, "runs": {"natural": {"label": "natural", "switches": 40, "retry_ms": 250, "transitions": 40, "timing": {"poll_interval_ms": {"median": 99.98921300211805, "max": 286.3401899958262}, "switch_ms": {"median": 25.13380500022322, "max": 34.362017999228556}}, "a_to_b": 20, "b_to_a": 20, "gap_ms": 0, "polls": 417, "raw_ok": 412, "raw_mixed": 2, "raw_missing": 3, "retried_ok": 5, "publish_in_progress": 0, "accepted_mixed": 0, "accepted_missing": 0, "poll_errors": 0, "first_poll_error": null, "accepted_ids_seen": ["A", "B"], "accepted_sequence": "AAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBBAAAAAAAAAABBBBBBBBBBAAAAAAAAAABBBBBBBBBBBAAAAAAAAAA"}, "control": {"label": "control", "switches": 10, "retry_ms": 250, "transitions": 10, "timing": {"poll_interval_ms": {"median": 99.9274539972248, "max": 297.31835999700706}, "switch_ms": {"median": 155.66600750389625, "max": 164.9648070015246}}, "a_to_b": 5, "b_to_a": 5, "gap_ms": 60, "polls": 117, "raw_ok": 107, "raw_mixed": 7, "raw_missing": 3, "retried_ok": 10, "publish_in_progress": 0, "accepted_mixed": 0, "accepted_missing": 0, "poll_errors": 0, "first_poll_error": null, "accepted_ids_seen": ["A", "B"], "accepted_sequence": "AAAAAAAAAAABBBBBBBBBBAAAAAAAAAAABBBBBBBBBBBAAAAAAAAAABBBBBBBBBBBAAAAAAAAAAABBBBBBBBBBAAAAAAAAAAABBBBBBBBBBBAAAAAAAAAA"}}, "end_state_ok": true, "view_check": {"view_created": true, "view_listed": true, "duckdb_reads_view": false, "duckdb_error": "CatalogException: Catalog Error: Table with name v does not exist!", "create_status": 200, "list_status": 200}, "verdict": {"verdict": "fallback", "path": "table rename", "reasons": ["DuckDB cannot read the Iceberg view that Lakekeeper lists, so view repoint is unavailable", "the natural run made 40 switches, 20 A to B and 20 B to A, and accepted no mixed or missing read", "PublishInProgress was 0 with a retry delay of 250 ms above the longest natural switch (34.362017999228556 ms)", "the control run counted 7 raw mixed and 3 raw missing reads, so the poller sees the window"]}}
+```
+
+### View check
+
+A view `v` was created through Lakekeeper's REST API (HTTP 200) and listed by the namespace's views call (HTTP 200). DuckDB 1.5.5 could not read it. Its error text:
+
+```text
+CatalogException: Catalog Error: Table with name v does not exist!
+```
+
+The view and its namespace were dropped afterwards. View repoint is therefore unavailable with DuckDB as the reader, and ADR-001's fallback, table rename, is the path built.
+
+### Natural run
+
+Gold switched 40 times with no gap between objects, 20 from A to B and 20 from B to A, with the poller running from one hold before the first switch to one hold after the last.
+
+| Count | Value |
+| --- | --- |
+| switches | 40 |
+| a_to_b | 20 |
+| b_to_a | 20 |
+| polls | 417 |
+| raw_ok (first read ok) | 412 |
+| raw_mixed (first read mixed) | 2 |
+| raw_missing (first read missing) | 3 |
+| retried_ok (accepted after the retry) | 5 |
+| accepted_mixed | 0 |
+| accepted_missing | 0 |
+| PublishInProgress | 0 |
+| poll errors | 0 |
+| transitions between accepted ids | 40 |
+| publish ids accepted | A and B |
+
+Timing: poll interval median 100.0 ms, maximum 286.3 ms; switch duration (three objects, nine renames) median 25.1 ms, maximum 34.4 ms. The retry delay, 250 ms, is above the longest natural switch, 34.4 ms. The raw mixed and missing reads were five polls that landed inside a switch; every one resolved on the single retry, which is the rule working as ADR-001 describes. Forty transitions for forty switches shows the poller saw every state change, so it was not reading a stale copy.
+
+### Control run
+
+The positive control: the same poller and rule over 10 switches (5 each way) with a gap of 60 ms between objects, which widens the window in which gold is mixed. It shows the poller can see the window.
+
+| Count | Value |
+| --- | --- |
+| switches | 10 |
+| a_to_b | 5 |
+| b_to_a | 5 |
+| polls | 117 |
+| raw_ok (first read ok) | 107 |
+| raw_mixed (first read mixed) | 7 |
+| raw_missing (first read missing) | 3 |
+| retried_ok (accepted after the retry) | 10 |
+| accepted_mixed | 0 |
+| accepted_missing | 0 |
+| PublishInProgress | 0 |
+| poll errors | 0 |
+| transitions between accepted ids | 10 |
+| publish ids accepted | A and B |
+
+Timing: poll interval median 99.9 ms, maximum 297.3 ms; switch duration median 155.7 ms, maximum 165.0 ms. Ten raw mixed or missing reads, all retried and accepted once the switch finished: the poller sees the window, so zero accepted bad reads in the natural run is a result and not blindness. A natural run can see no mixed read by luck, which is why the page does not rest on the natural counts alone.
+
+### Consequences
+
+- ADR-001 item 7's fallback holds: table rename with the publish-id rule, and readers retry once on not-found as well as on a mixed read. A switch is atomic per object only, so a reader can see gold half-switched or an object absent between two renames; the retry covers both.
+- The switch goes through Lakekeeper's REST rename, because DuckDB's own rename stays inside one namespace.
+- `gold_candidate` keeps the retired gold copy after a switch, as ADR-001's credential section expects.
+- Every gold reader keeps `max_table_staleness` at 0. DuckDB 1.5.5 re-resolves metadata on every read by default, and research found that a positive staleness (60 s) returned the old copy.
+- Gold objects are `incremental` models built into empty namespaces and purged before every rebuild, because DuckDB's Iceberg cannot rename or replace a table in the transaction that creates it, and the `table` materialization does exactly that.
+- Week 21 reuses `scripts/gold_switch.py`'s rule in the semantic layer and the MCP server; its own retry test starts from the 250 ms retry delay measured here.
+- The reference-architecture change for this fallback is the owner's `/shop-write-doc` hand-off in Phase 6's settling PR, and Phase 6 mirrors this verdict into ADR-001's Results table.
 
 ## Item 8: RAM budget
 
