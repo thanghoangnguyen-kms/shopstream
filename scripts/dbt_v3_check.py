@@ -3,10 +3,13 @@
 A spike script run inside the `spark-job` one-shot: `python /app/dbt_v3_check.py reset|inspect`.
 `reset` has Lakekeeper purge the table so the next dbt run starts from no table. `inspect` loads
 the table from Lakekeeper's REST catalog and prints its format version, table uuid, metadata
-location and snapshots sorted by sequence number, plus the rows DuckDB reads, sorted by id. Both
-print one compact JSON line, the last line of stdout. The loadTable body, its `config` and its
-`storage-credentials` are never printed: Lakekeeper vends keys there even without the delegation
-header, so only status codes and the parsed metadata fields leave this script.
+location and snapshots sorted by sequence number, and reads the table's metadata.json itself from
+SeaweedFS with the key loadTable vends (gzip-aware), reporting the file's format version, table uuid
+and snapshots beside the catalog's. It also prints the rows DuckDB reads, sorted by id. Both print
+one compact JSON line, the last line of stdout. The loadTable body, its `config`, its
+`storage-credentials` and the vended key are never printed: the key lives in local variables, and
+every error passes `read_v3.error_text` with those values as secrets, so only status codes and the
+parsed metadata fields leave this script.
 
 This is a spike script (ADR-001 Evidence rules): it needs a live stack and has no unit tests. The
 heavy import (duckdb) sits inside `inspect`, so importing this module in CI is safe.
@@ -14,16 +17,21 @@ heavy import (duckdb) sits inside `inspect`, so importing this module in CI is s
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import probe_scope
 import read_v3
 import spark_v3_job
 
 NAMESPACE = "silver_spike"
 TABLE = "inc_v3"
+DELEGATION_HEADER = {"X-Iceberg-Access-Delegation": "vended-credentials"}
+GZIP_MAGIC = b"\x1f\x8b"
 # The snapshot summary keys that show what each commit did, in the order they are reported.
 SUMMARY_KEYS = (
     "added-data-files",
@@ -82,6 +90,58 @@ def load_metadata() -> tuple[Mapping[str, Any], str]:
     return metadata, str(parsed["metadata-location"])
 
 
+class MetadataReadError(Exception):
+    """Reading metadata.json failed; the message is already scrubbed of the vended values."""
+
+
+def split_location(location: str) -> tuple[str, str]:
+    """`s3://<bucket>/<key>` as (bucket, key)."""
+    parts = urllib.parse.urlsplit(location)
+    if parts.scheme not in {"s3", "s3a"} or not parts.netloc or not parts.path.strip("/"):
+        raise ValueError("metadata-location is not an s3 bucket and key")
+    return parts.netloc, parts.path.lstrip("/")
+
+
+def gunzip_if_gzipped(body: bytes) -> bytes:
+    """Iceberg writes `.gz.metadata.json` files; a plain file passes through unchanged."""
+    return gzip.decompress(body) if body.startswith(GZIP_MAGIC) else body
+
+
+def metadata_file() -> Mapping[str, Any]:
+    """The table's metadata.json read from SeaweedFS with the key loadTable vends.
+
+    The three vended values stay in local variables and are the `secrets` of every error text, so
+    a failure never carries any part of a key. Raises MetadataReadError with that scrubbed text.
+    """
+    secrets: list[str] = []
+    try:
+        status, body = spark_v3_job.http_request("GET", table_url(), DELEGATION_HEADER, None)
+        if status != 200:
+            raise RuntimeError(f"loading {NAMESPACE}.{TABLE} returned HTTP {status}")
+        parsed = json.loads(body)
+        config = probe_scope.vended_config(parsed)
+        if config is None:
+            raise RuntimeError("loadTable vended no storage-credentials entry")
+        values = {field: config.get(field) for field in probe_scope.VENDED_FIELDS}
+        secrets = [value for value in values.values() if isinstance(value, str)]
+        missing = [
+            field for field, value in values.items() if not isinstance(value, str) or not value
+        ]
+        if missing:
+            raise RuntimeError(f"the vended config lacks {', '.join(missing)}")
+        client = probe_scope.make_s3_client(
+            str(values["s3.access-key-id"]),
+            str(values["s3.secret-access-key"]),
+            str(values["s3.session-token"]),
+        )
+        bucket, key = split_location(str(parsed["metadata-location"]))
+        raw: bytes = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        metadata: Mapping[str, Any] = json.loads(gunzip_if_gzipped(raw))
+        return metadata
+    except Exception as exc:
+        raise MetadataReadError(read_v3.error_text(exc, secrets)) from None
+
+
 def read_rows() -> tuple[list[list[Any]], str]:
     """The table's rows through DuckDB, sorted by id, and DuckDB's version."""
     con = read_v3.duckdb_connect()
@@ -104,6 +164,9 @@ def inspect() -> dict[str, Any]:
         "table_uuid": None,
         "metadata_location": None,
         "snapshots": None,
+        "file_format_version": None,
+        "file_table_uuid": None,
+        "file_snapshots": None,
         "rows": None,
         "duckdb_version": None,
         "error": None,
@@ -114,6 +177,17 @@ def inspect() -> dict[str, Any]:
         result["table_uuid"] = metadata.get("table-uuid")
         result["metadata_location"] = location
         result["snapshots"] = sorted_snapshots(metadata)
+    except Exception as exc:
+        result["error"] = read_v3.error_text(exc)
+        return result
+    try:
+        file_metadata = metadata_file()
+        result["file_format_version"] = file_metadata.get("format-version")
+        result["file_table_uuid"] = file_metadata.get("table-uuid")
+        result["file_snapshots"] = sorted_snapshots(file_metadata)
+    except MetadataReadError as exc:
+        result["error"] = str(exc)
+        return result
     except Exception as exc:
         result["error"] = read_v3.error_text(exc)
         return result
