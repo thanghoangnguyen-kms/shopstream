@@ -365,7 +365,91 @@ Phase 6's settling PR mirrors this verdict into ADR-001's Results table.
 
 ## Item 2: Spark v3
 
-Not run.
+Recorded 2026-10-02.
+
+Verdict: fallback. Spark 4.1.3 wrote four format-version 3 tables with deletion vectors, and DuckDB 1.5.5 read all four at Spark's snapshot ids with Spark's row count and digest. PyIceberg 0.12.0 and Polars 1.44.2 cannot load a table with a VARIANT column, so per ADR-001 item 2 they read the payload as a JSON string column; both matched Spark on the two JSON-string tables, deletion vectors applied. No reader needs the v2 fallback.
+
+### Versions
+
+- Spark 4.1.3, Iceberg 1.11.0 and PySpark 4.1.3, with the driver and a Python UDF on Python 3.13.15 (the image from Item 14: base image digest and jar checksums are recorded there; image id `sha256:dc4a42f28a22492611bec28d32be471ad9023555535935463a7e1a4d25d91545`).
+- Readers, all from the locked `spike` group in that image: DuckDB 1.5.5 with its iceberg extension 45163a28 (baked in `/opt/duckdb/extensions`, auto-install off), PyIceberg 0.12.0, Polars 1.44.2, pyarrow 25.0.1.
+- Lakekeeper 0.13.6, SeaweedFS 4.47.
+
+### Command
+
+The writer and the three readers run one after the other in one `spark-job` container, so every reader sees the snapshots Spark just committed, and nothing else writes `spike_v3`. `read_v3.py` reads the job's JSON file, pins every read to the snapshot id Spark reported (DuckDB `AT (VERSION => id)`, PyIceberg `scan(snapshot_id=id)`, Polars `scan_iceberg(..., snapshot_id=id)`), and hashes each reader's Arrow rows through `scripts/row_hash.py`. The raw capture went to a temporary file outside both trees and through `scripts/redact_evidence.py`; the redactor changed nothing. Credentials are not printed: PyIceberg's vended storage keys and the Polars storage options live in memory only.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile spike run --rm -T spark-job sh -c 'python /app/spark_v3_job.py --out /tmp/spark.json && python /app/read_v3.py /tmp/spark.json'   (fields of the two JSON lines)
+spark_version: 4.1.3
+iceberg_version: 1.11.0
+pyspark_version: 4.1.3
+python_driver: 3.13.15
+python_udf: 3.13.15
+namespace: spike_v3
+duckdb: 1.5.5 (iceberg extension 45163a28)
+pyiceberg: 0.12.0
+polars: 1.44.2
+pyarrow: 25.0.1
+verdict: fallback
+fallback: pyiceberg -> JSON string column
+fallback: polars -> JSON string column
+reason: Spark wrote format-version 3 on all four tables, with added-dvs and PUFFIN delete files on b_json_dv and c_variant_dv
+reason: duckdb matches Spark on all four tables
+reason: pyiceberg cannot take the VARIANT tables (a_variant cannot-load, b_json_dv match, c_variant_dv cannot-load, d_json match), so it reads the payload as a JSON string column
+reason: polars cannot take the VARIANT tables (a_variant cannot-load, b_json_dv match, c_variant_dv cannot-load, d_json match), so it reads the payload as a JSON string column
+```
+
+### Writer evidence
+
+The four tables differ on purpose, so every reader failure is attributed to one feature:
+
+- `a_variant`: VARIANT payload, one INSERT, no deletes. Fails only if a reader cannot take VARIANT.
+- `b_json_dv`: JSON string payload, INSERT, then MERGE (update id 2, insert id 5), then DELETE of id 4, all merge-on-read. Fails only if a reader does not apply deletion vectors.
+- `c_variant_dv`: the VARIANT payload with the same MERGE and DELETE. Matches only if a reader has both.
+- `d_json`: JSON string payload, one INSERT, no deletes. The plain base read; a failure here is neither feature, so the verdict rule stops as inconclusive.
+
+```text
+a_variant: payload_type=variant format_version=3 snapshots=[append added-dvs=0] delete_files=[none]
+b_json_dv: payload_type=json_string format_version=3 snapshots=[append added-dvs=0, overwrite added-dvs=1, delete added-dvs=1] delete_files=[content=1 PUFFIN records=1, content=1 PUFFIN records=1]
+c_variant_dv: payload_type=variant format_version=3 snapshots=[append added-dvs=0, overwrite added-dvs=1, delete added-dvs=1] delete_files=[content=1 PUFFIN records=1, content=1 PUFFIN records=1]
+d_json: payload_type=json_string format_version=3 snapshots=[append added-dvs=0] delete_files=[none]
+all four table digests: 73e1c20d49efc16984df4fea2be2e99e7d3429d113fd5183e80eee0e447afa8b
+```
+
+The deleted row (id 4) is absent from every reader's rows: each loaded cell has four rows and Spark's digest, and an unloadable table is a `cannot-load` cell with empty counts, never zero rows. All four Spark digests are equal, so a VARIANT column read as JSON text and a JSON string column hash alike. A cell matches only when the row count and the table digest both equal Spark's. Readers may return rows in any order, because the table digest is order-free. Decimals compare as strings at the column's scale, timestamps as UTC microseconds and JSON numbers as normalised decimals, so the readers' different Arrow widths and time zones do not cause a mismatch on their own.
+
+### Parity matrix
+
+Spark is the reference. Each reader read the snapshot id in its row, and every one of the 8 cells a reader loaded reports that same id as its own current snapshot.
+
+| Table | Reader | Result | Snapshot id | Rows | Digest (first 16 hex) |
+| --- | --- | --- | --- | --- | --- |
+| a_variant | spark | reference | 543517267814854887 | 4 | `73e1c20d49efc169` |
+| a_variant | duckdb | match | 543517267814854887 | 4 | `73e1c20d49efc169` |
+| a_variant | pyiceberg | cannot-load | 543517267814854887 | - | - |
+| a_variant | polars | cannot-load | 543517267814854887 | - | - |
+| b_json_dv | spark | reference | 3957586650624810269 | 4 | `73e1c20d49efc169` |
+| b_json_dv | duckdb | match | 3957586650624810269 | 4 | `73e1c20d49efc169` |
+| b_json_dv | pyiceberg | match | 3957586650624810269 | 4 | `73e1c20d49efc169` |
+| b_json_dv | polars | match | 3957586650624810269 | 4 | `73e1c20d49efc169` |
+| c_variant_dv | spark | reference | 1430565965759835334 | 4 | `73e1c20d49efc169` |
+| c_variant_dv | duckdb | match | 1430565965759835334 | 4 | `73e1c20d49efc169` |
+| c_variant_dv | pyiceberg | cannot-load | 1430565965759835334 | - | - |
+| c_variant_dv | polars | cannot-load | 1430565965759835334 | - | - |
+| d_json | spark | reference | 672250923678555355 | 4 | `73e1c20d49efc169` |
+| d_json | duckdb | match | 672250923678555355 | 4 | `73e1c20d49efc169` |
+| d_json | pyiceberg | match | 672250923678555355 | 4 | `73e1c20d49efc169` |
+| d_json | polars | match | 672250923678555355 | 4 | `73e1c20d49efc169` |
+
+Cannot-load error text, first line only by design: PyIceberg `ValidationError: 1 validation error for TableResponse` on `a_variant` and on `c_variant_dv`; Polars `PyIceberg load failed (ValidationError: 1 validation error for TableResponse)` on the same two, because Polars loads tables through PyIceberg. The first line does not name the field, so a one-off `load_table` of `spike_v3.a_variant` in the same container printed only the exception lines that contain `Unsupported field type`: `Value error, Unsupported field type: 'variant'`. That confirms PyIceberg 0.12.0 has no VARIANT type, and it fails the whole table, not just the column.
+
+### Consequences
+
+- PyIceberg and Polars take ADR-001 item 2's `JSON string column` fallback: a table that either must read keeps its payload as a JSON string column (`b_json_dv` and `d_json` show that path reads correctly, deletion vectors included). DuckDB and Spark need no fallback. No reader needs `v2 with position deletes`.
+- The deletion-vector evidence on a VARIANT table (`c_variant_dv`) therefore rests on Spark and DuckDB alone; PyIceberg and Polars show deletion vectors only on the JSON-string table (G4: they only read v3).
+- Deletion vectors mask rows; they do not erase them (G10). Erasure rewrites, expires snapshots and removes orphan files in a later week.
+- This page does not change ADR-001 or the reference architecture. The reference-architecture change for the JSON-string fallback is the owner's `/shop-write-doc` hand-off in Phase 6's settling PR, and Phase 6 mirrors this verdict into ADR-001's Results table.
 
 ## Item 3: dbt v3
 
