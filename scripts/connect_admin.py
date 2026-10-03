@@ -16,10 +16,16 @@ PLAT-08's proof is `placeholders`: a capture from one of six sources is piped in
 it counts the env-provider placeholders and the real secret's plaintext occurrences (raw and
 JSON-escaped), printing counts and never a value.
 
-CLI: `register` prints one JSON line `{"connectors": {name: state}, "plugins": {class: version}}`;
-`status` prints the connectors' states; `placeholders --key NAME --source LABEL` reads a capture on
-stdin; `show-config source|sink` prints a connector config for piping. Exit 0 on success, 1 on a failed
-connector or an error, 2 on usage.
+Plan 04-03 adds the lifecycle calls the rollback paths need: `stop`, `wait_stopped`, `resume`,
+`delete`, and the offsets PATCH (`offsets_body`, `patch_offsets`). An unexpected status raises with
+the connector name and the status only, never the response body.
+
+CLI: `register [--no-branch]` prints one JSON line `{"connectors": {name: state}, "plugins": {class:
+version}}` (`--no-branch` registers the sink without a commit branch, bronze append-only on main);
+`status` prints the connectors' states; `stop`, `resume` and `delete` act on one connector (default
+bronze-sink); `placeholders --key NAME --source LABEL` reads a capture on stdin; `show-config
+source|sink` prints a connector config for piping. Exit 0 on success, 1 on a failed connector or an
+error, 2 on usage.
 """
 
 from __future__ import annotations
@@ -277,10 +283,104 @@ def plugins() -> dict[str, str]:
     }
 
 
-def register() -> dict[str, Any]:
-    """Put the source, then the sink, then wait for both: {"connectors": {...}, "plugins": {...}}."""
+def _expect(name: str, action: str, status: int, accepted: frozenset[int]) -> None:
+    """Raise unless `status` is accepted; the message holds the name, action and status only."""
+    if status not in accepted:
+        raise RuntimeError(f"{name}: {action} returned HTTP {status}")
+
+
+def stop(name: str) -> None:
+    """PUT /connectors/<name>/stop (Connect answers 204); the connector ends STOPPED with no tasks."""
+    status, _ = http_request("PUT", f"{CONNECT_URL}/connectors/{name}/stop", {}, None)
+    _expect(name, "stop", status, frozenset({204}))
+
+
+def resume(name: str) -> None:
+    """PUT /connectors/<name>/resume (Connect answers 202)."""
+    status, _ = http_request("PUT", f"{CONNECT_URL}/connectors/{name}/resume", {}, None)
+    _expect(name, "resume", status, frozenset({202}))
+
+
+def delete(name: str) -> None:
+    """DELETE /connectors/<name>; 204 (deleted) and 404 (already gone) are both fine."""
+    status, _ = http_request("DELETE", f"{CONNECT_URL}/connectors/{name}", {}, None)
+    _expect(name, "delete", status, frozenset({204, 404}))
+
+
+def wait_stopped(
+    name: str,
+    timeout_s: float = 120,
+    interval_s: float = POLL_INTERVAL_S,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> str:
+    """Poll until the connector's state is STOPPED and its task list is empty, and return STOPPED.
+
+    A FAILED connector raises at once; a timeout raises with the last state seen. KIP-875's offsets
+    PATCH needs exactly this state.
+    """
+    deadline = clock() + timeout_s
+    while True:
+        report = connector_status(name)
+        connector = report.get("connector")
+        state = str(connector.get("state", "UNKNOWN")) if isinstance(connector, dict) else "UNKNOWN"
+        tasks = report.get("tasks")
+        if state == "STOPPED" and not tasks:
+            return state
+        if state == "FAILED":
+            raise RuntimeError(f"{name} is FAILED while waiting for STOPPED")
+        if clock() >= deadline:
+            raise TimeoutError(f"{name} was not STOPPED after {timeout_s:g} s (last state {state})")
+        sleep(interval_s)
+
+
+def offsets_body(resume_at: Mapping[tuple[str, int], int]) -> dict[str, Any]:
+    """The PATCH /connectors/<name>/offsets body for {(topic, partition): next offset to read}.
+
+    Exactly {"offsets": [{"partition": {"kafka_topic": T, "kafka_partition": P}, "offset":
+    {"kafka_offset": N}}, ...]}, with partition and offset as JSON integers, sorted by (topic,
+    partition). An empty map, a negative offset or a non-integer raises ValueError.
+    """
+    if not resume_at:
+        raise ValueError("offsets_body needs at least one partition")
+    entries = []
+    for (topic_name, partition), offset in sorted(resume_at.items()):
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("an offset must be a non-negative integer")
+        if isinstance(partition, bool) or not isinstance(partition, int) or partition < 0:
+            raise ValueError("a partition must be a non-negative integer")
+        entries.append(
+            {
+                "partition": {"kafka_topic": topic_name, "kafka_partition": partition},
+                "offset": {"kafka_offset": offset},
+            }
+        )
+    return {"offsets": entries}
+
+
+def patch_offsets(name: str, body: Mapping[str, Any]) -> int:
+    """PATCH /connectors/<name>/offsets with `body`; only 200 is accepted and returned.
+
+    The connector must be STOPPED (KIP-875). The error names the connector and the status only.
+    """
+    status, _ = http_request(
+        "PATCH",
+        f"{CONNECT_URL}/connectors/{name}/offsets",
+        JSON_HEADERS,
+        json.dumps(dict(body)).encode(),
+    )
+    _expect(name, "offsets patch", status, frozenset({200}))
+    return status
+
+
+def register(branch: str | None = "audit") -> dict[str, Any]:
+    """Put the source, then the sink, then wait for both: {"connectors": {...}, "plugins": {...}}.
+
+    `branch` is the sink's default commit branch; None registers it without one (bronze append-only
+    on main, ADR-001's "branch doesn't work" configuration).
+    """
     put_config(SOURCE_NAME, debezium_config())
-    put_config(SINK_NAME, sink_config())
+    put_config(SINK_NAME, sink_config(branch))
     states = {name: wait_running(name) for name in (SOURCE_NAME, SINK_NAME)}
     return {"connectors": states, "plugins": plugins()}
 
@@ -330,14 +430,38 @@ def show_config(kind: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Register and inspect the CDC connectors.")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("register", help="put both connectors and wait until they run")
+    registered = commands.add_parser("register", help="put both connectors and wait until they run")
+    registered.add_argument(
+        "--no-branch", action="store_true", help="register the sink without a commit branch"
+    )
     commands.add_parser("status", help="print both connectors' states")
+    for verb, text in (
+        ("stop", "stop a connector and wait until it is STOPPED with no tasks"),
+        ("resume", "resume a stopped connector and wait until it is RUNNING"),
+        ("delete", "delete a connector (a missing one is fine)"),
+    ):
+        lifecycle = commands.add_parser(verb, help=text)
+        lifecycle.add_argument(
+            "connector", nargs="?", default=SINK_NAME, choices=(SOURCE_NAME, SINK_NAME)
+        )
     counted = commands.add_parser("placeholders", help="count placeholders and plaintext on stdin")
     counted.add_argument("--key", required=True, help="name of the secret's environment variable")
     counted.add_argument("--source", required=True, help="label of the capture")
     shown = commands.add_parser("show-config", help="print a connector config as JSON")
     shown.add_argument("kind", choices=("source", "sink"))
     return parser
+
+
+def lifecycle_command(verb: str, name: str) -> dict[str, str]:
+    """Run stop, resume or delete on one connector; report the state it settled in."""
+    if verb == "stop":
+        stop(name)
+        return {"connector": name, "state": wait_stopped(name)}
+    if verb == "resume":
+        resume(name)
+        return {"connector": name, "state": wait_running(name)}
+    delete(name)
+    return {"connector": name, "state": "DELETED"}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -347,7 +471,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2 if exc.code not in (0, None) else 0
     try:
         if args.command == "register":
-            print(json.dumps(register(), sort_keys=True), flush=True)
+            print(
+                json.dumps(register(None if args.no_branch else "audit"), sort_keys=True),
+                flush=True,
+            )
+        elif args.command in {"stop", "resume", "delete"}:
+            print(
+                json.dumps(lifecycle_command(args.command, args.connector), sort_keys=True),
+                flush=True,
+            )
         elif args.command == "status":
             states = _report()
             print(json.dumps({"connectors": states}, sort_keys=True), flush=True)

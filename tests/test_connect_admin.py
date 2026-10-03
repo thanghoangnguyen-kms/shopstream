@@ -493,3 +493,195 @@ def test_show_config_prints_the_connector_json_for_piping(
     assert ca.main(["show-config", "sink"]) == 0
     assert json.loads(capsys.readouterr().out) == ca.sink_config()
     assert ca.main(["show-config", "other"]) == 2
+
+
+# --- stop, resume, delete and the offsets PATCH (Plan 04-03) -------------------------------------
+
+
+def status_body(connector: str, *tasks: str) -> tuple[int, bytes]:
+    report = {
+        "connector": {"state": connector},
+        "tasks": [{"id": i, "state": state} for i, state in enumerate(tasks)],
+    }
+    return 200, json.dumps(report).encode()
+
+
+def test_stop_resume_and_delete_send_the_right_method_and_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script(
+        {
+            ("PUT", "/connectors/bronze-sink/stop"): [(204, b"")],
+            ("PUT", "/connectors/bronze-sink/resume"): [(202, b"")],
+            ("DELETE", "/connectors/bronze-sink"): [(204, b"")],
+        }
+    )
+    monkeypatch.setattr(ca, "http_request", script)
+    ca.stop(ca.SINK_NAME)
+    ca.resume(ca.SINK_NAME)
+    ca.delete(ca.SINK_NAME)
+    assert [(c.method, c.url.removeprefix(ca.CONNECT_URL)) for c in script.calls] == [
+        ("PUT", "/connectors/bronze-sink/stop"),
+        ("PUT", "/connectors/bronze-sink/resume"),
+        ("DELETE", "/connectors/bronze-sink"),
+    ]
+
+
+def test_delete_accepts_a_missing_connector(monkeypatch: pytest.MonkeyPatch) -> None:
+    script = Script({("DELETE", "/connectors/bronze-sink"): [(404, b'{"message": "gone"}')]})
+    monkeypatch.setattr(ca, "http_request", script)
+    ca.delete(ca.SINK_NAME)
+
+
+@pytest.mark.parametrize(
+    ("call", "key", "status"),
+    [
+        (ca.stop, ("PUT", "/connectors/bronze-sink/stop"), 409),
+        (ca.resume, ("PUT", "/connectors/bronze-sink/resume"), 500),
+        (ca.delete, ("DELETE", "/connectors/bronze-sink"), 403),
+    ],
+)
+def test_an_unexpected_status_raises_with_the_status_and_no_body(
+    monkeypatch: pytest.MonkeyPatch, call: Any, key: tuple[str, str], status: int
+) -> None:
+    secret_body = b'{"message": "internal host connect-7 refused"}'
+    monkeypatch.setattr(ca, "http_request", Script({key: [(status, secret_body)]}))
+    with pytest.raises(RuntimeError, match=f"HTTP {status}") as info:
+        call(ca.SINK_NAME)
+    assert "connect-7" not in str(info.value)
+    assert "refused" not in str(info.value)
+
+
+def test_wait_stopped_needs_the_state_stopped_and_no_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script(
+        {
+            ("GET", "/connectors/bronze-sink/status"): [
+                status_body("RUNNING", "RUNNING"),
+                status_body("STOPPED", "RUNNING"),
+                status_body("STOPPED"),
+            ]
+        }
+    )
+    monkeypatch.setattr(ca, "http_request", script)
+    slept: list[float] = []
+    assert ca.wait_stopped(ca.SINK_NAME, sleep=slept.append) == "STOPPED"
+    assert slept == [2.0, 2.0]
+
+
+def test_wait_stopped_times_out_with_the_last_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ca,
+        "http_request",
+        Script({("GET", "/connectors/bronze-sink/status"): [status_body("RUNNING", "RUNNING")]}),
+    )
+    now = iter([0.0, 1.0, 100.0, 200.0])
+    with pytest.raises(TimeoutError, match="RUNNING"):
+        ca.wait_stopped(ca.SINK_NAME, timeout_s=50, sleep=lambda _: None, clock=lambda: next(now))
+
+
+# --- the offsets PATCH body ---------------------------------------------------------------------
+
+
+def test_offsets_body_is_exactly_the_documented_shape_sorted_with_integers() -> None:
+    topic = "shopstream.public.customers"
+    body = ca.offsets_body({(topic, 1): 42, (topic, 0): 9})
+    assert body == {
+        "offsets": [
+            {
+                "partition": {"kafka_topic": topic, "kafka_partition": 0},
+                "offset": {"kafka_offset": 9},
+            },
+            {
+                "partition": {"kafka_topic": topic, "kafka_partition": 1},
+                "offset": {"kafka_offset": 42},
+            },
+        ]
+    }
+    text = json.dumps(body)
+    assert not re.search(r'"\d+"', text)
+    assert re.search(r'"kafka_partition": 0\b', text)
+
+
+def test_offsets_body_sorts_by_topic_then_partition() -> None:
+    body = ca.offsets_body({("b", 0): 1, ("a", 2): 1, ("a", 10): 1, ("a", 1): 1})
+    keys = [
+        (o["partition"]["kafka_topic"], o["partition"]["kafka_partition"]) for o in body["offsets"]
+    ]
+    assert keys == [("a", 1), ("a", 2), ("a", 10), ("b", 0)]
+
+
+def test_offsets_body_refuses_a_negative_or_non_integer_offset_and_an_empty_map() -> None:
+    with pytest.raises(ValueError, match="offset"):
+        ca.offsets_body({("t", 0): -1})
+    with pytest.raises(ValueError, match="offset"):
+        ca.offsets_body({("t", 0): "5"})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="partition"):
+        ca.offsets_body({})
+
+
+def test_patch_offsets_sends_the_body_and_accepts_only_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = ca.offsets_body({("t", 0): 3})
+    script = Script({("PATCH", "/connectors/bronze-sink/offsets"): [(200, b'{"message": "ok"}')]})
+    monkeypatch.setattr(ca, "http_request", script)
+    assert ca.patch_offsets(ca.SINK_NAME, body) == 200
+    (call,) = script.calls
+    assert call.method == "PATCH"
+    assert json.loads(call.body or b"{}") == body
+    refused = Script({("PATCH", "/connectors/bronze-sink/offsets"): [(400, b'{"message": "x"}')]})
+    monkeypatch.setattr(ca, "http_request", refused)
+    with pytest.raises(RuntimeError, match="HTTP 400"):
+        ca.patch_offsets(ca.SINK_NAME, body)
+
+
+# --- register without a commit branch -----------------------------------------------------------
+
+
+def test_register_no_branch_puts_a_sink_config_without_the_commit_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = happy_script()
+    monkeypatch.setattr(ca, "http_request", script)
+    ca.register(branch=None)
+    sink_put = next(c for c in script.calls if c.url.endswith("/connectors/bronze-sink/config"))
+    sent = json.loads(sink_put.body or b"{}")
+    assert "iceberg.tables.default-commit-branch" not in sent
+    assert sent == ca.sink_config(None)
+
+
+def test_register_defaults_to_the_audit_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    script = happy_script()
+    monkeypatch.setattr(ca, "http_request", script)
+    ca.register()
+    sink_put = next(c for c in script.calls if c.url.endswith("/connectors/bronze-sink/config"))
+    assert json.loads(sink_put.body or b"{}")["iceberg.tables.default-commit-branch"] == "audit"
+
+
+def test_the_cli_register_no_branch_flag_and_the_lifecycle_commands(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = happy_script()
+    monkeypatch.setattr(ca, "http_request", script)
+    assert ca.main(["register", "--no-branch"]) == 0
+    sink_put = next(c for c in script.calls if c.url.endswith("/connectors/bronze-sink/config"))
+    assert "iceberg.tables.default-commit-branch" not in json.loads(sink_put.body or b"{}")
+    capsys.readouterr()
+    lifecycle = Script(
+        {
+            ("PUT", "/connectors/bronze-sink/stop"): [(204, b"")],
+            ("GET", "/connectors/bronze-sink/status"): [
+                status_body("STOPPED"),
+                status_body("RUNNING", "RUNNING"),
+            ],
+            ("PUT", "/connectors/bronze-sink/resume"): [(202, b"")],
+            ("DELETE", "/connectors/bronze-sink"): [(204, b"")],
+        }
+    )
+    monkeypatch.setattr(ca, "http_request", lifecycle)
+    for command in ("stop", "resume", "delete"):
+        assert ca.main([command]) == 0
+        assert json.loads(capsys.readouterr().out)["connector"] == "bronze-sink"
+    assert ca.main(["stop", "not-a-connector"]) == 2

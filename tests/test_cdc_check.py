@@ -595,3 +595,51 @@ def test_a_kill_classified_data_complete_makes_a_go_report_in_window() -> None:
         [event("COMMIT_COMPLETE", COMMIT_A)],
     )
     assert cc.item5_verdict(make_report(kills=out))["verdict"] == "inconclusive"
+
+
+# --- Confluent wire format and key offsets (Plan 04-03) ------------------------------------------
+
+
+def test_confluent_schema_id_reads_the_big_endian_id_after_the_zero_magic_byte() -> None:
+    assert cc.confluent_schema_id(b"\x00\x00\x00\x00\x07rest") == 7
+    assert cc.confluent_schema_id(b"\x00\x00\x01\x00\x02") == 0x00010002
+    assert cc.confluent_schema_id(b"\x00\xff\xff\xff\xff") == 0xFFFFFFFF
+
+
+@pytest.mark.parametrize(
+    "data", [b"", b"\x00\x00\x00\x00", b"\x01\x00\x00\x00\x07", b"\xc2\x01abcd"]
+)
+def test_confluent_schema_id_refuses_a_short_record_or_a_wrong_magic_byte(data: bytes) -> None:
+    with pytest.raises(ValueError, match="wire-format"):
+        cc.confluent_schema_id(data)
+
+
+def test_key_offsets_matches_decoded_keys_and_includes_tombstones() -> None:
+    records: list[tuple[str, int, int, dict[str, int] | None]] = [
+        (CUSTOMERS, 0, 0, {"customer_id": 5}),
+        (CUSTOMERS, 0, 1, {"customer_id": 6}),
+        (CUSTOMERS, 0, 2, {"customer_id": 5}),  # a tombstone carries its key too
+        (CUSTOMERS, 1, 0, {"customer_id": 7}),
+        (CUSTOMERS, 1, 1, None),
+    ]
+    assert cc.key_offsets("customers", records, [5, 7]) == {
+        (CUSTOMERS, 0, 0),
+        (CUSTOMERS, 0, 2),
+        (CUSTOMERS, 1, 0),
+    }
+
+
+def test_key_offsets_with_no_ledger_matches_nothing_and_refuses_a_composite_key() -> None:
+    assert cc.key_offsets("customers", [(CUSTOMERS, 0, 0, {"customer_id": 5})], []) == set()
+    with pytest.raises(ValueError, match="composite"):
+        cc.key_offsets("order_items", [], [1])
+
+
+def test_the_ledger_offsets_feed_compare_offsets_as_allowed_missing() -> None:
+    kafka = offsets(CUSTOMERS, 0, 4)
+    erased = cc.key_offsets(
+        "customers", [(CUSTOMERS, 0, n, {"customer_id": n}) for n in range(4)], [1, 3]
+    )
+    bronze = sorted(kafka - erased)
+    result = cc.compare_offsets(kafka, bronze, {(CUSTOMERS, 0): 4}, frozenset(erased))
+    assert (result["missing"], result["missing_allowed"], result["extra"]) == (2, 2, 0)

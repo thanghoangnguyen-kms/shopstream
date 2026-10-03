@@ -4,7 +4,9 @@ Run inside the `cdc-run` one-shot (the spike image on the Compose network, which
 Karapace and Connect): `python /app/cdc_check.py item5 --timeout 300`. The last line of stdout is one
 compact JSON line. Plan 04-01's tracer used `ensure-namespace`, `refs` and `bronze-find`; Plan 04-02
 adds the exactly-once measurement (`item5`), the `test_decoding` count slot (`slot-create`,
-`slot-drop`) and the scoped `reset`; Plan 04-03 adds the rollback checks.
+`slot-drop`) and the scoped `reset`; Plan 04-03 adds the key-aware offset set (`kafka_key_offsets`,
+which decodes the Confluent wire-format key through Karapace) and `set_check`, the set comparison at
+any bronze ref the write-audit-publish and rollback runs repeat.
 
 Item 5's rule is pure and tested: `pk_of`, `compare_offsets`, `change_stats`, `delete_stats`,
 `count_changes` and `item5_verdict`. The bronze set of (topic, partition, offset) is compared with the
@@ -30,11 +32,12 @@ import argparse
 import json
 import os
 import re
+import struct
 import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 import connect_admin
@@ -89,6 +92,8 @@ COUNT_KEYS = (
     "pg_changes",
     "delete_ok",
 )
+
+WIRE_HEADER_BYTES = 5
 
 Offset = tuple[str, int, int]
 Change = tuple[str, tuple[int, ...] | None, int | None]
@@ -242,6 +247,41 @@ def delete_example(
             and (row["topic"], row["partition"], later[0]) in row_offsets,
         }
     return None
+
+
+def confluent_schema_id(data: bytes) -> int:
+    """The Karapace schema id of a Confluent wire-format record: byte 0 is 0, bytes 1 to 4 the id.
+
+    The id is big-endian. Raises ValueError when the magic byte is not 0 or the record is shorter
+    than the 5-byte header.
+    """
+    if len(data) < WIRE_HEADER_BYTES:
+        raise ValueError("a Confluent wire-format record needs at least 5 bytes")
+    if data[0] != 0:
+        raise ValueError("not a Confluent wire-format record: the magic byte is not 0")
+    (schema_id,) = struct.unpack(">I", data[1:WIRE_HEADER_BYTES])
+    return int(schema_id)
+
+
+def key_offsets(
+    table: str,
+    records: Iterable[tuple[str, int, int, Mapping[str, Any] | None]],
+    keys: Collection[int],
+) -> set[Offset]:
+    """The (topic, partition, offset) of every record whose decoded key's primary key is in `keys`.
+
+    `records` carry the decoded Avro key (None for a record with no key). Only single-column
+    primary keys are supported; a tombstone is matched on its key like any other record.
+    """
+    columns = PK_COLUMNS[table]
+    if len(columns) != 1:
+        raise ValueError(f"{table} has a composite primary key")
+    wanted = {int(key) for key in keys}
+    found: set[Offset] = set()
+    for topic, partition, offset, key in records:
+        if key is not None and int(key[columns[0]]) in wanted:
+            found.add((topic, partition, offset))
+    return found
 
 
 CONTROL_MAGIC = b"\xc2\x01"
@@ -559,7 +599,7 @@ def bronze_find(table: str, pk: tuple[str, ...], timeout_s: float) -> dict[str, 
 def bronze_rows(table: str, ref: str = AUDIT_BRANCH) -> dict[str, Any]:
     """The rows of bronze.<table> at `ref`'s head: {"rows", "snapshot_id", "snapshots", "absent"}.
 
-    Each row is {table, topic, partition, offset, op, lsn, pk} with ints for the numbers. A table
+    `ref` is a branch name or, when it is all digits, a snapshot id (a rollback target). Each row is {table, topic, partition, offset, op, lsn, pk} with ints for the numbers. A table
     the sink has not created yet, or one with no `ref`, is `absent` with no rows; any other error
     propagates, so a caller can call the table unreadable.
     """
@@ -571,9 +611,14 @@ def bronze_rows(table: str, ref: str = AUDIT_BRANCH) -> dict[str, Any]:
     except NoSuchTableError:
         return empty
     found = iceberg_table.refs()
-    if ref not in found:
+    if ref.isdigit():
+        snapshot_id = int(ref)
+        if iceberg_table.snapshot_by_id(snapshot_id) is None:
+            return {**empty, "snapshots": len(iceberg_table.snapshots())}
+    elif ref not in found:
         return {**empty, "snapshots": len(iceberg_table.snapshots())}
-    snapshot_id = int(found[ref].snapshot_id)
+    else:
+        snapshot_id = int(found[ref].snapshot_id)
     arrow = iceberg_table.scan(snapshot_id=snapshot_id, selected_fields=ENVELOPE_COLUMNS).to_arrow()
     rows = []
     for row in arrow.to_pylist():
@@ -697,19 +742,21 @@ def pg_changes(end_lsn: str, final: bool = False) -> dict[str, Any]:
 # --- kafka side -------------------------------------------------------------------------------
 
 
-def read_committed(
+def read_records(
     topics: Sequence[str],
     settle_s: float = SETTLE_S,
     timeout_s: float = 600.0,
     keep_values: bool = False,
-) -> tuple[list[tuple[str, int, int, bytes | None]], dict[tuple[str, int], int]]:
+    keep_keys: bool = False,
+) -> tuple[list[tuple[str, int, int, bytes | None, bytes | None]], dict[tuple[str, int], int]]:
     """Every record a read_committed consumer sees below each partition's end: (records, ends).
 
-    A record is (topic, partition, offset, value); a tombstone's value is None, and a non-null
-    value is its bytes only with `keep_values` (else b""). The end offsets are read_committed's,
-    exclusive, polled until two reads `settle_s` apart are equal. A fresh consumer group that never
-    commits reads each partition from its log start to that end, so a second call on the same state
-    gives the same records; a record at or beyond the end is ignored.
+    A record is (topic, partition, offset, value, key); a tombstone's value is None, and a non-null
+    value is its bytes only with `keep_values` (else b""); the key is its bytes only with
+    `keep_keys` (else None). The end offsets are read_committed's, exclusive, polled until two
+    reads `settle_s` apart are equal. A fresh consumer group that never commits reads each
+    partition from its log start to that end, so a second call on the same state gives the same
+    records; a record at or beyond the end is ignored.
     """
     from confluent_kafka import Consumer, IsolationLevel, KafkaError, KafkaException, TopicPartition
     from confluent_kafka.admin import AdminClient, OffsetSpec
@@ -750,7 +797,7 @@ def read_committed(
             "enable.partition.eof": True,
         }
     )
-    records: list[tuple[str, int, int, bytes | None]] = []
+    records: list[tuple[str, int, int, bytes | None, bytes | None]] = []
     done = {key for key, end in ends.items() if starts[key] >= end}
     try:
         consumer.assign([TopicPartition(t, p, starts[(t, p)]) for (t, p) in sorted(ends)])
@@ -773,12 +820,47 @@ def read_committed(
                 continue
             value = message.value()
             kept = None if value is None else (bytes(value) if keep_values else b"")
-            records.append((key[0], key[1], offset, kept))
+            raw_key = message.key()
+            kept_key = bytes(raw_key) if keep_keys and raw_key is not None else None
+            records.append((key[0], key[1], offset, kept, kept_key))
             if offset >= ends[key] - 1:
                 done.add(key)
     finally:
         consumer.close()
     return records, ends
+
+
+def read_committed(
+    topics: Sequence[str],
+    settle_s: float = SETTLE_S,
+    timeout_s: float = 600.0,
+    keep_values: bool = False,
+) -> tuple[list[tuple[str, int, int, bytes | None]], dict[tuple[str, int], int]]:
+    """`read_records` without the keys: (topic, partition, offset, value) records and the ends."""
+    records, ends = read_records(topics, settle_s, timeout_s, keep_values)
+    return [(t, p, o, value) for t, p, o, value, _key in records], ends
+
+
+def log_start_offsets(
+    topics: Sequence[str],
+) -> tuple[list[tuple[str, int]], dict[tuple[str, int], int]]:
+    """Every (topic, partition) of `topics`, sorted, and each one's log-start offset.
+
+    A bronze replay resumes a partition that has no rows in the restored snapshot at its log start.
+    """
+    from confluent_kafka import TopicPartition
+    from confluent_kafka.admin import AdminClient, OffsetSpec
+
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
+    partitions = []
+    for name in topics:
+        meta = admin.list_topics(name, timeout=30).topics[name]
+        partitions += [TopicPartition(name, number) for number in sorted(meta.partitions)]
+    futures = admin.list_offsets(
+        {tp: OffsetSpec.earliest() for tp in partitions}, request_timeout=30
+    )
+    starts = {(tp.topic, tp.partition): int(f.result().offset) for tp, f in futures.items()}
+    return sorted(starts), starts
 
 
 def kafka_offsets(
@@ -789,6 +871,46 @@ def kafka_offsets(
     nonnull = {(t, p, o) for t, p, o, value in records if value is not None}
     tombstones = {(t, p, o) for t, p, o, value in records if value is None}
     return nonnull, tombstones, ends
+
+
+def avro_schema(schema_id: int) -> Any:
+    """The parsed writer schema Karapace holds under `schema_id` (GET /schemas/ids/<id>)."""
+    import fastavro
+
+    status, payload = connect_admin.http_request(
+        "GET", f"{connect_admin.KARAPACE_URL}/schemas/ids/{int(schema_id)}", {}, None
+    )
+    if status != 200:
+        raise RuntimeError(f"Karapace returned HTTP {status} for schema id {schema_id}")
+    return fastavro.parse_schema(json.loads(json.loads(payload)["schema"]))
+
+
+def kafka_key_offsets(table: str, keys: Collection[int]) -> set[Offset]:
+    """The (topic, partition, offset) of every record in the table's topic whose key is in `keys`.
+
+    Reads the topic read_committed from log start with a fresh group, fetches each schema id once
+    from Karapace, and decodes each key (Confluent wire format, Avro) with fastavro. Tombstones are
+    included: they carry their key. Only the matching offsets leave this function.
+    """
+    import io
+
+    import fastavro
+
+    records, _ends = read_records([connect_admin.topic(table)], keep_keys=True)
+    schemas: dict[int, Any] = {}
+    decoded: list[tuple[str, int, int, Mapping[str, Any] | None]] = []
+    for topic, partition, offset, _value, raw_key in records:
+        if raw_key is None:
+            decoded.append((topic, partition, offset, None))
+            continue
+        schema_id = confluent_schema_id(raw_key)
+        if schema_id not in schemas:
+            schemas[schema_id] = avro_schema(schema_id)
+        key = fastavro.schemaless_reader(
+            io.BytesIO(raw_key[WIRE_HEADER_BYTES:]), schemas[schema_id]
+        )
+        decoded.append((topic, partition, offset, key if isinstance(key, Mapping) else None))
+    return key_offsets(table, decoded, keys)
 
 
 def control_events(timeout_s: float = 120.0) -> tuple[list[dict[str, Any]], int]:
@@ -816,8 +938,8 @@ def control_events(timeout_s: float = 120.0) -> tuple[list[dict[str, Any]], int]
 # --- measurement ------------------------------------------------------------------------------
 
 
-def gather() -> dict[str, Any]:
-    """Read the Kafka set and every bronze table once: the inputs of one measurement."""
+def gather(ref: str = AUDIT_BRANCH) -> dict[str, Any]:
+    """Read the Kafka set and every bronze table at `ref` once: the inputs of one measurement."""
     topics = [connect_admin.topic(table) for table in connect_admin.TABLES]
     nonnull, tombstones, ends = kafka_offsets(topics)
     rows: list[dict[str, Any]] = []
@@ -826,7 +948,7 @@ def gather() -> dict[str, Any]:
     snapshots = 0
     for table in connect_admin.TABLES:
         try:
-            found = bronze_rows(table)
+            found = bronze_rows(table, ref)
         except Exception:
             unreadable.append(table)
             continue
@@ -861,7 +983,10 @@ def summarize(
 
 
 def wait_caught_up(
-    timeout_s: float, allowed_missing: frozenset[Offset], pg_total: int
+    timeout_s: float,
+    allowed_missing: frozenset[Offset],
+    pg_total: int,
+    ref: str = AUDIT_BRANCH,
 ) -> dict[str, Any]:
     """Re-gather every 10 s until bronze holds every Kafka offset and every counted change.
 
@@ -872,7 +997,7 @@ def wait_caught_up(
     """
     deadline = time.monotonic() + timeout_s
     while True:
-        data = gather()
+        data = gather(ref)
         summary = summarize(data, pg_total, allowed_missing)
         caught_up = (
             not data["unreadable"]
@@ -882,6 +1007,31 @@ def wait_caught_up(
         if caught_up or time.monotonic() >= deadline:
             return data
         time.sleep(CATCH_UP_INTERVAL_S)
+
+
+def set_check(ref: str, ledger: Collection[int]) -> dict[str, Any]:
+    """Compare bronze's offsets at `ref` with the Kafka set over all five tables, allowing the ledger.
+
+    `allowed_missing` is every customers offset whose key is in `ledger`: an erased row. The result
+    is compare_offsets' counts and samples (offsets only) plus the ledger size, the Kafka tombstone
+    count and the rows read. A table that cannot be read raises: a set check never hides one.
+    """
+    allowed = frozenset(kafka_key_offsets("customers", ledger)) if ledger else frozenset()
+    topics = [connect_admin.topic(table) for table in connect_admin.TABLES]
+    nonnull, tombstones, ends = kafka_offsets(topics)
+    rows: list[dict[str, Any]] = []
+    for table in connect_admin.TABLES:
+        rows += bronze_rows(table, ref)["rows"]
+    compared = compare_offsets(
+        nonnull, [(r["topic"], r["partition"], r["offset"]) for r in rows], ends, allowed
+    )
+    return {
+        **compared,
+        "ref": ref,
+        "ledger_keys": len(ledger),
+        "bronze_rows": len(rows),
+        "kafka_tombstones": len(tombstones),
+    }
 
 
 def read_kills(stream: Iterable[str]) -> list[dict[str, Any]]:
@@ -1007,11 +1157,31 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("classify", help="classify the kill record on stdin from the control topic")
     drop = commands.add_parser("slot-drop", help="drop the named replication slots")
     drop.add_argument("names", nargs="+")
+    checked = commands.add_parser(
+        "set-check", help="compare bronze's offsets at a ref with Kafka's"
+    )
+    checked.add_argument("--ref", required=True, help="audit, main or a snapshot id")
     item5 = commands.add_parser("item5", help="measure exactly-once and print the verdict")
     item5.add_argument("--kills-stdin", action="store_true", help="read kill records on stdin")
     item5.add_argument("--final", action="store_true", help="also get_changes, then drop the slot")
     item5.add_argument("--timeout", type=float, default=300.0, help="seconds to wait for catch-up")
     return parser
+
+
+def read_ledger(stream: Any) -> list[int]:
+    """The erasure ledger from stdin: a JSON list of integer keys, or nothing for no ledger.
+
+    Only integers are accepted, so a ledger can never carry a name or an address.
+    """
+    text = stream.read().strip() if not stream.isatty() else ""
+    if not text:
+        return []
+    keys = json.loads(text)
+    if not isinstance(keys, list) or not all(
+        isinstance(key, int) and not isinstance(key, bool) for key in keys
+    ):
+        raise ValueError("the ledger must be a JSON list of integers")
+    return sorted(set(keys))
 
 
 def secrets_in_env() -> list[str]:
@@ -1040,6 +1210,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(classify_one(sys.stdin), sort_keys=True), flush=True)
         elif args.command == "slot-drop":
             print(json.dumps({"dropped": slot_drop(args.names)}, sort_keys=True), flush=True)
+        elif args.command == "set-check":
+            print(
+                json.dumps(set_check(args.ref, read_ledger(sys.stdin)), sort_keys=True), flush=True
+            )
         else:
             kills = read_kills(sys.stdin) if args.kills_stdin else []
             report = run_item5(kills, args.final, args.timeout)

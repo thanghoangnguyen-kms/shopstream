@@ -85,6 +85,8 @@ ignore = ["E501"]
 "scripts/cdc_workload.py" = ["S311", "S608"]
 # Fixed docker argv lists (S603, S607), never shell strings.
 "scripts/connect_kill.py" = ["S603", "S607"]
+# Spark scratch on the container's /tmp tmpfs (S108); SQL built from constant table names and integer keys through identifier() (S608).
+"scripts/bronze_wap.py" = ["S108", "S608"]
 
 [tool.mypy]
 python_version = "3.13"
