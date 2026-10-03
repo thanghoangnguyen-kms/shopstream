@@ -48,3 +48,8 @@ repos:
         entry: .tools/bin/gitleaks git --pre-commit --staged --redact --no-banner --verbose --config .gitleaks.toml
         language: system
         pass_filenames: false
+      - id: canary-guard
+        name: canary token guard
+        entry: uv run --frozen python scripts/canary_guard.py
+        language: system
+        pass_filenames: true

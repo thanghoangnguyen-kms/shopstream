@@ -1,0 +1,58 @@
+{
+  "identities": [
+    {
+      "name": "admin",
+      "credentials": [{"accessKey": "${SEAWEEDFS_ADMIN_KEY}", "secretKey": "${SEAWEEDFS_ADMIN_SECRET}"}],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    },
+    {
+      "name": "lakekeeper",
+      "credentials": [{"accessKey": "${LAKEKEEPER_S3_KEY}", "secretKey": "${LAKEKEEPER_S3_SECRET}"}],
+      "actions": ["Read", "List", "Tagging", "Write"]
+    },
+    {
+      "name": "probe-other",
+      "credentials": [{"accessKey": "${PROBE_OTHER_KEY}", "secretKey": "${PROBE_OTHER_SECRET}"}],
+      "actions": ["Read", "List"]
+    }
+  ],
+  "sts": {
+    "tokenDuration": "1h",
+    "maxSessionLength": "1h",
+    "issuer": "seaweedfs-sts",
+    "signingKey": "${STS_SIGNING_KEY}",
+    "accountId": "000000000000"
+  },
+  "roles": [
+    {
+      "roleName": "LakekeeperVendedRole",
+      "roleArn": "arn:aws:iam::000000000000:role/LakekeeperVendedRole",
+      "trustPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::000000000000:user/lakekeeper"},
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "attachedPolicies": ["WarehouseBucket"]
+    }
+  ],
+  "policies": [
+    {
+      "name": "WarehouseBucket",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "s3:*",
+            "Resource": ["arn:aws:s3:::warehouse", "arn:aws:s3:::warehouse/*"]
+          }
+        ]
+      }
+    }
+  ]
+}

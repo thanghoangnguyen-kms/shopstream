@@ -1,0 +1,14 @@
+[project]
+name = "shopstream-metricflow"
+version = "0.0.0"
+description = "MetricFlow for ADR-001 item 4 in its own uv project: dbt-metricflow with dbt-core and dbt-duckdb aligned to analytics/dbt, outside the workspace members."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "dbt-core==1.12.5",
+    "dbt-duckdb==1.11.0",
+    "dbt-metricflow[dbt-duckdb]==0.15.0",
+    "duckdb==1.5.5",
+]
+
+[tool.uv]
+package = false

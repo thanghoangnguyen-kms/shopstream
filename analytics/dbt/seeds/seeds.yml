@@ -1,0 +1,23 @@
+seeds:
+  - name: changes
+    description: Two change batches for item 3, batch 1 inserts and batch 2 updates one key and deletes another.
+    config:
+      column_types:
+        id: integer
+        name: varchar
+        is_deleted: boolean
+        batch: integer
+  - name: orders
+    description: Four orders on three days for item 4's semantic layer and item 7's gold switch.
+    config:
+      column_types:
+        order_id: integer
+        customer_id: integer
+        order_date: date
+        amount: decimal(10,2)
+  - name: customers
+    description: Three customers for item 7's gold switch, so dim_customers is the third switched object.
+    config:
+      column_types:
+        customer_id: integer
+        segment: varchar

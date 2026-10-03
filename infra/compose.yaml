@@ -1,0 +1,619 @@
+name: shopstream
+
+x-defaults: &defaults
+  restart: "no"
+
+# The Kafka settings the three combined broker/controller nodes share. Public config, so literal.
+# Replication factor 3 and min.insync.replicas 2 everywhere, including the internal topics: do not
+# copy the upstream example's single-node settings. Each node adds KAFKA_NODE_ID and its advertised
+# listener. Auto-creation is off: kafka-init creates every topic.
+x-kafka-env: &kafka-env
+  CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: "2"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+
+services:
+  postgres:
+    <<: *defaults
+    image: docker.io/library/postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    profiles: [core]
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - track_commit_timestamp=on
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+      # Bounds the WAL a replication slot holds: a peek-only count slot never advances.
+      - -c
+      - max_slot_wal_keep_size=4GB
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run just up}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?run just up}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?run just up}
+      SHOPSTREAM_DB_PASSWORD: ${SHOPSTREAM_DB_PASSWORD:?run just up}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      # TCP, because the init-time server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  lakekeeper-migrate:
+    <<: *defaults
+    image: quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5
+    profiles: [core]
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?run just up}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?run just up}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_PG_ENCRYPTION_KEY:?run just up}
+      # ADR-001 spike exception (G6): no authentication, loopback-only ports. Week 5 re-bootstraps with OIDC and OpenFGA.
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  lakekeeper:
+    <<: *defaults
+    image: quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5
+    profiles: [core]
+    command: ["serve"]
+    environment: *lakekeeper-env
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8181:8181"
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      # The image is FROM scratch: only the binary itself can probe.
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  seaweedfs:
+    <<: *defaults
+    image: docker.io/chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    profiles: [core]
+    command:
+      - mini
+      - -dir=/data
+      - -s3.config=/etc/seaweedfs/iam.json
+      - -s3.iam.config=/etc/seaweedfs/iam.json
+      - -webdav=false
+      - -admin.ui=false
+    volumes:
+      - seaweedfs-data:/data
+      # The only mount from infra/.generated: on virtiofs any container uid can read the 0600 file.
+      - ./.generated/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+    ports:
+      - "127.0.0.1:8333:8333"
+    mem_limit: 768m
+    memswap_limit: 768m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8333/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  frankfurter-init:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [core]
+    # A fresh named volume at /app/data is root-owned and the image runs as uid 1000.
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1000:1000", "/app/data"]
+    command: []
+    volumes:
+      - frankfurter-data:/app/data
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  frankfurter:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [core]
+    init: true
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+      # The defaults of 4 Puma workers and 5 threads do not fit the memory limit.
+      WORKER_PROCESSES: "1"
+      MAX_THREADS: "3"
+    depends_on:
+      frankfurter-init:
+        condition: service_completed_successfully
+    volumes:
+      - frankfurter-data:/app/data
+    ports:
+      - "127.0.0.1:8090:8080"
+    # Sized by Plan 01-04. From-empty backfills were OOM-killed at 192m, 384m and 512m. A run at 768m peaked
+    # at 310.4 MiB (formula: x 1.25, rounded up to 32 MiB = 416m), the clean-clone run at 416m peaked at
+    # 412.4 of 416 MiB, and a run at a 1g limit reached 493 MiB of anonymous memory. The owner set 640m:
+    # 493 MiB x 1.25 rounded up to 32 MiB.
+    mem_limit: 640m
+    memswap_limit: 640m
+    healthcheck:
+      # The root route answers before the provider backfill finishes; backfill completeness is item 10's check.
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 120s
+
+  bootstrap:
+    <<: *defaults
+    image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    profiles: [bootstrap]
+    command: ["python", "/app/lakekeeper_bootstrap.py", "bootstrap"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      SEAWEEDFS_ADMIN_KEY: ${SEAWEEDFS_ADMIN_KEY:?run just up}
+      SEAWEEDFS_ADMIN_SECRET: ${SEAWEEDFS_ADMIN_SECRET:?run just up}
+    volumes:
+      - ../scripts/lakekeeper_bootstrap.py:/app/lakekeeper_bootstrap.py:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  warehouse:
+    <<: *defaults
+    image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    profiles: [bootstrap]
+    command: ["python", "/app/lakekeeper_bootstrap.py", "warehouse"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      LAKEKEEPER_S3_KEY: ${LAKEKEEPER_S3_KEY:?run just up}
+      LAKEKEEPER_S3_SECRET: ${LAKEKEEPER_S3_SECRET:?run just up}
+    volumes:
+      - ../scripts/lakekeeper_bootstrap.py:/app/lakekeeper_bootstrap.py:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  # A spike one-shot that `just up` never starts. It holds the keys item 1's positive control and
+  # AssumeRole leg need. Built from infra/spike/Dockerfile, so the policy gate checks that file's
+  # FROM and COPY --from digests instead of an image: pin.
+  probe:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/probe_scope.py", "--json"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      AWS_EC2_METADATA_DISABLED: "true"
+      LAKEKEEPER_S3_KEY: ${LAKEKEEPER_S3_KEY:?run just up}
+      LAKEKEEPER_S3_SECRET: ${LAKEKEEPER_S3_SECRET:?run just up}
+      PROBE_OTHER_KEY: ${PROBE_OTHER_KEY:?run just up}
+      PROBE_OTHER_SECRET: ${PROBE_OTHER_SECRET:?run just up}
+      SEAWEEDFS_ADMIN_KEY: ${SEAWEEDFS_ADMIN_KEY:?run just up}
+      SEAWEEDFS_ADMIN_SECRET: ${SEAWEEDFS_ADMIN_SECRET:?run just up}
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    user: "65534:65534"
+    mem_limit: 256m
+    memswap_limit: 256m
+
+  # Item 2's Spark writer (readers come in Plan 02-05) and the job item 8 runs in Phase 5. Same
+  # image as probe. No infra/.env key reaches it: Lakekeeper vends the storage credentials to
+  # the JVM. Spark needs scratch space, hence the larger /tmp tmpfs on a read-only root. The tmpfs
+  # is mounted exec because the REST client decodes Lakekeeper's zstd responses with zstd-jni,
+  # which extracts a native library into /tmp and maps it (a default noexec tmpfs refuses that).
+  spark-job:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/spark_v3_job.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_EC2_METADATA_DISABLED: "true"
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,exec
+    user: "65534:65534"
+    mem_limit: 3g
+    memswap_limit: 3g
+
+  # Items 3, 9, 4 and 7's dbt runner, never started by `just up`. No infra/.env key reaches it:
+  # Lakekeeper vends the storage credentials to DuckDB. The analytics tree is mounted read-write
+  # because dbt writes its git-ignored target/ and logs/ there and DuckDB's Iceberg writer makes an
+  # empty data/ directory. The /tmp tmpfs is exec because DuckDB loads the extensions it downloads
+  # into HOME.
+  dbt-job:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/dbt/Dockerfile
+    profiles: [spike]
+    command: ["/opt/dbt/bin/dbt", "--version"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      DO_NOT_TRACK: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    working_dir: /work/analytics/dbt
+    volumes:
+      - ../analytics:/work/analytics
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,exec
+    user: "65534:65534"
+    mem_limit: 1g
+    memswap_limit: 1g
+
+  # Item 10's spike volume owner. A copy of frankfurter-init for the dedicated frankfurter-fx-data
+  # volume, so the core frankfurter never shares a SQLite file with the item 10 services.
+  frankfurter-fx-init:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1000:1000", "/app/data"]
+    command: []
+    volumes:
+      - frankfurter-fx-data:/app/data
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  # Item 10's online-once seed: the only service that talks to the ECB. It fills the empty
+  # frankfurter-fx-data volume with ECB only (db:setup, then the ECB backfill) and exits, so the
+  # SQLite file never has two writers. The default network gives it a route out.
+  frankfurter-seed:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    user: "1000:1000"
+    entrypoint: ["sh", "-c", "bundle exec rake db:setup && bundle exec rake 'backfill[ECB]'"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+    volumes:
+      - frankfurter-fx-data:/app/data
+    depends_on:
+      frankfurter-fx-init:
+        condition: service_completed_successfully
+    mem_limit: 640m
+    memswap_limit: 640m
+
+  # Item 10's web-only Frankfurter: puma without foreman, so no scheduler and no provider fetches. It
+  # sits on the internal fx_offline network only, where it answers as http://frankfurter:8080. Stop it
+  # (rm -sf) before any reseed so one SQLite file never has two writers.
+  frankfurter-offline:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    init: true
+    entrypoint: ["sh", "-c", "bundle exec puma -C config/puma.rb"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+      WORKER_PROCESSES: "1"
+      MAX_THREADS: "3"
+    volumes:
+      - frankfurter-fx-data:/app/data
+    networks:
+      fx_offline:
+        aliases: [frankfurter]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      # The root route answers before the backfill finishes by design; completeness is the loader's check.
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
+
+  # Item 10's throwaway dlt loader, built from the spike image and attached to fx_offline only: it
+  # has no route to the internet and no published port. scripts/fx_load.py proves the cut before it
+  # loads. dlt telemetry is off so dlt makes no call on the cut network.
+  fx-load:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/fx_load.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      FRANKFURTER_URL: http://frankfurter:8080
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    networks:
+      - fx_offline
+    depends_on:
+      frankfurter-offline:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    user: "65534:65534"
+    mem_limit: 1g
+    memswap_limit: 1g
+
+  # The `streaming` profile (Phase 4): three combined KRaft nodes, the topic one-shot, Karapace, a
+  # Connect worker and the Postgres CDC one-shot. No port is published: every probe runs in the
+  # network. Start it by name (`up -d --wait connect`), never with `just up`. Memory limits are
+  # provisional until Phase 5's item 8 measures under load.
+  #
+  # Three combined broker/controller nodes (Kafka 4.3.1). Settings come from the x-kafka-env anchor.
+  kafka-1:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:19092
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:19092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-2:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:19092
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:19092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-3:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "3"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:19092
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:19092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Creates every topic the phase uses at replication factor 3 and min.insync.replicas=2, then
+  # describes them so its log shows the result. Idempotent.
+  kafka-init:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    entrypoint: ["bash", "/scripts/create-topics.sh"]
+    command: []
+    environment:
+      KAFKA_HEAP_OPTS: -Xms64m -Xmx192m
+    volumes:
+      - ./kafka/create-topics.sh:/scripts/create-topics.sh:ro
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    mem_limit: 384m
+    memswap_limit: 384m
+
+  # Runs infra/postgres/cdc.sql (role, grants, reviews stand-in table, publication) on every start
+  # through the superuser password it already holds, so a clean clone and the existing volume both
+  # get it. The `$$NAME` form is the container's own shell variable, not a Compose interpolation.
+  cdc-init:
+    <<: *defaults
+    image: docker.io/library/postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    profiles: [streaming]
+    entrypoint: ["sh", "-c", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" exec psql -h postgres -U postgres -d postgres -v ON_ERROR_STOP=1 -v cdc_pw=\"$$CDC_DB_PASSWORD\" -f /cdc/cdc.sql"]
+    command: []
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run just up}
+      CDC_DB_PASSWORD: ${CDC_DB_PASSWORD:?run just up}
+    volumes:
+      - ./postgres/cdc.sql:/cdc/cdc.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 64m
+    memswap_limit: 64m
+
+  # Schema registry. KARAPACE_REPLICATION_FACTOR defaults to 1, which fails writes under
+  # min.insync.replicas 2 while /_health still says ready, so it is set to 3.
+  karapace:
+    <<: *defaults
+    image: ghcr.io/aiven-open/karapace:6.2.3@sha256:6d5b1ff1b77c497108be8be8359c9072294847cba5aa0767fc168ec70632d78f
+    profiles: [streaming]
+    entrypoint: ["python3", "-m", "karapace"]
+    environment:
+      KARAPACE_KARAPACE_REGISTRY: "true"
+      KARAPACE_ADVERTISED_HOSTNAME: karapace
+      KARAPACE_ADVERTISED_PROTOCOL: http
+      KARAPACE_BOOTSTRAP_URI: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      KARAPACE_PORT: "8081"
+      KARAPACE_HOST: 0.0.0.0
+      KARAPACE_CLIENT_ID: karapace
+      KARAPACE_GROUP_ID: karapace
+      KARAPACE_MASTER_ELIGIBILITY: "true"
+      KARAPACE_TOPIC_NAME: _schemas
+      KARAPACE_COMPATIBILITY: BACKWARD
+      KARAPACE_REPLICATION_FACTOR: "3"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  # Debezium 3.6.3.Final on Connect 4.3.0 with the Iceberg sink and the Avro converter, built from
+  # infra/connect/Dockerfile (no image key, so the policy gate checks that file's digests). The
+  # worker reads the connector password through Kafka's EnvVarConfigProvider, allowlisted for exactly
+  # CDC_DB_PASSWORD, so a connector config holds only an env-provider placeholder. The
+  # secret must never carry the worker prefix: the image's entrypoint writes every such variable
+  # into a properties file and echoes its value in the log. The variable names below are the ones
+  # the entrypoint reads (/docker-entrypoint.sh): HEAP_OPTS and ADVERTISED_HOST_NAME are mapped to
+  # KAFKA_HEAP_OPTS and the worker's advertised host. The sink's AWS SDK reads AWS_REGION; Lakekeeper
+  # vends the keys.
+  connect:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/connect/Dockerfile
+    profiles: [streaming]
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      OFFSET_FLUSH_INTERVAL_MS: "5000"
+      HEAP_OPTS: -Xms512m -Xmx1g
+      ADVERTISED_HOST_NAME: connect
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CONNECT_CONFIG_PROVIDERS_ENV_PARAM_ALLOWLIST_PATTERN: CDC_DB_PASSWORD
+      CDC_DB_PASSWORD: ${CDC_DB_PASSWORD:?run just up}
+      AWS_REGION: local-01
+      AWS_EC2_METADATA_DISABLED: "true"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      cdc-init:
+        condition: service_completed_successfully
+      karapace:
+        condition: service_healthy
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+
+networks:
+  # No route out: item 10's loader and web-only Frankfurter sit here and nothing else does.
+  fx_offline:
+    internal: true
+
+volumes:
+  postgres-data:
+  seaweedfs-data:
+  frankfurter-data:
+  frankfurter-fx-data:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:

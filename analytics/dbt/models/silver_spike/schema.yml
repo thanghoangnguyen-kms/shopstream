@@ -1,0 +1,13 @@
+models:
+  - name: inc_v3
+    description: Item 3's incremental, delete-capable Iceberg v3 table.
+    columns:
+      - name: id
+        description: The merge key, unique per row.
+        data_tests:
+          - unique
+          - not_null
+      - name: name
+        description: The row's payload.
+      - name: is_deleted
+        description: Whether the batch deletes the key; never stored as true.

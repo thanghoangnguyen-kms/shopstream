@@ -19,6 +19,21 @@ dev = [
   "types-pyyaml==6.0.12.20260906",
   "zizmor==1.30.1",
 ]
+spark = [
+    "pyspark==4.1.3",
+]
+spike = [
+    "boto3==1.43.103",
+    "confluent-kafka==2.15.1",
+    "dlt==1.30.0",
+    "duckdb==1.5.5",
+    "fastavro==1.12.2",
+    "pandas==3.0.6",
+    "polars==1.44.2",
+    "psycopg[binary]==3.3.6",
+    "pyarrow==25.0.1",
+    "pyiceberg[pyarrow]==0.12.0",
+]
 
 [tool.uv]
 package = false
@@ -42,12 +57,66 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S603", "S607"]
 "packages/*/tests/**" = ["S101", "S603", "S607"]
+# REPO_TOKEN and HOME_TOKEN hold the <repo> and <home> placeholders, not secrets.
+"scripts/redact_evidence.py" = ["S105"]
+# These scripts run fixed argv lists (docker, git) or a loopback health probe, never shell strings.
+"scripts/stack.py" = ["S603", "S607"]
+"scripts/mem_report.py" = ["S603", "S607"]
+"scripts/lakekeeper_bootstrap.py" = ["S310"]
+# urllib calls to the origin-allowlisted in-network Lakekeeper, like the bootstrap script.
+"scripts/probe_scope.py" = ["S310"]
+# Origin-allowlisted Lakekeeper GETs (S310), SQL built from the script's own constants and integer snapshot ids (S608), and the container's /tmp tmpfs as Spark scratch (S108).
+"scripts/spark_v3_job.py" = ["S108", "S310", "S608"]
+# SQL built from the job's own table names and integer snapshot ids.
+"scripts/read_v3.py" = ["S608"]
+# SQL built from the script's own constant names.
+"scripts/dbt_v3_check.py" = ["S608"]
+# Fixed absolute-path argv lists (the dbt and mf CLIs), never shell strings.
+"scripts/semantic_check.py" = ["S603"]
+# SQL built from fixed namespace and object names through identifier().
+"scripts/gold_switch_probe.py" = ["S608"]
+# Origin-allowlisted Frankfurter GETs (S310), the container's /tmp tmpfs (S108), and SQL over the loader's own table (S608).
+"scripts/fx_load.py" = ["S108", "S310", "S608"]
+# urllib calls to the origin-allowlisted in-network Connect and Karapace only (S310); SECRET_KEY holds the env var's name, not a secret (S105).
+"scripts/connect_admin.py" = ["S105", "S310"]
 
 [tool.mypy]
 python_version = "3.13"
 strict = true
 files = ["packages", "scripts", "tests"]
 mypy_path = ["scripts"]
+
+# The spike probe clients and readers (uv group `spike`) and PySpark (uv group `spark`) ship no
+# stubs and are not installed in CI.
+[[tool.mypy.overrides]]
+module = [
+  "boto3",
+  "boto3.*",
+  "botocore.*",
+  "polars",
+  "polars.*",
+  "pandas",
+  "pandas.*",
+  "pyarrow",
+  "pyarrow.*",
+  "dlt",
+  "dlt.*",
+  "psycopg",
+  "psycopg.*",
+  "confluent_kafka",
+  "confluent_kafka.*",
+  "fastavro",
+  "fastavro.*",
+  "pyspark",
+  "pyspark.*",
+  "pyiceberg",
+  "pyiceberg.*",
+  "duckdb",
+  "duckdb.*",
+  "dateutil",
+  "dateutil.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib", "-ra", "--strict-markers"]

@@ -1,0 +1,6 @@
+id,name,is_deleted,batch
+1,a,false,1
+2,b,false,1
+3,c,false,1
+2,b-updated,false,2
+3,c,true,2
