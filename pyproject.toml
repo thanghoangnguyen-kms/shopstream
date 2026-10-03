@@ -91,6 +91,8 @@ ignore = ["E501"]
 "scripts/clock_check.py" = ["S608"]
 # Fixed docker argv lists (S603, S607), never shell strings.
 "scripts/airflow_check.py" = ["S603", "S607"]
+# Fixed docker argv lists (S603, S607), never shell strings.
+"scripts/ram_budget.py" = ["S603", "S607"]
 # A seeded, reproducible workload, not cryptography (S311).
 "scripts/clickstream_load.py" = ["S311"]
 # The knob tests seed the generator's own random.Random, which is not used for secrets.

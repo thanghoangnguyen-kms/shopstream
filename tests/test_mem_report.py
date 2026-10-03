@@ -85,6 +85,10 @@ def test_parse_mem_usage_rejects_a_value_without_a_separator() -> None:
         ("/shopstream-postgres-1", "postgres"),
         ("shopstream-frankfurter-init-1", "frankfurter-init"),
         ("/shopstream-seaweedfs-12", "seaweedfs"),
+        ("shopstream-spark-job-run-4f87af04bf9d", "spark-job"),
+        ("/shopstream-cdc-run-run-0123456789ab", "cdc-run"),
+        ("shopstream-cdc-run-1", "cdc-run"),
+        ("shopstream-spark-job-run-012345678901", "spark-job"),
     ],
 )
 def test_service_of(name: str, service: str) -> None:
@@ -281,6 +285,10 @@ class Fakes:
             ("lakekeeper", "running", 0),
             ("frankfurter", "running", 0),
         ]
+        self.spike_limits: dict[str, object] = {
+            "spark-job": "3221225472",
+            "cdc-run": "2147483648",
+        }
         self.mem_total = MEM_TOTAL
         self.profiles_seen: list[list[str]] = []
         monkeypatch.setattr(mem_report, "compose_config", self.compose_config)
@@ -291,9 +299,12 @@ class Fakes:
 
     def compose_config(self, profiles: list[str]) -> dict[str, object]:
         self.profiles_seen.append(list(profiles))
+        wanted = dict(self.limits)
+        if "spike" in profiles:
+            wanted.update(self.spike_limits)
         services: dict[str, object] = {
             name: {"mem_limit": limit, "environment": {"FAKE_MATERIAL": self.canary}}
-            for name, limit in self.limits.items()
+            for name, limit in wanted.items()
         }
         return {"services": services}
 
@@ -411,7 +422,12 @@ def test_report_uses_the_same_profiles_as_just_up(
     fakes = Fakes(monkeypatch)
     monkeypatch.setenv("COMPOSE_PROFILES", "streaming, orchestration,bootstrap,*")
     mem_report.main(["report", "--samples", str(sample_file(tmp_path))])
-    assert fakes.profiles_seen == [["core", "streaming", "orchestration"]]
+    # the active profiles first (the totals and the long-running set), then the same plus `spike`
+    # (the per-service limit column and the --with-service names)
+    assert fakes.profiles_seen == [
+        ["core", "streaming", "orchestration"],
+        ["core", "streaming", "orchestration", "spike"],
+    ]
 
 
 def test_main_returns_1_when_a_docker_call_fails(
@@ -964,3 +980,390 @@ def test_breaches_come_out_in_the_documented_order(
     assert len(breaches) == len(starts)
     for breach, start in zip(breaches, starts, strict=True):
         assert breach.startswith(start), (breach, start)
+
+
+# --- compose run containers, spike one-offs and OOM events (Phase 5, item 8) ----------------
+
+RUN_FRAMES = [
+    (
+        "2026-10-03T10:00:00Z",
+        {"shopstream-postgres-1": "100MiB / 512MiB"},
+    ),
+    (
+        "2026-10-03T10:00:05Z",
+        {
+            "shopstream-postgres-1": "120MiB / 512MiB",
+            "shopstream-spark-job-run-4f87af04bf9d": "800MiB / 3GiB",
+            "shopstream-cdc-run-run-0123456789ab": "300MiB / 2GiB",
+            "shopstream-frankfurter-1": "300MiB / 768MiB",
+            "shopstream-lakekeeper-1": "19MiB / 256MiB",
+        },
+    ),
+]
+
+
+def run_samples(tmp_path: Path) -> Path:
+    path = tmp_path / "samples.jsonl"
+    write_samples(path, RUN_FRAMES)
+    return path
+
+
+def test_events_format_and_argv_always_carry_an_explicit_format() -> None:
+    assert mem_report.EVENTS_FORMAT == (
+        '{{.Time}} {{.Action}} {{.Actor.Attributes.name}} {{with index .Actor.Attributes "exitCode"}}'
+        "{{.}}{{else}}-{{end}}"
+    )
+    argv = mem_report.events_argv("1791040000")
+    assert argv[:4] == ["docker", "events", "--since", "1791040000"]
+    assert argv[argv.index("--format") + 1] == mem_report.EVENTS_FORMAT
+    assert "label=com.docker.compose.project=shopstream" in argv
+    assert [argv[i + 1] for i, word in enumerate(argv) if word == "--filter"] == [
+        "label=com.docker.compose.project=shopstream",
+        "event=oom",
+        "event=die",
+    ]
+    assert all(isinstance(word, str) for word in argv)
+
+
+def test_parse_events_keeps_capture_order_and_maps_run_containers() -> None:
+    text = (
+        "1791040003 die shopstream-spark-job-run-4f87af04bf9d 0\n"
+        "1791040001 oom shopstream-airflow-scheduler-1 -\n"
+        "\n"
+        "1791040002 die shopstream-airflow-scheduler-1 137\n"
+    )
+    assert mem_report.parse_events(text) == [
+        ("spark-job", "die", 0),
+        ("airflow-scheduler", "oom", None),
+        ("airflow-scheduler", "die", 137),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1791040001 kill shopstream-postgres-1 -",
+        "1791040001 die shopstream-postgres-1",
+        "1791040001 die shopstream-postgres-1 x",
+        "oom shopstream-postgres-1 -",
+        "1791040001 die shopstream-postgres-1 137 extra",
+    ],
+)
+def test_parse_events_rejects_an_unknown_action_and_a_malformed_line(text: str) -> None:
+    with pytest.raises(ValueError, match="docker events"):
+        mem_report.parse_events(text)
+
+
+def test_an_oom_event_and_an_exit_137_die_each_breach() -> None:
+    oom = mem_report.evaluate(0, 0, [], MEM_TOTAL, [], events=[("spark-job", "oom", None)])
+    assert oom == ["container spark-job had an OOM event"]
+    killed = mem_report.evaluate(0, 0, [], MEM_TOTAL, [], events=[("spark-job", "die", 137)])
+    assert len(killed) == 1
+    assert killed[0].startswith("container spark-job exited with code 137")
+    assert "events capture" in killed[0]
+
+
+@pytest.mark.parametrize("code", [0, 1, 2, 143])
+def test_a_die_with_another_exit_code_is_not_a_breach(code: int) -> None:
+    assert mem_report.evaluate(0, 0, [], MEM_TOTAL, [], events=[("spark-job", "die", code)]) == []
+
+
+def test_event_breaches_follow_the_capture_order() -> None:
+    events: list[tuple[str, str, int | None]] = [
+        ("zeta", "die", 137),
+        ("alpha", "oom", None),
+    ]
+    got = mem_report.evaluate(0, 0, [], MEM_TOTAL, [], events=events)
+    assert [b.split()[1] for b in got] == ["zeta", "alpha"]
+
+
+def test_inspect_and_state_cover_the_spike_containers_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake(argv: list[str]) -> str:
+        calls.append(argv)
+        return "id1\n" if argv[:2] == ["docker", "compose"] else ""
+
+    monkeypatch.setattr(mem_report, "_docker", fake)
+    mem_report.inspect_rows(["core", "streaming"])
+    listing = next(c for c in calls if c[:2] == ["docker", "compose"])
+    profiles = [listing[i + 1] for i, word in enumerate(listing) if word == "--profile"]
+    assert profiles == ["core", "streaming", "bootstrap", "spike"]
+    assert listing[-2:] == ["ps", "-aq"]
+
+
+def test_the_table_shows_a_spike_services_limit_for_its_run_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    mem_report.main(["report", "--samples", str(run_samples(tmp_path))])
+    out = capsys.readouterr().out
+    spark = next(line for line in out.splitlines() if line.startswith("spark-job "))
+    assert spark.split() == ["spark-job", "800.0", "3072.0"]
+    cdc = next(line for line in out.splitlines() if line.startswith("cdc-run "))
+    assert cdc.split() == ["cdc-run", "300.0", "2048.0"]
+    assert "spark-job-run" not in out
+
+
+def test_without_with_service_the_total_is_the_active_profiles_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    assert mem_report.main(["report", "--samples", str(run_samples(tmp_path))]) == 0
+    out = capsys.readouterr().out
+    assert "sum(mem_limit) for profiles core: 1.50 GiB" in out
+    assert "sum(mem_limit) with" not in out
+
+
+def test_with_service_adds_the_named_spike_limit_and_judges_the_ceiling_on_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.mem_total = 5 * GIB  # ceiling 4 GiB: the profiles' 1.5 GiB fits, 1.5 + 3 does not
+    samples = run_samples(tmp_path)
+    assert mem_report.main(["report", "--samples", str(samples)]) == 0
+    capsys.readouterr()
+    code = mem_report.main(["report", "--samples", str(samples), "--with-service", "spark-job"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "sum(mem_limit) for profiles core: 1.50 GiB" in out
+    assert "sum(mem_limit) with spark-job: 4.50 GiB" in out
+    assert "limits over" in out
+    assert "BREACH: sum(mem_limit) 4831838208 B is over MemTotal minus 1 GiB" in out
+
+
+def test_with_service_is_repeatable_and_sums_each_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    args = ["--with-service", "spark-job", "--with-service", "cdc-run"]
+    assert mem_report.main(["report", "--samples", str(run_samples(tmp_path)), *args]) == 0
+    assert "sum(mem_limit) with spark-job, cdc-run: 6.50 GiB" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ["nosuch", "postgres"])
+def test_with_service_rejects_an_unknown_or_an_already_active_name(
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    Fakes(monkeypatch)
+    code = mem_report.main(
+        ["report", "--samples", str(run_samples(tmp_path)), "--with-service", name]
+    )
+    assert code == 2
+    out = capsys.readouterr().out
+    assert name in out
+    assert "--with-service" in out
+
+
+def test_spike_services_are_not_long_running_for_the_state_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    code = mem_report.main(
+        ["report", "--samples", str(run_samples(tmp_path)), "--with-service", "spark-job"]
+    )
+    assert code == 0
+    assert "has no container" not in capsys.readouterr().out
+
+
+def write_events(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "events.txt"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("text", "needle"),
+    [
+        ("1791040001 oom shopstream-spark-job-run-4f87af04bf9d -\n", "had an OOM event"),
+        ("1791040001 die shopstream-spark-job-run-4f87af04bf9d 137\n", "exited with code 137"),
+    ],
+)
+def test_the_events_capture_turns_oom_and_137_into_breaches(
+    text: str,
+    needle: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    Fakes(monkeypatch)
+    events = write_events(tmp_path, text)
+    code = mem_report.main(
+        ["report", "--samples", str(run_samples(tmp_path)), "--events", str(events)]
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert f"BREACH: container spark-job {needle}" in out
+
+
+def test_a_clean_events_capture_is_no_breach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Fakes(monkeypatch)
+    events = write_events(tmp_path, "1791040001 die shopstream-spark-job-run-4f87af04bf9d 0\n")
+    assert (
+        mem_report.main(
+            ["report", "--samples", str(run_samples(tmp_path)), "--events", str(events)]
+        )
+        == 0
+    )
+
+
+def test_an_unreadable_events_capture_is_an_error_not_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Fakes(monkeypatch)
+    events = write_events(tmp_path, "not an event line\n")
+    code = mem_report.main(
+        ["report", "--samples", str(run_samples(tmp_path)), "--events", str(events)]
+    )
+    assert code == 1
+    assert "docker events" in capsys.readouterr().err
+
+
+def test_json_out_holds_every_figure_and_is_identical_on_a_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes = Fakes(monkeypatch)
+    events = write_events(tmp_path, "1791040001 die shopstream-spark-job-run-4f87af04bf9d 0\n")
+    first, second = tmp_path / "a.json", tmp_path / "b.json"
+    for target in (first, second):
+        args = [
+            "report",
+            "--samples",
+            str(run_samples(tmp_path)),
+            "--events",
+            str(events),
+            "--with-service",
+            "spark-job",
+            "--json-out",
+            str(target),
+        ]
+        assert mem_report.main(args) == 0
+    assert first.read_text(encoding="utf-8") == second.read_text(encoding="utf-8")
+    report = json.loads(first.read_text(encoding="utf-8"))
+    assert {
+        "frames",
+        "peak_sum",
+        "peak_ts",
+        "per_service",
+        "limit_total_profiles",
+        "limit_total",
+        "with_services",
+        "mem_total",
+        "ceiling",
+        "inspect",
+        "states",
+        "events",
+        "breaches",
+        "long_running",
+    } <= set(report)
+    assert report["frames"] == 2
+    assert report["peak_ts"] == "2026-10-03T10:00:05Z"
+    assert report["peak_sum"] == sum(
+        mem_report.parse_size(x.split(" / ")[0]) for x in RUN_FRAMES[1][1].values()
+    )
+    assert report["limit_total_profiles"] == 536870912 + 268435456 + 805306368
+    assert report["limit_total"] == report["limit_total_profiles"] + 3221225472
+    assert report["with_services"] == ["spark-job"]
+    assert report["mem_total"] == MEM_TOTAL
+    assert report["ceiling"] == MEM_TOTAL - GIB
+    assert report["events"] == [{"service": "spark-job", "action": "die", "exit_code": 0}]
+    assert report["breaches"] == []
+    assert report["inspect"][0] == {"service": "postgres", "oom_killed": False, "restarts": 0}
+    assert report["states"][0] == {"service": "postgres", "status": "running", "exit_code": 0}
+    names = [row["service"] for row in report["per_service"]]
+    assert names == ["spark-job", "cdc-run", "frankfurter", "postgres", "lakekeeper"]
+    assert report["per_service"][0] == {
+        "service": "spark-job",
+        "peak_bytes": 800 * MIB,
+        "limit_bytes": 3221225472,
+    }
+    assert fakes.canary not in first.read_text(encoding="utf-8")
+
+
+def test_json_out_is_written_when_the_report_breaches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes = Fakes(monkeypatch)
+    fakes.inspect = [("frankfurter", True, 1)]
+    target = tmp_path / "out.json"
+    code = mem_report.main(
+        ["report", "--samples", str(run_samples(tmp_path)), "--json-out", str(target)]
+    )
+    assert code == 1
+    report = json.loads(target.read_text(encoding="utf-8"))
+    assert any("OOM killed" in b for b in report["breaches"])
+    assert report["with_services"] == []
+    assert report["limit_total"] == report["limit_total_profiles"]
+
+
+def test_sample_out_writes_to_the_named_file_and_not_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default = tmp_path / ".mem" / "samples.jsonl"
+    monkeypatch.setattr(mem_report, "SAMPLES_FILE", default)
+    monkeypatch.setattr(
+        mem_report,
+        "docker_stats_frame",
+        lambda: [{"name": "shopstream-postgres-1", "mem_usage": "10MiB / 512MiB"}],
+    )
+    out = tmp_path / "run" / "mini.jsonl"
+    assert (
+        mem_report.main(["sample", "--duration", "0.05", "--interval", "0.02", "--out", str(out)])
+        == 0
+    )
+    assert mem_report.load_frames(out)
+    assert not default.exists()
+
+
+def test_json_out_orders_equal_peaks_by_service_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    write_samples(
+        path,
+        [
+            (
+                "2026-10-03T10:00:00Z",
+                {
+                    "shopstream-postgres-1": "100MiB / 512MiB",
+                    "shopstream-lakekeeper-1": "100MiB / 256MiB",
+                    "shopstream-frankfurter-1": "100MiB / 768MiB",
+                },
+            )
+        ],
+    )
+    target = tmp_path / "out.json"
+    mem_report.main(["report", "--samples", str(path), "--json-out", str(target)])
+    report = json.loads(target.read_text(encoding="utf-8"))
+    assert [row["service"] for row in report["per_service"]] == [
+        "frankfurter",
+        "lakekeeper",
+        "postgres",
+    ]
+
+
+def test_the_earliest_of_equal_peak_frames_is_the_peak_in_the_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Fakes(monkeypatch)
+    path = tmp_path / "samples.jsonl"
+    row = {"shopstream-postgres-1": "100MiB / 512MiB"}
+    write_samples(
+        path,
+        [
+            ("2026-10-03T10:00:10Z", row),
+            ("2026-10-03T10:00:00Z", row),
+            ("2026-10-03T10:00:05Z", row),
+        ],
+    )
+    target = tmp_path / "out.json"
+    mem_report.main(["report", "--samples", str(path), "--json-out", str(target)])
+    assert json.loads(target.read_text(encoding="utf-8"))["peak_ts"] == "2026-10-03T10:00:00Z"

@@ -61,6 +61,11 @@ DOCKER_STATES = frozenset(
     {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
 )
 OOM_KILL_EXIT_CODE = 137  # 128 + SIGKILL, what the out-of-memory killer sends
+EVENTS_FORMAT = (
+    '{{.Time}} {{.Action}} {{.Actor.Attributes.name}} {{with index .Actor.Attributes "exitCode"}}'
+    "{{.}}{{else}}-{{end}}"
+)
+EVENT_ACTIONS = frozenset({"oom", "die"})
 
 # docker stats prints binary units as KiB/MiB/GiB and decimal ones as kB/MB/GB.
 UNITS: dict[str, int] = {
@@ -130,6 +135,16 @@ def parse_mem_usage(text: str) -> tuple[int, int] | None:
 def service_of(name: str, project: str = PROJECT) -> str:
     """`shopstream-lakekeeper-migrate-1` and `/shopstream-postgres-1` to the service name."""
     return re.sub(rf"^{re.escape(project)}-|-\d+$", "", name.lstrip("/"))
+
+
+def events_argv(since: str) -> list[str]:
+    """The fixed `docker events` argv for the oom and die events of the project's containers."""
+    raise NotImplementedError("events_argv is not written yet")
+
+
+def parse_events(text: str) -> list[tuple[str, str, int | None]]:
+    """(service, action, exit code or None) per line of EVENTS_FORMAT, in capture order."""
+    raise NotImplementedError("parse_events is not written yet")
 
 
 def read_samples(path: Path) -> tuple[list[Frame], int]:
@@ -293,6 +308,7 @@ def evaluate(
     *,
     states: Sequence[tuple[str, str, int]] = (),
     long_running: Collection[str] = (),
+    events: Sequence[tuple[str, str, int | None]] = (),
 ) -> list[str]:
     """Breach messages; an empty list means every threshold holds."""
     breaches: list[str] = []
@@ -435,7 +451,13 @@ def cmd_sample(duration: float | None, interval: float, append: bool, path: Path
     return 0
 
 
-def cmd_report(samples: Path, min_frames: int = 1) -> int:
+def cmd_report(
+    samples: Path,
+    min_frames: int = 1,
+    with_services: Sequence[str] = (),
+    events_path: Path | None = None,
+    json_out: Path | None = None,
+) -> int:
     all_frames, skipped = read_samples(samples)
     if not all_frames:
         print(f"mem-report: no samples in {samples.name}; run just mem-sample first")
@@ -516,6 +538,9 @@ def main(argv: list[str] | None = None) -> int:
     sample.add_argument("--duration", type=float, help="stop after this many seconds")
     sample.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S)
     sample.add_argument("--append", action="store_true", help="keep the existing samples")
+    sample.add_argument(
+        "--out", type=Path, help="write the samples here (default .mem/samples.jsonl)"
+    )
     report = commands.add_parser("report", help="print peaks, limit totals and the OOM check")
     report.add_argument("--samples", type=Path, default=SAMPLES_FILE)
     report.add_argument(
@@ -524,11 +549,22 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="exit 2 when fewer frames than this hold container rows",
     )
+    report.add_argument(
+        "--with-service",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="add this spike service's mem_limit to the total (repeatable)",
+    )
+    report.add_argument("--events", type=Path, help="a `docker events` capture to check for OOM")
+    report.add_argument("--json-out", type=Path, help="write every figure to this JSON file")
     args = parser.parse_args(argv)
     try:
         if args.command == "sample":
             return cmd_sample(args.duration, args.interval, args.append, SAMPLES_FILE)
-        return cmd_report(args.samples, args.min_frames)
+        return cmd_report(
+            args.samples, args.min_frames, args.with_service, args.events, args.json_out
+        )
     except (DockerError, PreflightError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
