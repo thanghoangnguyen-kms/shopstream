@@ -1311,7 +1311,127 @@ The calendar rule is 1 January, 25 and 26 December every year; Good Friday, East
 
 ## Item 11: Two clocks
 
-Not run.
+Recorded 2026-10-03.
+
+Verdict: go. Per key, `source.lsn` order matched the WAL commit order for every streamed change of the 10-minute run with three concurrent writers and one `ALTER TABLE` (21,658 changes over 8,958 keys, 0 violations), snapshot rows came once per key before any streamed change, and every delete paired with its update at the simulated delete time, so ADR-001's go holds: order by `source.lsn`, validity from the simulated `updated_at`, which the Week 3 time-model ADR makes final.
+
+The check reads bronze, not Postgres. Every row of the five `bronze.<table>` tables at the `audit` branch's head is turned into one change (table, primary key, Kafka partition and offset, `op`, `source.lsn`, `source.txId`, `source.snapshot`, `after.updated_at`, `before.updated_at`, `source.sequence`). Per key, the order is the Kafka offset order within the key's partition. The canary token and every review body stay in memory: a change carries a flag or a hash.
+
+### Versions
+
+- Debezium 3.6.3.Final, the Iceberg sink 1.11.0, Karapace 6.2.3.
+- PostgreSQL 17.11 with `track_commit_timestamp` on and `REPLICA IDENTITY FULL` on all five captured tables (`relreplident` is `f` for each).
+- pyiceberg 0.12.0, psycopg 3.3.6, confluent-kafka 2.15.1, all read from the analyzer's own output.
+
+### Commands
+
+Each run starts from the same scoped reset (Phases 1 to 3's tables, the warehouse and the core Frankfurter stay), so each has its own empty Kafka volumes and empty bronze. The reset removes Connect, Karapace and the three brokers with their Kafka volumes, drops both replication slots, truncates the five captured tables, drops item 11's `tier` column so the `ALTER TABLE` can run again, and purges every bronze table through Lakekeeper's REST purge. The `test_decoding` slot is created after the seed, so the seeded rows reach bronze only as snapshot rows, and before the connectors are registered.
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile streaming rm -sf connect karapace kafka-init cdc-init kafka-1 kafka-2 kafka-3
+$ docker volume rm shopstream_kafka-1-data shopstream_kafka-2-data shopstream_kafka-3-data
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_check.py reset
+$ docker compose -f infra/compose.yaml --profile core --profile streaming up -d --wait connect
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_workload.py --mode seed --rows 300 --seed 111
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_check.py slot-create
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/connect_admin.py register
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_workload.py --mode item11 --sessions 1 --seconds 120 --rate 10 --seed 111
+$ ... python /app/clock_check.py item11 --workload-stdin --timeout 300      (the two workload JSON lines on stdin)
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_check.py slot-drop cnt_slot
+```
+
+The control is the block above: the seed with `--seed 111` (300 rows, 1,380 seeded keys over the five tables) and one writer session. The main run repeats the same eight steps with these workload lines:
+
+```text
+... python /app/cdc_workload.py --mode seed --rows 500 --seed 11
+... python /app/cdc_workload.py --mode item11 --sessions 3 --seconds 600 --rate 30 --seed 11 --alter-at 300 --canary --late-products 5 --review-injection
+... python /app/clock_check.py item11 --workload-stdin --timeout 600
+```
+
+The main seed holds 2,300 keys (customers 500, products 250, orders 500, order_items 1,000, reviews 50). The main run started right after `register` returned. Its first step is to wait for Debezium's replication slot (it was seen), so every change of the run is one the connector streams and the run still overlaps the snapshot's reading of the seeded rows.
+
+The workload is a one-off loader, so it has no tests and this page records its command lines and seeds. The simulated business clock starts 1 s after the newest `updated_at` and ticks 1 ms per statement. Each writer session takes its tick when it builds a statement, then waits a seeded 0 to 20 ms before executing it, so another session can take a later tick and commit first. Session `i` uses `random.Random(seed + i)`. Updates and delete pairs (an `UPDATE` of `updated_at` then a `DELETE` in one transaction) pick from a hot set of 200 keys per table, the first 200 keys in the table, seeded keys included. A delete takes its key out of the set, and a new insert joins the set while it has room. Inserts use new ids from 100,000. The main run made 18,000 transactions at 30 per second in total (about 10 per session) and the control 1,200 at 10 per second. Both used the same clock, the same code and the same transaction mix: 45 percent inserts, 35 percent updates, 20 percent delete pairs.
+
+### Ordering
+
+How commit order was taken: a `test_decoding` slot, created before the run, was peeked (not consumed) up to the run's end LSN with `include-xids`. A transaction's commit rank is the position of its `COMMIT <xid>` line among the `COMMIT` lines, and `xid` is matched to `source.txId`. The slot decoded 1,444 changes of the five tables for the control and 21,658 for the main run, equal to the streamed changes bronze holds. Before the analysis, bronze held every non-null Kafka offset (0 missing) and every distinct change.
+
+| | Control (1 session, 120 s, seed 111) | Main (3 sessions, 600 s, seed 11) |
+| --- | ---: | ---: |
+| Streamed changes | 1,444 | 21,658 |
+| Keys checked | 935 | 8,958 |
+| Commits ranked | 1,214 | 18,064 |
+| Streamed changes without `source.lsn` | 0 | 0 |
+| `source.lsn` violations (a tie or a decrease per key) | 0 | 0 |
+| Commit-rank violations (a decrease per key) | 0 | 0 |
+| Unranked changes (a `txId` with no commit rank) | 0 | 0 |
+| `updated_at` comparisons | 671 | 9,905 |
+| `updated_at` ties | 0 | 0 |
+| `updated_at` inversions | 0 | 2 |
+| `source.sequence` comparisons | 509 | 12,700 |
+| `source.sequence` ties | 0 | 0 |
+| `source.sequence` inversions | 0 | 0 |
+| `source.sequence` null elements | 2 | 1 |
+
+`updated_at` is read on `c`, `u` and `r` rows as UTC microseconds, and an `op=d` row never enters that sequence. `source.sequence` is read as two integers (last committed LSN, current LSN), a null element counts as -1, and a change's pair is compared with the previous change's pair of the same key. Neither clock decides the verdict alone: the verdict is go when no streamed change lacks `source.lsn` and per-key `source.lsn` and commit-rank order both hold, the snapshot check holds and every delete pairs. The two `updated_at` inversions of the main run did not change it. Rerunning the analyzer on the stopped state printed the same report, byte for byte.
+
+### Snapshot and deletes
+
+| | Control | Main |
+| --- | ---: | ---: |
+| Seeded keys | 1,380 | 2,300 |
+| `op=r` rows | 1,380 | 2,300 |
+| Keys with one `r` row | 1,380 | 2,300 |
+| Keys with several `r` rows | 0 | 0 |
+| `r` rows after a streamed change of the same key | 0 | 0 |
+| `source.snapshot` `first` | 1 | 1 |
+| `source.snapshot` `true` | 1,370 | 2,290 |
+| `source.snapshot` `last` | 1 | 1 |
+| `source.snapshot` `first_in_data_collection` | 4 | 4 |
+| `source.snapshot` `last_in_data_collection` | 4 | 4 |
+| `op=d` rows | 244 | 3,645 |
+| Paired with one `op=u` row of the same key and transaction | 244 | 3,645 |
+| Unpaired | 0 | 0 |
+| `before.updated_at` unequal to the paired `after.updated_at` | 0 | 0 |
+
+Debezium 3.6.3.Final also writes `first_in_data_collection` and `last_in_data_collection` to `source.snapshot`, four of each here, next to the one `first` and one `last` of the whole snapshot; the check accepts all five snapshot values. A streamed row carries `false`. Every `r` row came before the streamed changes of its key.
+
+### Knob detections
+
+Counts from the main run (item 13 itself is Phase 5's and reads these):
+
+- `ALTER TABLE customers ADD COLUMN tier text` ran 300.011 s into the run. Karapace's `shopstream.public.customers-value` subject then listed versions 1 and 2, `bronze.customers` held the optional `after.tier` column, and 443 customer changes in bronze carry a tier value. pgoutput sends a new column with the next change to the table, so the run inserted a customer with a tier straight after the `ALTER TABLE`.
+- Canary: 1 customers row in bronze holds the erasure canary. It was compared in memory and counted; the value is in no capture. A scan of every capture for the token found no hit.
+- Late-arriving products: 5 of 5. Each is an `order_items` row whose `source.lsn` is below the insert `source.lsn` of its product, and no product was missing from bronze.
+- Seeded review: 1 row in `bronze.reviews`, and the sha256 of its body matched the expected value (`9c0bc3e6f072b05c0cf41c7279af114b88ae6e26d1088c7739b463e11edd09f3`). The body is a neutral marker string, so the knob needs only a known row and a known hash; its text is not reproduced here, and nothing in the run reads or forwards it.
+- Rows by table and `op` in bronze:
+
+| Table | `r` | `c` | `u` | `d` |
+| --- | ---: | ---: | ---: | ---: |
+| customers | 500 | 1,626 | 1,972 | 732 |
+| products | 250 | 1,589 | 1,999 | 713 |
+| orders | 500 | 1,615 | 1,960 | 722 |
+| order_items | 1,000 | 1,658 | 1,996 | 756 |
+| reviews | 50 | 1,620 | 1,978 | 722 |
+
+The null-default regression (apache/iceberg#17652) belongs with item 13, not here.
+
+### Observations for the Week 3 time-model ADR
+
+For analytics-eng, who owns SCD2. These are measurements; no decision is written here, and the ADR is Week 3's.
+
+- Ordering: `source.lsn` was present on all 21,658 streamed changes of the main run and rose strictly per key in commit order, 0 violations across 8,958 keys, with three concurrent writers, 3,645 deletes and an `ALTER TABLE`. The commit ranks never decreased either.
+- Concurrency and the simulated clock: three writers taking the simulated time at statement time, then waiting up to 20 ms, produced 2 `updated_at` inversions in 9,905 comparisons; the single writer produced 0 in 671. Both inversions are `u` rows of one `orders` key whose times differ by one clock tick (1 ms), and in both the `source.lsn` order was right. The clock gave every statement its own millisecond, so no tie was possible and both runs show 0 ties. ADR-001 calls an `updated_at` tie or inversion a generator defect, never a case the dbt macro works around, so the generator has to assign the business clock in commit order.
+- `source.sequence` is a stringified JSON array of two integers (last committed LSN, current LSN). In the main run the first element was null on 1 of 21,658 streamed changes (a customers insert); the first element equalled the second on 12,694 changes, was below it on 8,034 and above it on 929, so with concurrent writers the first element is not a lower bound of the second. Compared as the pair (first, second), it rose strictly per key: 0 ties and 0 inversions in 12,700 comparisons.
+- Deletes: under `REPLICA IDENTITY FULL` the `op=d` row's `before.updated_at` is the simulated delete time. All 3,645 deletes paired with exactly one `op=u` row of the same key and transaction whose `after.updated_at` equals it, the `op=d` row has no `after` image, and its `source.lsn` is above its pair's.
+- `ALTER TABLE` columns reach bronze as optional columns (`after.tier`) and Karapace's subject moves to its next version. 443 of the 4,830 customers rows carry a tier value; the others, written before the `ALTER TABLE` or by sessions that do not set the column, read null.
+- The check ran at a 30 transactions per second write rate on a hot set of 200 keys per table, one stack, one run of each kind. The inversion count depends on the 0 to 20 ms wait, the hot set and the rate, and was not tuned.
+
+### Consequences
+
+- ADR-001 item 11: go. The fallback (order by `source.sequence`, parsed as two numbers) was not needed, and it held in the same run anyway.
+- Phase 6 mirrors the verdict into ADR-001's Results table.
+- The `reviews` table is the stand-in for the seeded prompt-injection knob; the Week 3 generator names the real column.
 
 ## Item 12: Throughput
 
