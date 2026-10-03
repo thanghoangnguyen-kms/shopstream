@@ -703,7 +703,9 @@ Research history, from 2026-10-02 and not rerun: installing dbt 2.0.6 and `dbt-m
 
 Recorded 2026-10-03.
 
-The item's verdict follows the exactly-once and write-audit-publish checks recorded below. This part records the streaming stack those checks run on and the connector-secrets proof.
+Verdict: go. Debezium 3.6.3.Final into the Iceberg sink 1.11.0 landed every change exactly once across Connect worker kills, and with the sink committing to the `audit` branch, `main` moved only by fast-forward, a Spark erasure `DELETE` and `rewrite_data_files` committed on `audit` while it was ahead, the next fast-forward succeeded, expiry left no referenced data file holding the erased rows, and both rollback paths replayed from row offsets with no gap or duplicate.
+
+The verdict follows the exactly-once and write-audit-publish checks recorded below. This part records the streaming stack those checks run on and the connector-secrets proof.
 
 ### Streaming stack
 
@@ -851,6 +853,69 @@ The simulated business clock ran from 2026-01-01T00:00:00+00:00 to 2026-01-01T00
 Before the run, the scoped reset: `rm -sf` of `connect`, `karapace`, `kafka-init`, `cdc-init` and the three brokers; removal of the three Kafka volumes; `cdc_check.py reset` (drops `shopstream_dbz` and `cnt_slot`, truncates the five captured tables, drops item 11's `tier` column if present, purges every bronze table through Lakekeeper); `up -d --wait connect`; `cdc_check.py slot-create`; `connect_admin.py register`. Phases 1 to 3's tables, the warehouse and the core Frankfurter were not touched.
 
 Kill command, one per stage, from the host: `uv run --frozen python scripts/connect_kill.py --stage initiated --delay-ms 0 --timeout 240`, then `--stage ready --delay-ms 200`, then `--stage completed --delay-ms 0`. Each record was classified with `cdc_check.py classify` on stdin. Final measurement, with the kill records on stdin: `docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_check.py item5 --kills-stdin --final --timeout 600`.
+
+### Bronze write-audit-publish
+
+The sink was registered with `iceberg.tables.default-commit-branch=audit`, so every bronze table had an `audit` ref and no `main` ref. Spark 4.1 with the Iceberg 1.11.0 runtime, from the spike image, ran every statement against Lakekeeper's `spike` warehouse; DuckDB cannot branch, so only Spark touched refs. Each step is a subcommand of `scripts/bronze_wap.py`, run as `docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T spark-job python /app/bronze_wap.py <step>` (`brnz01-pre`, then `brnz01-chain` reading the first step's JSON on stdin, then `brnz01-after` reading the second's). Between the steps a trickle workload kept the sink committing: `python /app/cdc_workload.py --mode trickle --seconds 60 --rate 5 --seed 31` before the first step, then seeds 32 and 33 before the second and third.
+
+A short list of five synthetic customer keys stood in for Week 5's erasure ledger, which does not exist yet: each customers partition's highest-offset key plus the two oldest. Every check prints counts, never a row.
+
+| Step | Result |
+| ---- | ------ |
+| Refs before the first fast-forward | all five tables: `audit` present (33 to 34 snapshots each), `main` absent |
+| First `fast_forward('<table>', 'main', 'audit')` | `ok` on all five; `main` is created at `audit`'s head |
+| Sink adds commits, `main` not moved | `main`'s snapshot ids equal the first fast-forward's on all five tables, while customers' `audit` advanced past them |
+| Sink stopped (state STOPPED, no tasks) | the whole Spark chain below runs with no sink commit round in flight |
+| Erasure `DELETE` on `audit` | commits an `overwrite` snapshot on `audit`; `main` unchanged |
+| `rewrite_data_files` on `audit` | commits a `replace` snapshot: 37 files rewritten into 1 (611,449 bytes), 0 failed |
+| Set check on `audit` before publishing | 15,245 bronze rows against 15,262 non-null Kafka records; 17 missing, all of them offsets whose decoded Kafka key is in the ledger; 0 extra; 0 duplicate; 0 at or beyond the end |
+| Second fast-forward | `ok` on all five tables |
+| Ledger rows after it | 0 on `main`, 0 on `audit` |
+| Erase repeated | 0 rows removed |
+| Fast-forward repeated with `main` already at `audit`'s head | `ok`, a no-op |
+| `expire_snapshots(older_than => <now UTC>, retain_last => 1)` on customers | 41 data files, 82 manifests and 42 manifest lists deleted; 1 snapshot left |
+| Referenced-file check | every path in `all_data_files` opened through the PyIceberg table's FileIO, which holds vended access only: 1 file, 0 rows holding a ledger key |
+| Sink resumed, then one more trickle | a new sink-written `append` snapshot landed on `audit`; `main`'s ids unchanged |
+
+Statements as run, for customers (the other four tables use the same text with their name):
+
+```text
+DELETE FROM rest.bronze.customers.branch_audit WHERE coalesce(after.customer_id, before.customer_id) IN (<five integer keys>)
+CALL rest.system.rewrite_data_files(table => 'bronze.customers', branch => 'audit', options => map('rewrite-all', 'true', 'min-input-files', '2'))
+CALL rest.system.fast_forward('bronze.customers', 'main', 'audit')
+CALL rest.system.expire_snapshots(table => 'bronze.customers', older_than => TIMESTAMP '<now UTC>', retain_last => 1)
+SELECT file_path FROM rest.bronze.customers.all_data_files
+SELECT count(*) FROM rest.bronze.customers VERSION AS OF 'main' WHERE coalesce(after.customer_id, before.customer_id) IN (<five integer keys>)
+```
+
+The order is the one ADR-001 fixes: the ledger `DELETE` and the rewrite on `audit`, then the fast-forward, then expiry. Expiry keeps every branch head, so expiring before the fast-forward would keep the files `main` still pointed at, with the erased rows in them. Expiry also ran only with the sink stopped, so no commit round was in flight; the surviving head after expiry can be a Spark snapshot with no `kafka.connect.offsets.*` property, and the sink then relies on its `-coord` consumer group's offsets (customers' survivor here was a Spark `overwrite` snapshot, and the sink kept committing). After the sink resumed, its next commit landed on `audit` and `main` stayed put.
+
+The `DELETE` committed as an `overwrite` snapshot that rewrote the affected files, and expiry is what deletes the old ones, because a snapshot keeps every file it references. `remove_orphan_files` was not run: it is not in the go criterion, and the Lakekeeper maintenance queues stay off until ADR-002 names an owner. The fast-forwards were run by hand; no interval was measured.
+
+### Rollback
+
+Both paths follow ADR-001's rule: restore a snapshot, take each source partition's resume offset from that snapshot's rows (one past the highest `_kafka_metadata_offset` among its rows, the log-start offset from `OffsetSpec.earliest()` for a partition with no rows), stop the sink, set the offsets, resume, wait for catch-up, then apply the ledger again. `PATCH /connectors/bronze-sink/offsets` returned 200 on both paths; Connect accepts it only while the connector is STOPPED. The body is built from the sorted partitions, with integers for partition and offset, for example customers' first two partitions on path A:
+
+```text
+{"offsets": [{"partition": {"kafka_topic": "shopstream.public.customers", "kafka_partition": 0}, "offset": {"kafka_offset": 1114}}, {"partition": {"kafka_topic": "shopstream.public.customers", "kafka_partition": 1}, "offset": {"kafka_offset": 1205}}]}
+```
+
+| Measure | Path A: the branch works | Path B: the branch does not work |
+| ------- | ------------------------ | -------------------------------- |
+| Setup | sink on `audit`; the trickle with seed 34 added sink commits on `audit` past `main` | scoped reset, then the sink registered without a commit branch, so bronze is append-only on `main`; item 5's workload (`--seed 7`), the erasure `DELETE` on `main` as snapshot R, then the trickle with seed 35 |
+| Restore step | `ALTER TABLE rest.bronze.<table> CREATE OR REPLACE BRANCH audit AS OF VERSION <main's snapshot id>` on all five | `CALL rest.system.rollback_to_snapshot('bronze.<table>', <snapshot id>)` on all five: R for customers, each other table's head at R's time |
+| Customers' restored snapshot | written by Spark (the chain's overwrite) | written by Spark (R), equal to the setup's R |
+| Other four tables' restored snapshots | written by the sink | written by the sink |
+| PATCH status | 200 | 200 |
+| Ledger rows re-landed before the reapply | 0 | 6 |
+| Ledger rows after the reapply | 0 | 0 |
+| Bronze rows against non-null Kafka records at the end | 15,941 against 15,958 | 1,778 against 1,801 |
+| Missing offsets, all of them the ledger's | 17 | 23 |
+| Extra, duplicate, at or beyond the end | 0, 0, 0 | 0, 0, 0 |
+
+The path A count of 0 is not the "above 0" the replay can show: the trickle ran after the chain added newer rows, so no ledger key held a partition's highest offset at the restore point, and the replay had nothing to re-land. Path B's 6 is the case the ADR describes, where the replay re-lands erased records and the ledger reapply removes them again. Path A also reapplied the ledger on `audit` (the `DELETE`, a rewrite of 2 files into 1, the fast-forward on all five tables and an expiry that deleted 11 data files, the sink stopped around it), and path B reapplied the `DELETE` on `main`.
+
+Path B ran after a scoped reset, not by switching a live sink's branch, so only one sink ever existed on the control topic; `GET /connectors` listed exactly `shopstream-cdc` and `bronze-sink`. The reset was item 5's scoped reset (remove the connect, karapace and Kafka containers and the three Kafka volumes, `cdc_check.py reset`, bring `connect` back up), with the connectors registered by `python /app/connect_admin.py register --no-branch` and no slot-create step. The two path commands were `python /app/bronze_wap.py setup-main` and `python /app/bronze_wap.py rollback-main` reading the setup's JSON on stdin, and path A's was `python /app/bronze_wap.py rollback-branch` reading the chain's JSON. The trickle seeds were 31 to 35 and the item 5 workload's was 7. The registration call for path B stopped on a 404 from Connect's status route in the moments after the PUT, although both connectors then reached RUNNING; that was a defect in the helper's wait, fixed afterwards, and it did not affect the measurement.
 
 ### FALL-02
 
