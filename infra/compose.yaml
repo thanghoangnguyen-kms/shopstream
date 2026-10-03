@@ -27,6 +27,23 @@ x-kafka-env: &kafka-env
   KAFKA_LOG_DIRS: /var/lib/kafka/data
   KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
 
+# The environment every Airflow service shares (the `orchestration` profile). The database password,
+# the Fernet key and the JWT secret come from infra/.env (the JWT secret must be the same value in
+# every component). DAGS_ARE_PAUSED_AT_CREATION is false because a new DAG is paused and asset events
+# then start no runs. SIMPLE_AUTH_MANAGER_ALL_ADMINS makes every user an admin: a spike posture that
+# is safe only because no Airflow service publishes a port. The Kafka connection is a JSON
+# connection in the environment, so no DAG or plugin file holds a broker address.
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?run just up}@postgres:5432/airflow
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?run just up}
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run just up}
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+  AIRFLOW_CONN_KAFKA_DEFAULT: '{"conn_type": "kafka", "extra": {"bootstrap.servers": "kafka-1:19092,kafka-2:19092,kafka-3:19092", "group.id": "airflow-fx-refresh", "auto.offset.reset": "earliest", "enable.auto.commit": false}}'
+
 services:
   postgres:
     <<: *defaults
@@ -638,6 +655,138 @@ services:
       interval: 10s
       timeout: 5s
       retries: 18
+      start_period: 60s
+
+  # The `orchestration` profile (Phase 4, item 6): Airflow 3.3.2 on LocalExecutor, one image built from
+  # infra/airflow/Dockerfile (no image key, so the policy gate checks that file's FROM digest), with
+  # the existing `airflow` database on the core Postgres. It always runs with `streaming`, which owns
+  # the brokers and the fx.refresh topic. No port is published: the evidence is read through the
+  # database and the `airflow` CLI inside the network. Start it by name (`up -d --wait airflow-apiserver
+  # airflow-scheduler airflow-dag-processor airflow-triggerer`), never with `just up`. The DAGs and the
+  # plugins are mounted read-only; the apply function lives in plugins because the triggerer imports it
+  # from there. Memory limits are provisional until Phase 5's item 8 measures under load.
+  #
+  # The one-shot that migrates the airflow database. The four services below wait for it.
+  airflow-init:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    entrypoint: ["airflow", "db", "migrate"]
+    command: []
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 768m
+    memswap_limit: 768m
+
+  airflow-apiserver:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["api-server"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # Provisional 1g: Phase 5 runs item 3's dbt build in this scheduler's LocalExecutor.
+  airflow-scheduler:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["scheduler"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      # `$$HOSTNAME` is the container's own shell variable, not a Compose interpolation.
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["dag-processor"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # Runs the asset watcher's Kafka trigger. It imports the apply function from /opt/airflow/plugins,
+  # so restart it after any edit there.
+  airflow-triggerer:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["triggerer"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
       start_period: 60s
 
 networks:

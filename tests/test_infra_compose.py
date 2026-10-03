@@ -8,6 +8,7 @@ start order, the published ports, the secret mounts and the CDC-ready init.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -53,9 +54,23 @@ SPIKE_LONG_RUNNING = {"frankfurter-offline"}
 SPIKE_IMAGE_SERVICES = {"probe", "spark-job", "fx-load", "cdc-run"}
 FRANKFURTER_SPIKE = {"frankfurter-fx-init", "frankfurter-seed", "frankfurter-offline"}
 STREAMING = {"kafka-1", "kafka-2", "kafka-3", "kafka-init", "karapace", "connect", "cdc-init"}
+ORCHESTRATION = {
+    "airflow-init",
+    "airflow-apiserver",
+    "airflow-scheduler",
+    "airflow-dag-processor",
+    "airflow-triggerer",
+}
 KAFKA_NODES = ("kafka-1", "kafka-2", "kafka-3")
 SPIKE_DOCKERFILE = INFRA / "spike" / "Dockerfile"
 CONNECT_DOCKERFILE = INFRA / "connect" / "Dockerfile"
+AIRFLOW_DOCKERFILE = INFRA / "airflow" / "Dockerfile"
+AIRFLOW_IMAGE_DIGEST = "sha256:e9982ad3f49a60418622e1baf80c34b0daf3fa5091a336cb5ee61f0cdd189371"
+AIRFLOW_MOUNTS = [
+    "../orchestration/dags:/opt/airflow/dags:ro",
+    "../orchestration/plugins:/opt/airflow/plugins:ro",
+]
+AIRFLOW_SECRETS = {"AIRFLOW_DB_PASSWORD", "AIRFLOW_FERNET_KEY", "AIRFLOW_JWT_SECRET"}
 CDC_SQL = (INFRA / "postgres" / "cdc.sql").read_text(encoding="utf-8")
 CREATE_TOPICS = (INFRA / "kafka" / "create-topics.sh").read_text(encoding="utf-8")
 SINK_COMMIT = "6976e020b894f6a6777704df2b8c4458cb291ae9"
@@ -106,14 +121,15 @@ def test_the_project_is_named_and_uses_no_deploy_block() -> None:
     assert not [name for name, service in SERVICES.items() if "deploy" in service]
 
 
-def test_only_the_four_profiles_hold_services_and_the_sets_are_exact() -> None:
+def test_only_the_five_profiles_hold_services_and_the_sets_are_exact() -> None:
     used = {profile for service in SERVICES.values() for profile in service.get("profiles", [])}
-    assert used == {"core", "bootstrap", "spike", "streaming"}
-    assert set(SERVICES) == CORE | BOOTSTRAP | SPIKE | STREAMING
+    assert used == {"core", "bootstrap", "spike", "streaming", "orchestration"}
+    assert set(SERVICES) == CORE | BOOTSTRAP | SPIKE | STREAMING | ORCHESTRATION
     assert profile_services("core") == CORE
     assert profile_services("bootstrap") == BOOTSTRAP
     assert profile_services("spike") == SPIKE
     assert profile_services("streaming") == STREAMING
+    assert profile_services("orchestration") == ORCHESTRATION
     assert all(len(service["profiles"]) == 1 for service in SERVICES.values())
 
 
@@ -172,7 +188,7 @@ def test_the_one_shots_are_the_bootstrap_and_spike_profiles_and_the_completed_de
         BOOTSTRAP
         | (SPIKE - SPIKE_LONG_RUNNING)
         | {"lakekeeper-migrate", "frankfurter-init", "frankfurter-fx-init"}
-        | {"kafka-init", "cdc-init"}
+        | {"kafka-init", "cdc-init", "airflow-init"}
     )
 
 
@@ -189,6 +205,11 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
 
 
 # --- start order ------------------------------------------------------------------------------
+
+AIRFLOW_LONG_RUNNING_ORDER = {
+    "airflow-init": "service_completed_successfully",
+    "postgres": "service_healthy",
+}
 
 
 @pytest.mark.parametrize(
@@ -243,6 +264,11 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
                 "seaweedfs": "service_healthy",
             },
         ),
+        ("airflow-init", {"postgres": "service_healthy"}),
+        ("airflow-apiserver", AIRFLOW_LONG_RUNNING_ORDER),
+        ("airflow-scheduler", AIRFLOW_LONG_RUNNING_ORDER),
+        ("airflow-dag-processor", AIRFLOW_LONG_RUNNING_ORDER),
+        ("airflow-triggerer", AIRFLOW_LONG_RUNNING_ORDER),
     ],
 )
 def test_start_order_is_enforced_by_depends_on_conditions(
@@ -738,7 +764,113 @@ def test_create_topics_makes_every_topic_idempotently_at_replication_factor_thre
         assert f"create shopstream.public.{table} 3 cleanup.policy=delete" in CREATE_TOPICS
 
 
-def test_the_long_running_services_of_core_and_streaming_fit_the_vm_budget() -> None:
-    long_running = (CORE | STREAMING) - one_shots()
+def test_the_long_running_services_of_core_streaming_and_orchestration_fit_the_vm_budget() -> None:
+    # Provisional until Phase 5's item 8 measures under load.
+    long_running = (CORE | STREAMING | ORCHESTRATION) - one_shots()
     total = sum(memory_bytes(SERVICES[name]["mem_limit"]) for name in long_running)
     assert total <= LONG_RUNNING_BUDGET
+
+
+# --- the orchestration profile ----------------------------------------------------------------
+
+
+def interpolated(name: str) -> set[str]:
+    """The `${NAME` variables in the values of a service's environment."""
+    environment: dict[str, str] = SERVICES[name]["environment"]
+    return {
+        variable
+        for value in environment.values()
+        for variable in re.findall(r"\$\{(\w+)", str(value))
+    }
+
+
+def test_no_orchestration_service_publishes_a_port() -> None:
+    for name in sorted(ORCHESTRATION):
+        assert "ports" not in SERVICES[name], name
+
+
+@pytest.mark.parametrize("name", sorted(ORCHESTRATION))
+def test_each_airflow_service_is_built_from_the_airflow_dockerfile(name: str) -> None:
+    service = SERVICES[name]
+    assert "image" not in service
+    assert service["build"] == {"context": "..", "dockerfile": "infra/airflow/Dockerfile"}
+
+
+@pytest.mark.parametrize("name", sorted(ORCHESTRATION))
+def test_each_airflow_service_mounts_exactly_the_two_read_only_orchestration_paths(
+    name: str,
+) -> None:
+    assert SERVICES[name]["volumes"] == AIRFLOW_MOUNTS
+
+
+@pytest.mark.parametrize("name", sorted(ORCHESTRATION))
+def test_each_airflow_service_reads_only_the_three_airflow_secrets(name: str) -> None:
+    assert interpolated(name) == AIRFLOW_SECRETS
+
+
+@pytest.mark.parametrize("name", sorted(ORCHESTRATION))
+def test_each_airflow_service_runs_unpaused_on_the_local_executor(name: str) -> None:
+    environment = SERVICES[name]["environment"]
+    assert environment["AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION"] == "false"
+    assert environment["AIRFLOW__CORE__EXECUTOR"] == "LocalExecutor"
+    assert environment["AIRFLOW__CORE__LOAD_EXAMPLES"] == "false"
+
+
+def test_the_kafka_connection_comes_from_the_environment_and_reads_the_topic_from_the_start() -> (
+    None
+):
+    raw = SERVICES["airflow-triggerer"]["environment"]["AIRFLOW_CONN_KAFKA_DEFAULT"]
+    connection = json.loads(raw)
+    assert connection["conn_type"] == "kafka"
+    extra = connection["extra"]
+    assert extra["bootstrap.servers"] == "kafka-1:19092,kafka-2:19092,kafka-3:19092"
+    assert extra["group.id"] == "airflow-fx-refresh"
+    assert extra["auto.offset.reset"] == "earliest"
+    assert extra["enable.auto.commit"] is False
+
+
+def test_airflow_init_migrates_the_database_and_the_other_four_run_one_command_each() -> None:
+    assert SERVICES["airflow-init"]["entrypoint"] == ["airflow", "db", "migrate"]
+    assert SERVICES["airflow-init"]["command"] == []
+    commands = {
+        name: SERVICES[name]["command"] for name in sorted(ORCHESTRATION - {"airflow-init"})
+    }
+    assert commands == {
+        "airflow-apiserver": ["api-server"],
+        "airflow-scheduler": ["scheduler"],
+        "airflow-dag-processor": ["dag-processor"],
+        "airflow-triggerer": ["triggerer"],
+    }
+
+
+def test_the_airflow_jobs_are_probed_by_hostname_with_the_container_shell_variable() -> None:
+    for name, job in (
+        ("airflow-scheduler", "SchedulerJob"),
+        ("airflow-dag-processor", "DagProcessorJob"),
+        ("airflow-triggerer", "TriggererJob"),
+    ):
+        test = SERVICES[name]["healthcheck"]["test"]
+        assert test[0] == "CMD-SHELL"
+        assert f"--job-type {job}" in test[1]
+        assert '--hostname "$$HOSTNAME"' in test[1]
+
+
+def test_the_airflow_dockerfile_pins_the_base_by_digest_and_installs_the_three_pins() -> None:
+    lines = dockerfile_lines(AIRFLOW_DOCKERFILE)
+    froms = [line for line in lines if line.startswith("FROM ")]
+    assert len(froms) == 1
+    assert froms[0].endswith(f"@{AIRFLOW_IMAGE_DIGEST}")
+    assert ":3.3.2-python3.13" in froms[0]
+    assert not [line for line in lines if line.startswith(("ADD ", "COPY ", "ENV "))]
+    runs = [line for line in lines if line.startswith("RUN ")]
+    assert len(runs) == 1
+    pins = re.findall(r'"(apache-airflow[\w-]*==[\w.]+)"', runs[0])
+    assert pins == [
+        "apache-airflow==3.3.2",
+        "apache-airflow-providers-apache-kafka==2.0.0",
+        "apache-airflow-providers-common-messaging==2.1.0",
+    ]
+    assert (
+        "--constraint "
+        '"https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.13.txt"'
+    ) in runs[0]
