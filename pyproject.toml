@@ -87,6 +87,8 @@ ignore = ["E501"]
 "scripts/connect_kill.py" = ["S603", "S607"]
 # Spark scratch on the container's /tmp tmpfs (S108); SQL built from constant table names and integer keys through identifier() (S608).
 "scripts/bronze_wap.py" = ["S108", "S608"]
+# The test_decoding peek uses a constant slot name and a pg_lsn bind value; SQL text is built from constants only (S608).
+"scripts/clock_check.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.13"
