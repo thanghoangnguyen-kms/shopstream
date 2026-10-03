@@ -247,7 +247,7 @@ def test_islands_from_rows_groups_by_partition_and_sorts() -> None:
 def test_islands_from_rows_refuses_an_empty_or_inverted_island_and_a_non_integer() -> None:
     for bad in [(0, 3, 3), (0, 5, 2), (0, "1", 2), (0.5, 1, 2), (0, 1)]:
         with pytest.raises(ValueError, match="island"):
-            tc.islands_from_rows([bad])  # type: ignore[list-item]
+            tc.islands_from_rows([bad])
 
 
 # --- parse_log_dirs -----------------------------------------------------------------------------
