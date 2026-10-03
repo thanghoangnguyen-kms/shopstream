@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
+import secrets
+import sys
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from email.message import Message
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import connect_admin as ca
@@ -370,3 +374,122 @@ def test_a_network_error_fails_without_a_traceback(
     monkeypatch.setattr(ca, "http_request", down)
     assert ca.main(["register"]) == 1
     assert "ConnectionRefusedError" in capsys.readouterr().err
+
+
+# --- PLAT-08: placeholders and plaintext occurrences ---------------------------------------------
+
+
+def test_a_placeholder_is_found_and_listed_once() -> None:
+    value = secrets.token_hex(16)
+    text = (
+        '{"a": "${env:CDC_DB_PASSWORD}", "b": "${env:CDC_DB_PASSWORD}", "c": "${env:OTHER_NAME}"}'
+    )
+    report = ca.placeholder_report(text, value)
+    assert report["placeholders"] == ["${env:CDC_DB_PASSWORD}", "${env:OTHER_NAME}"]
+    assert report["plaintext_secret_occurrences"] == 0
+
+
+def test_the_raw_and_the_json_escaped_secret_are_both_counted() -> None:
+    value = 'p"a\\ss-' + secrets.token_hex(8)
+    escaped = json.dumps(value)[1:-1]
+    assert escaped != value
+    text = f"raw {value} and json {escaped} and again {escaped}"
+    assert ca.placeholder_report(text, value)["plaintext_secret_occurrences"] == 3
+
+
+def test_a_secret_with_no_escape_form_is_not_counted_twice() -> None:
+    value = secrets.token_hex(16)
+    assert ca.placeholder_report(f"x {value} y", value)["plaintext_secret_occurrences"] == 1
+
+
+def test_a_short_secret_is_refused_without_naming_it() -> None:
+    short = secrets.token_hex(8)[: ca.MIN_SECRET_CHARS - 1]
+    assert len(short) == ca.MIN_SECRET_CHARS - 1
+    with pytest.raises(ValueError, match="too short") as info:
+        ca.placeholder_report(f"text {short}", short)
+    assert short not in str(info.value)
+    ca.placeholder_report("text", short.ljust(ca.MIN_SECRET_CHARS, "x"))
+
+
+def test_read_secret_prefers_the_environment_and_falls_back_to_the_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from_file = secrets.token_hex(8)
+    from_env = secrets.token_hex(8)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"CDC_DB_PASSWORD={from_file}\n", encoding="utf-8")
+    monkeypatch.setattr(ca, "DEFAULT_ENV_FILE", env_file)
+    monkeypatch.delenv("CDC_DB_PASSWORD", raising=False)
+    assert ca.read_secret("CDC_DB_PASSWORD") == from_file
+    monkeypatch.setenv("CDC_DB_PASSWORD", from_env)
+    assert ca.read_secret("CDC_DB_PASSWORD") == from_env
+
+
+def test_read_secret_names_the_key_and_never_a_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    other = secrets.token_hex(8)
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"SOMETHING_ELSE={other}\nCDC_DB_PASSWORD=\n", encoding="utf-8")
+    monkeypatch.setattr(ca, "DEFAULT_ENV_FILE", env_file)
+    monkeypatch.delenv("CDC_DB_PASSWORD", raising=False)
+    with pytest.raises(ValueError, match="CDC_DB_PASSWORD") as info:
+        ca.read_secret("CDC_DB_PASSWORD")
+    assert other not in str(info.value)
+    monkeypatch.setattr(ca, "DEFAULT_ENV_FILE", tmp_path / "missing.env")
+    with pytest.raises(ValueError, match="CDC_DB_PASSWORD"):
+        ca.read_secret("CDC_DB_PASSWORD")
+
+
+def feed(monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(data)))
+
+
+def test_the_placeholders_command_prints_one_json_line_without_the_secret(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    value = secrets.token_hex(16)
+    monkeypatch.setenv("CDC_DB_PASSWORD", value)
+    feed(monkeypatch, b'{"database.password": "${env:CDC_DB_PASSWORD}"}\n')
+    assert ca.main(["placeholders", "--key", "CDC_DB_PASSWORD", "--source", "rest-config"]) == 0
+    out = capsys.readouterr().out
+    assert value not in out
+    assert json.loads(out) == {
+        "source": "rest-config",
+        "placeholders": ["${env:CDC_DB_PASSWORD}"],
+        "plaintext_secret_occurrences": 0,
+    }
+
+
+def test_the_placeholders_command_counts_a_leak_and_decodes_bad_bytes_with_replacement(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    value = secrets.token_hex(16)
+    monkeypatch.setenv("CDC_DB_PASSWORD", value)
+    feed(monkeypatch, b"\xff\xfe log line " + value.encode() + b" \x80 tail\n")
+    assert ca.main(["placeholders", "--key", "CDC_DB_PASSWORD", "--source", "worker-log"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["plaintext_secret_occurrences"] == 1
+    assert report["source"] == "worker-log"
+
+
+def test_the_placeholders_command_refuses_a_short_secret_and_prints_no_value(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    short = "abc1234"
+    monkeypatch.setenv("CDC_DB_PASSWORD", short)
+    feed(monkeypatch, b"text")
+    assert ca.main(["placeholders", "--key", "CDC_DB_PASSWORD", "--source", "x"]) == 1
+    captured = capsys.readouterr()
+    assert short not in captured.out + captured.err
+    assert "too short" in captured.err
+
+
+def test_show_config_prints_the_connector_json_for_piping(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert ca.main(["show-config", "source"]) == 0
+    assert json.loads(capsys.readouterr().out) == ca.debezium_config()
+    assert ca.main(["show-config", "sink"]) == 0
+    assert json.loads(capsys.readouterr().out) == ca.sink_config()
+    assert ca.main(["show-config", "other"]) == 2

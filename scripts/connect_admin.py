@@ -12,14 +12,22 @@ Registration is deliberately not part of `just up` (research A8; PLAT-04 is Phas
 without a network: the config builders, `check_url`, `state_of` and the polling loop (through an
 injected `http_request`). The only network calls go through the origin-allowlisted `http_request`.
 
+PLAT-08's proof is `placeholders`: a capture from one of six sources is piped into it on the host and
+it counts the env-provider placeholders and the real secret's plaintext occurrences (raw and
+JSON-escaped), printing counts and never a value.
+
 CLI: `register` prints one JSON line `{"connectors": {name: state}, "plugins": {class: version}}`;
-`status` prints the connectors' states. Exit 0 on success, 1 on a failed connector or an error, 2 on
-usage.
+`status` prints the connectors' states; `placeholders --key NAME --source LABEL` reads a capture on
+stdin; `show-config source|sink` prints a connector config for piping. Exit 0 on success, 1 on a failed
+connector or an error, 2 on usage.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import re
 import sys
 import time
 import urllib.error
@@ -28,6 +36,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+import dotenv_lite
 from read_v3 import error_text, scrub_values
 
 CONNECT_URL = "http://connect:8083"
@@ -44,6 +53,11 @@ RUNNING = "RUNNING"
 JSON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 POLL_INTERVAL_S = 2.0
 ERROR_LIMIT = 200
+# Kafka's EnvVarConfigProvider reference, as it appears in a connector config.
+PLACEHOLDER = re.compile(r"\$\{env:[A-Za-z_][A-Za-z0-9_]*\}")
+# A shorter secret is refused: counting a common string would prove nothing.
+MIN_SECRET_CHARS = 8
+DEFAULT_ENV_FILE = dotenv_lite.DEFAULT_ENV_FILE
 
 
 def check_url(url: str) -> None:
@@ -275,21 +289,79 @@ def _report() -> dict[str, str]:
     return {name: state_of(connector_status(name)) for name in (SOURCE_NAME, SINK_NAME)}
 
 
+def placeholder_report(text: str, secret: str) -> dict[str, Any]:
+    """Count the env placeholders in `text` and the plaintext occurrences of `secret`.
+
+    `plaintext_secret_occurrences` is the raw count plus the count of the secret's JSON-escaped form
+    when that differs, so a copy escaped inside a JSON string cannot hide. A secret under
+    MIN_SECRET_CHARS raises ValueError (its message never holds the secret).
+    """
+    if len(secret) < MIN_SECRET_CHARS:
+        raise ValueError("secret too short to count")
+    escaped = json.dumps(secret)[1:-1]
+    occurrences = text.count(secret)
+    if escaped != secret:
+        occurrences += text.count(escaped)
+    return {
+        "placeholders": sorted(set(PLACEHOLDER.findall(text))),
+        "plaintext_secret_occurrences": occurrences,
+    }
+
+
+def read_secret(key: str) -> str:
+    """The value of `key` from the environment, else from infra/.env. Errors name the key only."""
+    value = os.environ.get(key)
+    if value:
+        return value
+    values = dotenv_lite.read_dotenv(DEFAULT_ENV_FILE)
+    if values is not None and values.get(key):
+        return values[key]
+    raise ValueError(f"{key} is not set in the environment or in infra/.env")
+
+
+def show_config(kind: str) -> None:
+    """Print the Debezium or the sink config as JSON, for piping into `placeholders`."""
+    configs = {"source": debezium_config, "sink": sink_config}
+    if kind not in configs:
+        raise ValueError("kind must be source or sink")
+    print(json.dumps(configs[kind](), sort_keys=True, indent=2), flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Register and inspect the CDC connectors.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("register", help="put both connectors and wait until they run")
+    commands.add_parser("status", help="print both connectors' states")
+    counted = commands.add_parser("placeholders", help="count placeholders and plaintext on stdin")
+    counted.add_argument("--key", required=True, help="name of the secret's environment variable")
+    counted.add_argument("--source", required=True, help="label of the capture")
+    shown = commands.add_parser("show-config", help="print a connector config as JSON")
+    shown.add_argument("kind", choices=("source", "sink"))
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    if args not in (["register"], ["status"]):
-        print("usage: connect_admin.py register | status", file=sys.stderr)
-        return 2
     try:
-        if args == ["register"]:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code not in (0, None) else 0
+    try:
+        if args.command == "register":
             print(json.dumps(register(), sort_keys=True), flush=True)
-            return 0
-        states = _report()
-        print(json.dumps({"connectors": states}, sort_keys=True), flush=True)
-        return 0 if all(state == RUNNING for state in states.values()) else 1
+        elif args.command == "status":
+            states = _report()
+            print(json.dumps({"connectors": states}, sort_keys=True), flush=True)
+            return 0 if all(state == RUNNING for state in states.values()) else 1
+        elif args.command == "placeholders":
+            text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+            report = placeholder_report(text, read_secret(args.key))
+            print(json.dumps({"source": args.source, **report}, sort_keys=True), flush=True)
+        else:
+            show_config(args.kind)
     except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
         print(f"error: {error_text(exc)}", file=sys.stderr)
         return 1
+    return 0
 
 
 if __name__ == "__main__":
