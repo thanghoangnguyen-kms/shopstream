@@ -263,3 +263,190 @@ def test_last_json_object_skips_log_noise_and_bad_lines() -> None:
 def test_the_ledger_table_and_branches_are_fixed() -> None:
     assert bw.LEDGER_TABLE == "customers"
     assert bw.BRANCHES == ("audit", "main")
+
+
+# --- replay_pending ---------------------------------------------------------------------------
+
+
+def test_replay_pending_counts_kafka_offsets_at_or_past_the_resume_offset_that_bronze_lacks() -> (
+    None
+):
+    kafka = {(CUSTOMERS, 0, n) for n in range(10)} | {(CUSTOMERS, 1, n) for n in range(4)}
+    resume = {(CUSTOMERS, 0): 6, (CUSTOMERS, 1): 2}
+    bronze = {(CUSTOMERS, 0, n) for n in range(8)} | {(CUSTOMERS, 1, 0), (CUSTOMERS, 1, 1)}
+    # partition 0 still lacks 8 and 9; partition 1 lacks 2 and 3
+    assert bw.replay_pending(kafka, bronze, resume) == 4
+    assert bw.replay_pending(kafka, kafka, resume) == 0
+
+
+def test_replay_pending_ignores_offsets_below_the_resume_offset_and_unlisted_partitions() -> None:
+    kafka = {(CUSTOMERS, 0, 0), (CUSTOMERS, 0, 7), (CUSTOMERS, 2, 5)}
+    assert bw.replay_pending(kafka, set(), {(CUSTOMERS, 0): 5}) == 1
+
+
+# --- brnz_verdict -----------------------------------------------------------------------------
+
+TABLES = ("customers", "products", "orders", "order_items", "reviews")
+GOOD_SET = {
+    "missing": 17,
+    "missing_allowed": 17,
+    "extra": 0,
+    "duplicate_offsets": 0,
+    "kafka_nonnull": 100,
+}
+
+
+def good_path(path: str) -> dict[str, Any]:
+    return {
+        "path": path,
+        "restored": {
+            "customers": {"snapshot_id": 11, "written_by": "spark"},
+            "orders": {"snapshot_id": 12, "written_by": "sink"},
+        },
+        "resume_offsets": {"shopstream.public.customers:0": 42},
+        "patch_status": 200,
+        "relanded_before_reapply": 3,
+        "rows_after_reapply": 0,
+        "set_check": dict(GOOD_SET),
+    }
+
+
+def good_steps() -> dict[str, dict[str, Any]]:
+    return {
+        "pre": {
+            "refs_before": {t: {"main": None, "audit": 5, "snapshots": 3} for t in TABLES},
+            "ledger": [2, 9, 100],
+            "ff1": dict.fromkeys(TABLES, "ok"),
+            "main_ids": {t: 5 for t in TABLES},
+        },
+        "chain": {
+            "main_unchanged_before_ff2": True,
+            "audit_advanced": True,
+            "audit_ops_added": ["overwrite", "replace"],
+            "rewrite": {"rewritten_data_files_count": 37, "added_data_files_count": 1},
+            "set_check": dict(GOOD_SET),
+            "ff2": dict.fromkeys(TABLES, "ok"),
+            "rows_main": 0,
+            "rows_audit": 0,
+            "repeat_erase_rows": 0,
+            "repeat_ff": "ok",
+            "files_check": {"files": 1, "rows_matching": 0},
+            "resumed": True,
+        },
+        "after": {"sink_commit_after_expiry": True, "main_unchanged": True},
+        "path_a": good_path("branch"),
+        "path_b": good_path("main"),
+    }
+
+
+def verdict(steps: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+    return bw.brnz_verdict(steps)
+
+
+def test_a_complete_step_set_is_go() -> None:
+    result = verdict(good_steps())  # type: ignore[arg-type]
+    assert result["verdict"] == "go"
+    assert result["fallback"] is None
+    assert result["reasons"]
+
+
+def test_main_present_before_the_first_fast_forward_is_the_no_branch_commit_fallback() -> None:
+    steps = good_steps()
+    steps["pre"]["refs_before"]["orders"]["main"] = 9
+    result = verdict(steps)  # type: ignore[arg-type]
+    assert (result["verdict"], result["fallback"]) == ("fallback", "no branch commit")
+
+
+def test_a_table_the_sink_never_gave_an_audit_ref_is_the_no_branch_commit_fallback() -> None:
+    steps = good_steps()
+    steps["pre"]["refs_before"]["products"]["audit"] = None
+    result = verdict(steps)  # type: ignore[arg-type]
+    assert (result["verdict"], result["fallback"]) == ("fallback", "no branch commit")
+
+
+def test_main_moving_during_the_chain_or_after_it_is_the_no_branch_commit_fallback() -> None:
+    during = good_steps()
+    during["chain"]["main_unchanged_before_ff2"] = False
+    after = good_steps()
+    after["after"]["main_unchanged"] = False
+    for steps in (during, after):
+        result = verdict(steps)  # type: ignore[arg-type]
+        assert (result["verdict"], result["fallback"]) == ("fallback", "no branch commit")
+
+
+@pytest.mark.parametrize("path", ["path_a", "path_b"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"set_check": {**GOOD_SET, "missing": 18}},
+        {"set_check": {**GOOD_SET, "duplicate_offsets": 1}},
+        {"set_check": {**GOOD_SET, "extra": 2}},
+        {"rows_after_reapply": 3},
+        {"patch_status": 400},
+        {"relanded_before_reapply": None},
+    ],
+)
+def test_a_rollback_gap_duplicate_extra_or_surviving_ledger_rows_is_inconclusive(
+    path: str, change: dict[str, Any]
+) -> None:
+    steps = good_steps()
+    steps[path].update(change)
+    result = verdict(steps)  # type: ignore[arg-type]
+    assert result["verdict"] == "inconclusive"
+    assert result["fallback"] is None
+    assert any(path in reason for reason in result["reasons"])
+
+
+def test_a_rollback_with_no_spark_written_restored_snapshot_is_inconclusive() -> None:
+    steps = good_steps()
+    steps["path_b"]["restored"] = {"customers": {"snapshot_id": 1, "written_by": "sink"}}
+    result = verdict(steps)  # type: ignore[arg-type]
+    assert result["verdict"] == "inconclusive"
+    assert any("Spark" in reason for reason in result["reasons"])
+
+
+@pytest.mark.parametrize(
+    ("step", "change"),
+    [
+        ("pre", {"ff1": {**dict.fromkeys(TABLES, "ok"), "orders": "ValueError: not an ancestor"}}),
+        ("pre", {"ledger": [1, 2]}),
+        ("chain", {"audit_advanced": False}),
+        ("chain", {"audit_ops_added": ["append", "replace"]}),
+        ("chain", {"audit_ops_added": ["delete"]}),
+        ("chain", {"rewrite": {"rewritten_data_files_count": 1}}),
+        ("chain", {"set_check": {**GOOD_SET, "missing": 18}}),
+        ("chain", {"ff2": {**dict.fromkeys(TABLES, "ok"), "reviews": "boom"}}),
+        ("chain", {"rows_main": 1}),
+        ("chain", {"rows_audit": 2}),
+        ("chain", {"repeat_erase_rows": 1}),
+        ("chain", {"repeat_ff": "boom"}),
+        ("chain", {"files_check": {"files": 1, "rows_matching": 4}}),
+        ("chain", {"files_check": {"files": 0, "rows_matching": 0}}),
+        ("chain", {"resumed": False}),
+        ("after", {"sink_commit_after_expiry": False}),
+    ],
+)
+def test_each_wap_condition_that_fails_makes_the_verdict_inconclusive(
+    step: str, change: dict[str, Any]
+) -> None:
+    steps = good_steps()
+    steps[step].update(change)
+    result = verdict(steps)  # type: ignore[arg-type]
+    assert result["verdict"] == "inconclusive"
+    assert result["reasons"]
+
+
+def test_a_missing_step_report_is_inconclusive_and_named() -> None:
+    steps: dict[str, dict[str, Any] | None] = dict(good_steps())
+    steps["path_b"] = None
+    result = verdict(steps)
+    assert result["verdict"] == "inconclusive"
+    assert any("path_b" in reason for reason in result["reasons"])
+
+
+def test_the_verdict_never_echoes_a_ledger_key() -> None:
+    steps = good_steps()
+    steps["pre"]["ledger"] = [2, 9, 7654321]
+    steps["path_a"]["rows_after_reapply"] = 3
+    result = verdict(steps)  # type: ignore[arg-type]
+    assert "7654321" not in " ".join(result["reasons"])

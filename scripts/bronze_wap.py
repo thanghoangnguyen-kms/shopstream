@@ -7,8 +7,8 @@ criterion 5's second half and for the two rollback paths (Bronze rollback).
 
 The pure parts are unit-tested: the SQL builders (`qualified`, `pk_predicate`, `erase_sql`,
 `rewrite_sql`, `fast_forward_sql`, `expire_sql`, `replace_branch_sql`, `rollback_sql`,
-`count_keys_sql`), `resume_offsets`, `pick_ledger`, `lineage_ops`, `written_by`, `guard_expire` and
-`brnz_verdict`. The live steps need a running stack and have no unit tests (ADR-001 Evidence rules).
+`count_keys_sql`), `resume_offsets`, `replay_pending`, `pick_ledger`, `lineage_ops`, `written_by`,
+`guard_expire` and `brnz_verdict`. The live steps need a running stack and have no unit tests (ADR-001 Evidence rules).
 Heavy imports (pyspark, pyiceberg, pyarrow, confluent_kafka) sit inside functions, so importing this
 module in CI is safe, and `verdict FILE...` runs on the host with no Spark.
 
@@ -17,6 +17,11 @@ integer customer keys that stands in for Week 5's ledger. Nothing here prints a 
 address: every check prints counts, snapshot ids, operations and integer keys. Every table name
 passes `read_v3.identifier` and `connect_admin.TABLES`, every key passes `int()`, and a branch comes
 only from BRANCHES, so the SQL is built from constants.
+
+Subcommands: `brnz01-pre`, `brnz01-chain` and `brnz01-after` run write-audit-publish (BRNZ-01);
+`rollback-branch` is rollback path A (the branch works: recreate audit at main's head); `setup-main`
+and `rollback-main` are path B (the branch doesn't work: a sink registered without a commit branch,
+`rollback_to_snapshot` on an append-only main); `verdict FILE...` judges the saved reports.
 
 The order is fixed by ADR-001: the erasure DELETE and the rewrite on `audit`, then the fast-forward,
 then `expire_snapshots`. Expiry keeps every branch head, so running it before the fast-forward would
@@ -30,7 +35,7 @@ import argparse
 import json
 import sys
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -48,6 +53,7 @@ CATCH_UP_TIMEOUT_S = 300.0
 CATCH_UP_INTERVAL_S = 10.0
 AFTER_TIMEOUT_S = 240.0
 ERASING_OPERATIONS = ("delete", "overwrite")
+STEP_NAMES = ("pre", "chain", "after", "path_a", "path_b")
 
 
 # --- pure SQL builders ------------------------------------------------------------------------
@@ -265,12 +271,158 @@ def ledger_of(report: Mapping[str, Any]) -> list[int]:
     return [int(key) for key in keys]
 
 
+def replay_pending(
+    kafka: Collection[cdc_check.Offset],
+    bronze: Collection[cdc_check.Offset],
+    resume: Mapping[tuple[str, int], int],
+) -> int:
+    """How many Kafka offsets at or past a partition's resume offset bronze does not hold yet.
+
+    Offsets below the resume offset were never replayed (an erased row stays erased there), so they
+    do not count; a partition with no resume offset is not part of the replay.
+    """
+    held = set(bronze)
+    return sum(
+        1
+        for topic, partition, offset in kafka
+        if (topic, partition) in resume
+        and offset >= resume[(topic, partition)]
+        and (topic, partition, offset) not in held
+    )
+
+
+GOOD_PATHS = {"path_a": "branch", "path_b": "main"}
+
+
+def set_problems(label: str, check: Mapping[str, Any] | None) -> list[str]:
+    """Why a set check is not exact: a gap beyond the ledger's offsets, an extra row or a duplicate."""
+    if not isinstance(check, Mapping) or any(
+        key not in check for key in ("missing", "missing_allowed", "extra", "duplicate_offsets")
+    ):
+        return [f"{label}: the set check is absent"]
+    found: list[str] = []
+    gap = int(check["missing"]) - int(check["missing_allowed"])
+    if gap:
+        found.append(f"{label}: {gap} Kafka offset(s) are missing from bronze beyond the ledger's")
+    if check["extra"]:
+        found.append(f"{label}: {check['extra']} bronze offset(s) are not in the Kafka set")
+    if check["duplicate_offsets"]:
+        found.append(f"{label}: {check['duplicate_offsets']} offset(s) appear more than once")
+    return found
+
+
+def pre_problems(pre: Mapping[str, Any]) -> list[str]:
+    found: list[str] = []
+    refs = pre.get("refs_before") or {}
+    if sorted(refs) != sorted(connect_admin.TABLES):
+        found.append("pre: refs_before does not cover the five bronze tables")
+    failed = sorted(table for table, outcome in (pre.get("ff1") or {}).items() if outcome != "ok")
+    if failed or not pre.get("ff1"):
+        found.append(f"pre: the first fast-forward failed on {', '.join(failed) or 'every table'}")
+    if len(pre.get("ledger") or []) < 3:
+        found.append("pre: the ledger holds fewer than three keys")
+    return found
+
+
+def chain_problems(chain: Mapping[str, Any]) -> list[str]:
+    found: list[str] = []
+    if chain.get("audit_advanced") is not True:
+        found.append("chain: audit had not advanced past main before the erasure")
+    ops = list(chain.get("audit_ops_added") or [])
+    if not ops or ops[0] not in ERASING_OPERATIONS or ops[-1] != "replace":
+        found.append(f"chain: audit's new snapshots were {ops}, not an erasure then a replace")
+    rewritten = int((chain.get("rewrite") or {}).get("rewritten_data_files_count") or 0)
+    if rewritten < 2:
+        found.append(f"chain: the rewrite touched {rewritten} file(s), fewer than two")
+    found += set_problems("chain", chain.get("set_check"))
+    failed = sorted(table for table, outcome in (chain.get("ff2") or {}).items() if outcome != "ok")
+    if failed or not chain.get("ff2"):
+        found.append(
+            f"chain: the second fast-forward failed on {', '.join(failed) or 'every table'}"
+        )
+    for field in ("rows_main", "rows_audit", "repeat_erase_rows"):
+        if chain.get(field) != 0:
+            found.append(f"chain: {field} is {chain.get(field)}, expected 0")
+    if chain.get("repeat_ff") != "ok":
+        found.append("chain: the repeated fast-forward was not a no-op")
+    files = chain.get("files_check") or {}
+    if int(files.get("files") or 0) < 1 or files.get("rows_matching") != 0:
+        found.append("chain: a referenced data file still holds a ledger key, or none was opened")
+    if chain.get("resumed") is not True:
+        found.append("chain: the sink did not resume")
+    return found
+
+
+def path_problems(label: str, expected: str, report: Mapping[str, Any]) -> list[str]:
+    found: list[str] = []
+    if report.get("path") != expected:
+        found.append(f"{label}: the report is for path {report.get('path')!r}, not {expected!r}")
+    if report.get("patch_status") != 200:
+        found.append(f"{label}: the offsets PATCH returned {report.get('patch_status')}")
+    restored = (report.get("restored") or {}).values()
+    if not any(entry.get("written_by") == "spark" for entry in restored):
+        found.append(f"{label}: no restored snapshot was written by Spark")
+    if not isinstance(report.get("relanded_before_reapply"), int):
+        found.append(f"{label}: the re-landed ledger rows were not counted")
+    if report.get("rows_after_reapply") != 0:
+        found.append(
+            f"{label}: {report.get('rows_after_reapply')} ledger row(s) survive the reapply"
+        )
+    found += set_problems(label, report.get("set_check"))
+    return found
+
+
 def brnz_verdict(steps: Mapping[str, Mapping[str, Any] | None]) -> dict[str, Any]:
     """Item 5's write-audit-publish verdict: go, fallback ("no branch commit") or inconclusive.
 
-    Tracer version: the rollback steps are judged by Task 2's rule.
+    `steps` holds the saved reports named in STEP_NAMES (pre, chain, after, path_a, path_b).
+    Fallback ("no branch commit", ADR-001's bronze-without-WAP route) when the sink never created an
+    audit branch, or main existed before the first fast-forward or moved without one. Go only when
+    every condition of go criterion 5's second half holds: the first fast-forward, an erasure and a
+    replace on audit, an exact set check, the second fast-forward, 0 ledger rows on both refs and in
+    every referenced file, no-op repeats, a sink commit after expiry, and on both rollback paths
+    an accepted PATCH, a Spark-written restored snapshot, counted re-landed rows, 0 after the
+    reapply and an exact final set check. Anything else is inconclusive with its reasons: a rollback
+    gap, duplicate or surviving erased row has no named fallback.
     """
-    return {"verdict": "inconclusive", "fallback": None, "reasons": ["rollback steps not run"]}
+    pre, chain, after = steps.get("pre"), steps.get("chain"), steps.get("after")
+    routes: list[str] = []
+    for table, ref in sorted(((pre or {}).get("refs_before") or {}).items()):
+        if ref.get("audit") is None:
+            routes.append(f"{table} has no audit ref: the sink created no branch commit")
+        if ref.get("main") is not None:
+            routes.append(f"{table} had a main ref before the first fast-forward")
+    if chain is not None and chain.get("main_unchanged_before_ff2") is False:
+        routes.append("main moved before the second fast-forward")
+    if after is not None and after.get("main_unchanged") is False:
+        routes.append("main moved after the chain without a fast-forward")
+    if routes:
+        return {"verdict": "fallback", "fallback": "no branch commit", "reasons": routes}
+    problems: list[str] = []
+    absent = [name for name in STEP_NAMES if not steps.get(name)]
+    if absent:
+        problems.append(f"step report(s) missing: {', '.join(absent)}")
+    if pre:
+        problems += pre_problems(pre)
+    if chain:
+        problems += chain_problems(chain)
+    if after and after.get("sink_commit_after_expiry") is not True:
+        problems.append("after: the sink wrote no new audit commit after expiry")
+    for label, expected in GOOD_PATHS.items():
+        report = steps.get(label)
+        if report:
+            problems += path_problems(label, expected, report)
+    if problems:
+        return {"verdict": "inconclusive", "fallback": None, "reasons": problems}
+    return {
+        "verdict": "go",
+        "fallback": None,
+        "reasons": [
+            "main moved only by fast-forward, an erasure and a rewrite committed on audit while it "
+            "was ahead, the next fast-forward succeeded, no referenced file holds a ledger key "
+            "after expiry, and both rollback paths replayed with no gap or duplicate"
+        ],
+    }
 
 
 # --- live: refs and files ---------------------------------------------------------------------
@@ -541,6 +693,199 @@ def brnz01_after(chain: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+# --- live: BRNZ-02 ----------------------------------------------------------------------------
+
+
+def restore_offsets(targets: Mapping[str, int]) -> dict[tuple[str, int], int]:
+    """The resume offset of every source partition, from the rows at each table's restore target.
+
+    `targets` maps a table to the snapshot id being restored. A table with no rows at its target
+    contributes none, so its partitions resume at their log-start offsets (research Pattern 5).
+    """
+    partitions, starts = cdc_check.log_start_offsets(
+        [connect_admin.topic(table) for table in connect_admin.TABLES]
+    )
+    rows_max: dict[tuple[str, int], int] = {}
+    for table in connect_admin.TABLES:
+        found = cdc_check.bronze_rows(table, str(targets[table]))
+        if found["absent"]:
+            raise RuntimeError(f"{table} has no snapshot {targets[table]} to restore")
+        for row in found["rows"]:
+            key = (str(row["topic"]), int(row["partition"]))
+            rows_max[key] = max(rows_max.get(key, -1), int(row["offset"]))
+    return resume_offsets(rows_max, partitions, starts)
+
+
+def wait_replayed(
+    ref: str, resume: Mapping[tuple[str, int], int], timeout_s: float = 600.0
+) -> dict[str, Any]:
+    """Re-read Kafka and bronze at `ref` every 10 s until every offset at or past a resume offset landed.
+
+    On a timeout the last count is returned: the final set check then reports a real gap.
+    """
+    deadline = time.monotonic() + timeout_s
+    polls = 0
+    while True:
+        data = cdc_check.gather(ref)
+        held = {(r["topic"], r["partition"], r["offset"]) for r in data["rows"]}
+        pending = replay_pending(data["nonnull"], held, resume)
+        polls += 1
+        done = not data["unreadable"] and pending == 0
+        if done or time.monotonic() >= deadline:
+            return {"replayed": done, "pending": pending, "polls": polls}
+        time.sleep(CATCH_UP_INTERVAL_S)
+
+
+def restored_facts(targets: Mapping[str, int]) -> dict[str, dict[str, Any]]:
+    """{table: {"snapshot_id", "written_by"}} for each restore target."""
+    facts: dict[str, dict[str, Any]] = {}
+    for table in connect_admin.TABLES:
+        iceberg_table = cdc_check.load_bronze(table)
+        facts[table] = {
+            "snapshot_id": int(targets[table]),
+            "written_by": snapshot_facts(iceberg_table, int(targets[table]))["written_by"],
+        }
+    return facts
+
+
+def resume_report(resume: Mapping[tuple[str, int], int]) -> dict[str, int]:
+    return {f"{topic}:{partition}": offset for (topic, partition), offset in sorted(resume.items())}
+
+
+def rollback_branch(chain: Mapping[str, Any]) -> dict[str, Any]:
+    """Path A (the branch works): discard audit's commits past main, replay from main's head rows.
+
+    The sink is stopped; audit is recreated at main's head in every table; the offsets from the
+    rows at main's head are PATCHed; the sink resumes and catches up; the ledger rows the replay
+    re-landed are counted, then the ledger is reapplied (erase and rewrite on audit, fast-forward,
+    expire) with the sink stopped, and the final set check allows the ledger's offsets.
+    """
+    ledger = ledger_of(chain)
+    sink_stop()
+    refs = refs_report()
+    absent = [table for table in connect_admin.TABLES if refs[table]["main"] is None]
+    if absent:
+        raise RuntimeError(f"no main ref to restore on {', '.join(absent)}")
+    targets = {table: int(refs[table]["main"]) for table in connect_admin.TABLES}
+    restored = restored_facts(targets)
+    resume = restore_offsets(targets)
+    spark = spark_session()
+    try:
+        for table in connect_admin.TABLES:
+            run(spark, replace_branch_sql(table, targets[table]))
+        patch_status = connect_admin.patch_offsets(SINK, connect_admin.offsets_body(resume))
+        sink_start()
+        replay = wait_replayed("audit", resume)
+        relanded = count_keys(spark, LEDGER_TABLE, ledger, "audit")
+        sink_stop()
+        executed = ["stop"]
+        run(spark, erase_sql(LEDGER_TABLE, ledger, "audit"))
+        executed.append("erase")
+        rewrite = run(spark, rewrite_sql(LEDGER_TABLE, "audit"))[0]
+        executed.append("rewrite")
+        ff = fast_forward_all(spark)
+        executed.append("fast_forward")
+        guard_expire(executed, sink_stopped=True)
+        expire = run(spark, expire_sql(LEDGER_TABLE, datetime.now(UTC)))[0]
+        executed.append("expire")
+        rows_after = count_keys(spark, LEDGER_TABLE, ledger, "audit") + count_keys(
+            spark, LEDGER_TABLE, ledger, "main"
+        )
+    finally:
+        spark.stop()
+    sink_start()
+    return {
+        "path": "branch",
+        "restored": restored,
+        "resume_offsets": resume_report(resume),
+        "patch_status": patch_status,
+        "replay": replay,
+        "relanded_before_reapply": relanded,
+        "reapply": {"order": executed, "rewrite": rewrite, "ff": ff, "expire": expire},
+        "rows_after_reapply": rows_after,
+        "set_check": cdc_check.set_check("audit", ledger),
+    }
+
+
+def setup_main() -> dict[str, Any]:
+    """Path B setup, on a sink registered without a commit branch: erase the ledger on main.
+
+    Every table must have main and no audit. The erasure DELETE makes snapshot R, written by Spark;
+    each other table's main head right after it is its rollback target.
+    """
+    refs = refs_report()
+    wrong = [
+        table
+        for table in connect_admin.TABLES
+        if refs[table]["main"] is None or refs[table]["audit"] is not None
+    ]
+    if wrong:
+        raise RuntimeError(f"expected main and no audit on every table, not on {', '.join(wrong)}")
+    caught_up = wait_set_equal("main", frozenset())
+    found = cdc_check.bronze_rows(LEDGER_TABLE, "main")
+    ledger = pick_ledger(
+        (int(row["partition"]), int(row["offset"]), int(row["pk"][0]))
+        for row in found["rows"]
+        if row["pk"] is not None
+    )
+    sink_stop()
+    spark = spark_session()
+    try:
+        run(spark, erase_sql(LEDGER_TABLE, ledger, "main"))
+        rows_after_erase = count_keys(spark, LEDGER_TABLE, ledger, "main")
+    finally:
+        spark.stop()
+    after = refs_report()
+    sink_start()
+    targets = {table: int(after[table]["main"]) for table in connect_admin.TABLES}
+    return {
+        "ledger": ledger,
+        "caught_up": caught_up,
+        "r_snapshot": targets[LEDGER_TABLE],
+        "r_written_by": after[LEDGER_TABLE]["heads"]["main"]["written_by"],
+        "targets": targets,
+        "rows_after_erase": rows_after_erase,
+    }
+
+
+def rollback_main(setup: Mapping[str, Any]) -> dict[str, Any]:
+    """Path B (the branch doesn't work): roll main back to R and the recorded heads, replay, reapply.
+
+    `rollback_to_snapshot` on main for every table, the offsets from the rows at those targets,
+    PATCH, resume and catch-up; the re-landed ledger rows are counted, then erased again on main
+    with the sink stopped.
+    """
+    ledger = ledger_of(setup)
+    targets = {table: int(setup["targets"][table]) for table in connect_admin.TABLES}
+    sink_stop()
+    restored = restored_facts(targets)
+    resume = restore_offsets(targets)
+    spark = spark_session()
+    try:
+        for table in connect_admin.TABLES:
+            run(spark, rollback_sql(table, targets[table]))
+        patch_status = connect_admin.patch_offsets(SINK, connect_admin.offsets_body(resume))
+        sink_start()
+        replay = wait_replayed("main", resume)
+        relanded = count_keys(spark, LEDGER_TABLE, ledger, "main")
+        sink_stop()
+        run(spark, erase_sql(LEDGER_TABLE, ledger, "main"))
+        rows_after = count_keys(spark, LEDGER_TABLE, ledger, "main")
+    finally:
+        spark.stop()
+    sink_start()
+    return {
+        "path": "main",
+        "restored": restored,
+        "resume_offsets": resume_report(resume),
+        "patch_status": patch_status,
+        "replay": replay,
+        "relanded_before_reapply": relanded,
+        "rows_after_reapply": rows_after,
+        "set_check": cdc_check.set_check("main", ledger),
+    }
+
+
 # --- CLI --------------------------------------------------------------------------------------
 
 
@@ -552,6 +897,11 @@ def build_parser() -> argparse.ArgumentParser:
         "brnz01-chain", help="erase, compact, publish, expire and check (stdin: pre)"
     )
     commands.add_parser("brnz01-after", help="the sink's commit after expiry (stdin: chain)")
+    commands.add_parser(
+        "rollback-branch", help="path A: recreate audit at main and replay (stdin: chain)"
+    )
+    commands.add_parser("setup-main", help="path B setup: erase the ledger on an append-only main")
+    commands.add_parser("rollback-main", help="path B: roll main back and replay (stdin: setup)")
     judged = commands.add_parser("verdict", help="judge saved step files (host-safe, no Spark)")
     judged.add_argument("files", nargs="+")
     return parser
@@ -562,9 +912,6 @@ def read_stdin_report() -> dict[str, Any]:
     if report is None:
         raise ValueError("no JSON line on stdin")
     return report
-
-
-STEP_NAMES = ("pre", "chain", "after", "path_a", "path_b")
 
 
 def verdict_command(files: Sequence[str]) -> int:
@@ -593,8 +940,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = brnz01_pre()
         elif args.command == "brnz01-chain":
             report = brnz01_chain(read_stdin_report())
-        else:
+        elif args.command == "brnz01-after":
             report = brnz01_after(read_stdin_report())
+        elif args.command == "rollback-branch":
+            report = rollback_branch(read_stdin_report())
+        elif args.command == "setup-main":
+            report = setup_main()
+        else:
+            report = rollback_main(read_stdin_report())
         print(json.dumps(report, sort_keys=True, default=str), flush=True)
     except Exception as exc:
         print(f"error: {error_text(exc)}", file=sys.stderr)
