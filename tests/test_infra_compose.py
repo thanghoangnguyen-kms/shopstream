@@ -46,10 +46,11 @@ SPIKE = {
     "frankfurter-seed",
     "frankfurter-offline",
     "fx-load",
+    "cdc-run",
 }
 # The one spike service that stays up (item 10's web-only Frankfurter), so it has a healthcheck.
 SPIKE_LONG_RUNNING = {"frankfurter-offline"}
-SPIKE_IMAGE_SERVICES = {"probe", "spark-job", "fx-load"}
+SPIKE_IMAGE_SERVICES = {"probe", "spark-job", "fx-load", "cdc-run"}
 FRANKFURTER_SPIKE = {"frankfurter-fx-init", "frankfurter-seed", "frankfurter-offline"}
 STREAMING = {"kafka-1", "kafka-2", "kafka-3", "kafka-init", "karapace", "connect", "cdc-init"}
 KAFKA_NODES = ("kafka-1", "kafka-2", "kafka-3")
@@ -218,6 +219,7 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
         ("frankfurter-seed", {"frankfurter-fx-init": "service_completed_successfully"}),
         ("frankfurter-offline", {}),
         ("fx-load", {"frankfurter-offline": "service_healthy"}),
+        ("cdc-run", {"lakekeeper": "service_healthy", "seaweedfs": "service_healthy"}),
         ("kafka-1", {}),
         ("kafka-2", {}),
         ("kafka-3", {}),
@@ -379,6 +381,7 @@ def test_each_one_shot_sees_only_its_own_key_pair() -> None:
         assert secrets_of(name) == set(), name
     assert secrets_of("connect") == {"CDC_DB_PASSWORD"}
     assert secrets_of("cdc-init") == {"POSTGRES_PASSWORD", "CDC_DB_PASSWORD"}
+    assert secrets_of("cdc-run") == {"SHOPSTREAM_DB_PASSWORD", "CDC_DB_PASSWORD", "CANARY_TOKEN"}
     for name in (*KAFKA_NODES, "kafka-init", "karapace"):
         assert secrets_of(name) == set(), name
 

@@ -417,6 +417,42 @@ services:
     mem_limit: 1g
     memswap_limit: 1g
 
+  # Items 5 and 11's CDC runner, built from the spike image and never started by `just up`. It
+  # runs scripts/cdc_check.py (the measurement and the scoped reset), scripts/cdc_workload.py and
+  # scripts/connect_admin.py against Postgres, Kafka, Karapace and Connect, which the caller
+  # starts by activating the `streaming` profile. SHOPSTREAM_DB_PASSWORD is the workload's table
+  # owner login and for the reset's TRUNCATE; CDC_DB_PASSWORD is the replication role's, for the
+  # test_decoding count slot; CANARY_TOKEN is only counted for item 11 and never printed.
+  cdc-run:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/cdc_check.py", "refs"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_EC2_METADATA_DISABLED: "true"
+      SHOPSTREAM_DB_PASSWORD: ${SHOPSTREAM_DB_PASSWORD:?run just up}
+      CDC_DB_PASSWORD: ${CDC_DB_PASSWORD:?run just up}
+      CANARY_TOKEN: ${CANARY_TOKEN:?run just up}
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    user: "65534:65534"
+    mem_limit: 2g
+    memswap_limit: 2g
+
   # The `streaming` profile (Phase 4): three combined KRaft nodes, the topic one-shot, Karapace, a
   # Connect worker and the Postgres CDC one-shot. No port is published: every probe runs in the
   # network. Start it by name (`up -d --wait connect`), never with `just up`. Memory limits are

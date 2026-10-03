@@ -79,6 +79,10 @@ ignore = ["E501"]
 "scripts/fx_load.py" = ["S108", "S310", "S608"]
 # urllib calls to the origin-allowlisted in-network Connect and Karapace only (S310); SECRET_KEY holds the env var's name, not a secret (S105).
 "scripts/connect_admin.py" = ["S105", "S310"]
+# SQL built from the script's constant table names through identifier(); values are parameters.
+"scripts/cdc_check.py" = ["S608"]
+# A seeded, reproducible workload, not cryptography (S311); SQL from constant names with parameterized values (S608).
+"scripts/cdc_workload.py" = ["S311", "S608"]
 
 [tool.mypy]
 python_version = "3.13"
