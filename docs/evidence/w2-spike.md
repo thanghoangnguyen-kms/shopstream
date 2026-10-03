@@ -701,7 +701,82 @@ Research history, from 2026-10-02 and not rerun: installing dbt 2.0.6 and `dbt-m
 
 ## Item 5: CDC exactly-once
 
-Not run.
+Recorded 2026-10-03.
+
+The item's verdict follows the exactly-once and write-audit-publish checks recorded below. This part records the streaming stack those checks run on and the connector-secrets proof.
+
+### Streaming stack
+
+Versions, each image ref re-resolved on 2026-10-03 with `docker buildx imagetools inspect`; no tag had moved since it was pinned:
+
+- Kafka 4.3.1, three combined broker and controller nodes in KRaft mode, `docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837`.
+- Debezium 3.6.3.Final on Kafka Connect 4.3.0, `quay.io/debezium/connect:3.6.3.Final@sha256:665fef453613d9cfca4b1ec5dccfa3ba0e6bf4db8f39d7e853a848657e0ec7fa`.
+- Karapace 6.2.3, `ghcr.io/aiven-open/karapace:6.2.3@sha256:6d5b1ff1b77c497108be8be8359c9072294847cba5aa0767fc168ec70632d78f`.
+- The Iceberg Kafka Connect sink 1.11.0, built from Apache Iceberg commit `6976e020b894f6a6777704df2b8c4458cb291ae9` in the `docker.io/library/gradle:8.14.4-jdk21-noble@sha256:cc90b5198f747c454f4a3e17495b626fbdfa7ac77f1ad08502c355e6f81e6772` builder. The sink is not published as a runtime artifact. The zip's sha256, read from `/kafka/iceberg-sink-zip.sha256` in the image, is `c19b586b48779c96ec260e182a884f463c6dff3279e30073bac7af19242a07c1`. It is recorded, not pinned, because Gradle resolves its dependencies at build time. This build reused the layer cache of an earlier build of the same Dockerfile, so Gradle did not run again; the recorded zip is the one inside the image.
+- The Confluent Avro converter 8.3.2, fetched with a checksum check, sha256 `f849f49ae500d1c02f94a50d1dd4b3e63d26433843007ac114a7f8e9fb3d6be8`.
+- The unpack stage reuses `docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b`.
+
+Before the first image build, the owner confirmed that the converter and the builder image fall under ADR-001's decision, so no separate ADR was written for them.
+
+Bring-up, by name so the core Frankfurter is never started: `docker compose -f infra/compose.yaml --profile core --profile streaming up -d --wait connect`. The topic one-shot and the Postgres CDC one-shot both exited 0, and Karapace and Connect reported healthy. Both connectors are registered with `python /app/connect_admin.py register` inside the spike image; the plugin list shows `io.debezium.connector.postgresql.PostgresConnector` 3.6.3.Final and `org.apache.iceberg.connect.IcebergSinkConnector` 1.11.0.
+
+`kafka-topics.sh --describe`, reduced to one line per topic (name, partitions, replication factor, min.insync.replicas, cleanup.policy):
+
+```text
+__consumer_offsets 50 3 2 compact
+__debezium-heartbeat.shopstream 1 3 2 -
+__transaction_state 50 3 2 compact
+_schemas 1 3 2 compact
+connect-configs 1 3 2 compact
+connect-offsets 5 3 2 compact
+connect-status 5 3 2 compact
+control-iceberg 1 3 2 -
+fx.refresh 1 3 2 -
+shopstream.public.customers 3 3 2 delete
+shopstream.public.order_items 3 3 2 delete
+shopstream.public.orders 3 3 2 delete
+shopstream.public.products 3 3 2 delete
+shopstream.public.reviews 3 3 2 delete
+```
+
+The CDC topics use `cleanup.policy=delete` because compaction would make bronze a legitimate superset of the Kafka set; ADR-002 owns the real policy. Karapace creates its `_schemas` topic at replication factor 3 (its default of 1 fails writes under min.insync.replicas 2 while its health route still answers ready).
+
+Both connectors run with `tasks.max` 1. An idle sink task, one that never received a record, never answers the coordinator's commit request, so a three-task sink stalls every commit round for its 30 s timeout. The sink commits every 15 s (`iceberg.control.commit.interval-ms` 15000). Consumer groups: `connect-bronze-sink` (the sink's tasks), `connect-bronze-sink-coord` (its coordinator) and a transient `cg-control-<uuid>` group per worker; the source keeps its offsets in the `connect-offsets` topic. The control topic is `control-iceberg`.
+
+The tracer row: one insert into `customers` landed in `bronze.customers` on the `audit` branch as the raw Debezium envelope, `op` c, an integer `source.lsn` of 53888848, Kafka partition 1 and offset 0. The table has an `audit` ref and no `main` ref, as the sink's first commit creates only the branch.
+
+No Kafka, Karapace or Connect port is published (`docker compose ps` shows each with its container ports unpublished); every probe runs inside the Compose network.
+
+Heartbeat observation. The connector sets `heartbeat.interval.ms` 10000 and the `__debezium-heartbeat.shopstream` topic grew from 33 to 36 records in 30 s. Idle-slot check: `confirmed_flush_lsn` of the `shopstream_dbz` slot read `0/33648C0` with the current WAL position at `0/3388F48`; after five `pg_logical_emit_message` calls in the `postgres` database (which the shopstream slot never decodes) and 90 s of waiting it still read `0/33648C0` against `0/3389228`, and the slot retained 147 kB. So the heartbeat did not advance the flush position of an idle slot here. `max_slot_wal_keep_size` of 4GB on Postgres is the bound, and no heartbeat table was added.
+
+Memory, provisional until the load run measures it, from `docker stats --no-stream` on the five long-running streaming containers (the two one-shots have exited): connect 846.4 MiB of 1.5 GiB, karapace 111.7 MiB of 512 MiB, kafka-1 447.5 MiB, kafka-2 458.7 MiB and kafka-3 447.5 MiB, each of 1 GiB.
+
+### Connector secrets (PLAT-08)
+
+The Connect worker loads Kafka's `EnvVarConfigProvider` through three settings, which the Debezium image's entrypoint writes into the worker properties file:
+
+```text
+config.providers=env
+config.providers.env.class=org.apache.kafka.common.config.provider.EnvVarConfigProvider
+config.providers.env.param.allowlist.pattern=CDC_DB_PASSWORD
+```
+
+`grep -c` of the last line over the properties file prints 1. The Debezium connector's database password is the placeholder `${env:CDC_DB_PASSWORD}`; the real value reaches only the connect and Postgres CDC one-shot containers, through `infra/.env`. The connector running shows the placeholder resolves. The secret's name avoids the worker prefix because the entrypoint writes every variable with that prefix into its properties file and echoes its value in the log.
+
+Each capture below was piped from the host into `uv run python scripts/connect_admin.py placeholders --key CDC_DB_PASSWORD --source <label>`, which reads the capture as UTF-8 with replacement, lists the distinct placeholders and counts the real password's plaintext occurrences, both raw and in its JSON-escaped form. A control run with the real value in the input counted 1, raw and inside JSON. The helper refuses a secret under 8 characters instead of counting a common string.
+
+```text
+{"source": "connector-json", "placeholders": ["${env:CDC_DB_PASSWORD}"], "plaintext_secret_occurrences": 0}
+{"source": "rest-config", "placeholders": ["${env:CDC_DB_PASSWORD}"], "plaintext_secret_occurrences": 0}
+{"source": "rest-tasks", "placeholders": ["${env:CDC_DB_PASSWORD}"], "plaintext_secret_occurrences": 0}
+{"source": "config-topic", "placeholders": ["${env:CDC_DB_PASSWORD}"], "plaintext_secret_occurrences": 0}
+{"source": "worker-log", "placeholders": [], "plaintext_secret_occurrences": 0}
+{"source": "worker-properties", "placeholders": [], "plaintext_secret_occurrences": 0}
+```
+
+The sources, in order: the connector config as submitted (`show-config source`); `GET /connectors/shopstream-cdc`; `GET /connectors/shopstream-cdc/tasks`; every record of the `connect-configs` topic (12 records, read with `kafka-console-consumer.sh --from-beginning`); the worker log (6,165 lines); and `/kafka/config/connect-distributed.properties`.
+
+The redaction pass masks any password-named field whole, so this proof is given as placeholders and counts instead of the raw connector JSON.
 
 ## Item 6: Event-driven orchestration
 
