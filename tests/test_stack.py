@@ -30,6 +30,16 @@ MEASURED_MEM_TOTAL = 12515225600
 GIB = 2**30
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 CANARY = re.compile(r"^shpst_[0-9a-f]{40}$")
+FERNET = re.compile(r"^[A-Za-z0-9_-]{43}=$")
+
+
+def shape_of(key: str) -> re.Pattern[str]:
+    """The pattern a generated value for `key` must match."""
+    if key == "CANARY_TOKEN":
+        return CANARY
+    if key == "AIRFLOW_FERNET_KEY":
+        return FERNET
+    return HEX64
 
 
 def runtime_env() -> dict[str, str]:
@@ -238,10 +248,49 @@ def test_a_fresh_env_fills_every_empty_value_and_keeps_comments_and_order() -> N
     assert added == KEYS
     assert list(values) == KEYS
     for key, value in values.items():
-        assert (CANARY if key == "CANARY_TOKEN" else HEX64).match(value), key
+        assert shape_of(key).match(value), key
     assert len(set(values.values())) == len(KEYS)
     comments = [line for line in text.splitlines() if line.startswith("#")]
     assert comments == [line for line in EXAMPLE.splitlines() if line.startswith("#")]
+
+
+def test_the_fernet_key_is_the_urlsafe_base64_of_32_random_bytes() -> None:
+    key = stack.generate_value(stack.FERNET_KEY_NAME)
+    assert stack.FERNET_KEY_NAME == "AIRFLOW_FERNET_KEY"
+    assert len(base64.urlsafe_b64decode(key)) == 32
+    assert stack.generate_value(stack.FERNET_KEY_NAME) != key
+    # The default branch stays 64 hex characters, which is not a Fernet key.
+    assert HEX64.match(stack.generate_value("CDC_DB_PASSWORD"))
+
+
+def test_env_creates_the_file_then_tops_up_and_runs_no_docker_command(
+    sandbox: Sandbox, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert stack.main(["env"]) == 0
+    first = capsys.readouterr().out
+    assert f"env file: added {len(KEYS)} keys" in first
+    assert "identity file: rendered" in first
+    values = parse_dotenv(sandbox.env_file.read_text(encoding="utf-8"))
+    assert list(values) == KEYS
+    assert sandbox.identity_file.is_file()
+    removed = "CDC_DB_PASSWORD"
+    text = "".join(
+        line + "\n"
+        for line in sandbox.env_file.read_text(encoding="utf-8").splitlines()
+        if not line.startswith(f"{removed}=")
+    )
+    sandbox.env_file.write_text(text, encoding="utf-8")
+    assert stack.main(["env"]) == 0
+    second = capsys.readouterr().out
+    assert f"env file: added 1 keys: {removed}" in second
+    assert stack.main(["env"]) == 0
+    assert "env file: up to date" in capsys.readouterr().out
+    assert sandbox.calls == []
+    assert list(parse_dotenv(sandbox.env_file.read_text(encoding="utf-8"))) == [
+        key for key in KEYS if key != removed
+    ] + [removed]
+    for value in values.values():
+        assert value not in first + second
 
 
 def test_write_env_fresh_is_exclusive_and_private(tmp_path: Path) -> None:
@@ -328,7 +377,7 @@ def test_up_from_a_copy_of_the_example_fills_every_value_and_renders_the_identit
     values = parse_dotenv(text)
     assert list(values) == KEYS
     for key, value in values.items():
-        assert (CANARY if key == "CANARY_TOKEN" else HEX64).match(value), key
+        assert shape_of(key).match(value), key
     assert len(set(values.values())) == len(KEYS)
     comments = [line for line in text.splitlines() if line.startswith("#")]
     assert comments == [line for line in EXAMPLE.splitlines() if line.startswith("#")]

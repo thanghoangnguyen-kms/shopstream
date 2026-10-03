@@ -51,7 +51,13 @@ SPIKE = {
 SPIKE_LONG_RUNNING = {"frankfurter-offline"}
 SPIKE_IMAGE_SERVICES = {"probe", "spark-job", "fx-load"}
 FRANKFURTER_SPIKE = {"frankfurter-fx-init", "frankfurter-seed", "frankfurter-offline"}
+STREAMING = {"kafka-1", "kafka-2", "kafka-3", "kafka-init", "karapace", "connect", "cdc-init"}
+KAFKA_NODES = ("kafka-1", "kafka-2", "kafka-3")
 SPIKE_DOCKERFILE = INFRA / "spike" / "Dockerfile"
+CONNECT_DOCKERFILE = INFRA / "connect" / "Dockerfile"
+CDC_SQL = (INFRA / "postgres" / "cdc.sql").read_text(encoding="utf-8")
+CREATE_TOPICS = (INFRA / "kafka" / "create-topics.sh").read_text(encoding="utf-8")
+SINK_COMMIT = "6976e020b894f6a6777704df2b8c4458cb291ae9"
 DBT_DOCKERFILE = INFRA / "dbt" / "Dockerfile"
 DOCKERIGNORE = REPO / ".dockerignore"
 PYTHON_IMAGE_DIGEST = "sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b"
@@ -59,6 +65,9 @@ MIB = 2**20
 W05_RESERVE = 384 * MIB
 VM_BUDGET = 10 * 2**30
 CAPTURED_TABLES = ["customers", "products", "orders", "order_items"]
+CDC_TABLES = [*CAPTURED_TABLES, "reviews"]
+# ADR-001 go criterion 8: the Colima VM is 12 GiB and one GiB stays free. Provisional until Phase 5.
+LONG_RUNNING_BUDGET = 11 * 2**30
 
 
 def memory_bytes(value: str | int) -> int:
@@ -96,13 +105,14 @@ def test_the_project_is_named_and_uses_no_deploy_block() -> None:
     assert not [name for name, service in SERVICES.items() if "deploy" in service]
 
 
-def test_only_core_bootstrap_and_spike_hold_services_and_the_sets_are_exact() -> None:
+def test_only_the_four_profiles_hold_services_and_the_sets_are_exact() -> None:
     used = {profile for service in SERVICES.values() for profile in service.get("profiles", [])}
-    assert used == {"core", "bootstrap", "spike"}
-    assert set(SERVICES) == CORE | BOOTSTRAP | SPIKE
+    assert used == {"core", "bootstrap", "spike", "streaming"}
+    assert set(SERVICES) == CORE | BOOTSTRAP | SPIKE | STREAMING
     assert profile_services("core") == CORE
     assert profile_services("bootstrap") == BOOTSTRAP
     assert profile_services("spike") == SPIKE
+    assert profile_services("streaming") == STREAMING
     assert all(len(service["profiles"]) == 1 for service in SERVICES.values())
 
 
@@ -161,6 +171,7 @@ def test_the_one_shots_are_the_bootstrap_and_spike_profiles_and_the_completed_de
         BOOTSTRAP
         | (SPIKE - SPIKE_LONG_RUNNING)
         | {"lakekeeper-migrate", "frankfurter-init", "frankfurter-fx-init"}
+        | {"kafka-init", "cdc-init"}
     )
 
 
@@ -207,6 +218,29 @@ def test_one_shots_never_restart_and_have_no_healthcheck_and_everything_else_has
         ("frankfurter-seed", {"frankfurter-fx-init": "service_completed_successfully"}),
         ("frankfurter-offline", {}),
         ("fx-load", {"frankfurter-offline": "service_healthy"}),
+        ("kafka-1", {}),
+        ("kafka-2", {}),
+        ("kafka-3", {}),
+        (
+            "kafka-init",
+            {
+                "kafka-1": "service_healthy",
+                "kafka-2": "service_healthy",
+                "kafka-3": "service_healthy",
+            },
+        ),
+        ("cdc-init", {"postgres": "service_healthy"}),
+        ("karapace", {"kafka-init": "service_completed_successfully"}),
+        (
+            "connect",
+            {
+                "kafka-init": "service_completed_successfully",
+                "cdc-init": "service_completed_successfully",
+                "karapace": "service_healthy",
+                "lakekeeper": "service_healthy",
+                "seaweedfs": "service_healthy",
+            },
+        ),
     ],
 )
 def test_start_order_is_enforced_by_depends_on_conditions(
@@ -226,6 +260,7 @@ def test_postgres_starts_cdc_ready_and_probes_over_tcp() -> None:
         "track_commit_timestamp=on",
         "max_replication_slots=4",
         "max_wal_senders=4",
+        "max_slot_wal_keep_size=4GB",
     ):
         assert f"-c {setting}" in flags
     assert "-h 127.0.0.1" in " ".join(postgres["healthcheck"]["test"])
@@ -341,6 +376,10 @@ def test_each_one_shot_sees_only_its_own_key_pair() -> None:
     assert secrets_of("spark-job") == set()
     assert secrets_of("dbt-job") == set()
     for name in sorted(FRANKFURTER_SPIKE | {"fx-load"}):
+        assert secrets_of(name) == set(), name
+    assert secrets_of("connect") == {"CDC_DB_PASSWORD"}
+    assert secrets_of("cdc-init") == {"POSTGRES_PASSWORD", "CDC_DB_PASSWORD"}
+    for name in (*KAFKA_NODES, "kafka-init", "karapace"):
         assert secrets_of(name) == set(), name
 
 
@@ -563,3 +602,140 @@ def test_every_interpolated_variable_is_declared_in_the_env_example() -> None:
 def test_every_secret_interpolation_fails_loudly_when_blank() -> None:
     plain = re.findall(r"\$\{(\w+)\}", COMPOSE_TEXT)
     assert plain == []
+
+
+# --- the streaming profile --------------------------------------------------------------------
+
+
+def test_no_streaming_service_publishes_a_port() -> None:
+    for name in sorted(STREAMING):
+        assert "ports" not in SERVICES[name], name
+
+
+def test_the_worker_prefix_never_carries_an_interpolated_variable() -> None:
+    # The Debezium entrypoint writes every CONNECT_* variable into a properties file and echoes
+    # its value in the log, so a secret must never be given such a name.
+    for name, service in SERVICES.items():
+        for key, value in service.get("environment", {}).items():
+            if key.startswith("CONNECT_"):
+                assert "${" not in str(value), f"{name}: {key}"
+
+
+def test_connect_loads_the_env_config_provider_allowlisted_for_the_one_secret() -> None:
+    environment = SERVICES["connect"]["environment"]
+    assert environment["CONNECT_CONFIG_PROVIDERS"] == "env"
+    assert environment["CONNECT_CONFIG_PROVIDERS_ENV_CLASS"] == (
+        "org.apache.kafka.common.config.provider.EnvVarConfigProvider"
+    )
+    assert environment["CONNECT_CONFIG_PROVIDERS_ENV_PARAM_ALLOWLIST_PATTERN"] == "CDC_DB_PASSWORD"
+    assert environment["CDC_DB_PASSWORD"].endswith(":?run just up}")
+    assert "EnvVarConfigProvider" in COMPOSE_TEXT
+
+
+def test_connect_is_built_from_its_dockerfile_and_keeps_the_worker_variables_the_image_reads() -> (
+    None
+):
+    connect = SERVICES["connect"]
+    assert "image" not in connect
+    assert connect["build"] == {"context": "..", "dockerfile": "infra/connect/Dockerfile"}
+    environment = connect["environment"]
+    assert environment["CONFIG_STORAGE_TOPIC"] == "connect-configs"
+    assert environment["OFFSET_STORAGE_TOPIC"] == "connect-offsets"
+    assert environment["STATUS_STORAGE_TOPIC"] == "connect-status"
+    assert environment["OFFSET_FLUSH_INTERVAL_MS"] == "5000"
+    assert environment["AWS_REGION"] == "local-01"
+
+
+def test_the_kafka_nodes_and_kafka_init_share_one_image_and_a_three_way_replicated_cluster() -> (
+    None
+):
+    images = {SERVICES[name]["image"] for name in (*KAFKA_NODES, "kafka-init")}
+    assert len(images) == 1
+    assert next(iter(images)).startswith("docker.io/apache/kafka:4.3.1@sha256:")
+    ids = [SERVICES[name]["environment"]["KAFKA_NODE_ID"] for name in KAFKA_NODES]
+    assert ids == ["1", "2", "3"]
+    assert len({SERVICES[name]["environment"]["CLUSTER_ID"] for name in KAFKA_NODES}) == 1
+    for name in KAFKA_NODES:
+        environment = SERVICES[name]["environment"]
+        assert environment["KAFKA_DEFAULT_REPLICATION_FACTOR"] == "3"
+        assert environment["KAFKA_MIN_INSYNC_REPLICAS"] == "2"
+        assert environment["KAFKA_AUTO_CREATE_TOPICS_ENABLE"] == "false"
+        assert environment["KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR"] == "3"
+        assert environment["KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR"] == "3"
+        assert environment["KAFKA_ADVERTISED_LISTENERS"] == f"PLAINTEXT://{name}:19092"
+        assert bind_sources(name) == [f"{name}-data"]
+        assert f"{name}-data" in COMPOSE["volumes"]
+
+
+def test_karapace_creates_its_schema_topic_at_replication_factor_three() -> None:
+    environment = SERVICES["karapace"]["environment"]
+    assert environment["KARAPACE_REPLICATION_FACTOR"] == "3"
+    assert environment["KARAPACE_TOPIC_NAME"] == "_schemas"
+
+
+def test_the_connect_dockerfile_pins_every_input() -> None:
+    lines = dockerfile_lines(CONNECT_DOCKERFILE)
+    froms = [line for line in lines if line.startswith("FROM ")]
+    assert len(froms) == 3
+    for line in froms:
+        assert re.search(r"@sha256:[0-9a-f]{64}\b", line), line
+    unpack = next(line for line in froms if line.endswith("AS unpack"))
+    assert f"@{PYTHON_IMAGE_DIGEST}" in unpack
+    git_adds = [
+        line for line in lines if line.startswith("ADD ") and "github.com/apache/iceberg" in line
+    ]
+    assert len(git_adds) == 1
+    assert git_adds[0].split()[1] == f"https://github.com/apache/iceberg.git#{SINK_COMMIT}"
+    sums = [line for line in lines if line.startswith("ADD --checksum=sha256:")]
+    assert len(sums) == 1
+    assert re.match(r"ADD --checksum=sha256:[0-9a-f]{64} --chmod=644 https://", sums[0])
+    assert "kafka-connect-avro-converter-8.3.2.zip" in sums[0]
+    assert len([line for line in lines if line.startswith("ADD ")]) == 2
+    copies = [line for line in lines if line.startswith("COPY ")]
+    assert copies
+    for line in copies:
+        assert re.search(r"--from=(sink-build|unpack)\b", line), line
+
+
+def test_cdc_sql_is_idempotent_and_takes_the_password_only_as_a_psql_variable() -> None:
+    assert r"\connect shopstream" in CDC_SQL
+    assert CDC_SQL.count(r"\gexec") == 2
+    assert CDC_SQL.count(":'cdc_pw'") == 1
+    assert "PASSWORD '" not in CDC_SQL
+    assert "REPLICATION" in CDC_SQL
+    assert "NOSUPERUSER" in CDC_SQL
+    tables = ", ".join(CDC_TABLES)
+    assert f"CREATE PUBLICATION shopstream_cdc FOR TABLE {tables}" in CDC_SQL
+    assert f"GRANT SELECT ON {tables} TO cdc;" in CDC_SQL
+    assert "ALTER TABLE reviews REPLICA IDENTITY FULL;" in CDC_SQL
+    assert "CREATE TABLE IF NOT EXISTS reviews" in CDC_SQL
+    assert not re.search(r"\b(INSERT|COPY)\b", CDC_SQL)
+
+
+def test_create_topics_makes_every_topic_idempotently_at_replication_factor_three() -> None:
+    assert "set -euo pipefail" in CREATE_TOPICS
+    assert "--if-not-exists" in CREATE_TOPICS
+    assert "--replication-factor 3" in CREATE_TOPICS
+    assert "min.insync.replicas=2" in CREATE_TOPICS
+    topics = [
+        *(f"shopstream.public.{table}" for table in CDC_TABLES),
+        "control-iceberg",
+        "__debezium-heartbeat.shopstream",
+        "fx.refresh",
+        "connect-configs",
+        "connect-offsets",
+        "connect-status",
+        "_schemas",
+    ]
+    for topic in topics:
+        assert re.search(rf"^create {re.escape(topic)} \d", CREATE_TOPICS, flags=re.MULTILINE), (
+            topic
+        )
+    for table in CDC_TABLES:
+        assert f"create shopstream.public.{table} 3 cleanup.policy=delete" in CREATE_TOPICS
+
+
+def test_the_long_running_services_of_core_and_streaming_fit_the_vm_budget() -> None:
+    long_running = (CORE | STREAMING) - one_shots()
+    total = sum(memory_bytes(SERVICES[name]["mem_limit"]) for name in long_running)
+    assert total <= LONG_RUNNING_BUDGET

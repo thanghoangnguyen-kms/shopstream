@@ -2,7 +2,9 @@
 
 `up` refuses a VM that is too small, creates or tops up infra/.env, renders the SeaweedFS
 identity file into the git-ignored infra/.generated/, brings the core profile up healthy and
-runs the bootstrap and warehouse one-shots. `down` removes every profile's containers.
+runs the bootstrap and warehouse one-shots. `env` does only the infra/.env and identity-file
+steps (no preflight, no docker call), so a Compose file that gained a `${NAME:?run just up}`
+variable can be used before the stack is touched. `down` removes every profile's containers.
 
 The top-up fills every empty value in an existing infra/.env (so a plain copy of
 .env.example works), appends the keys the file lacks, never changes a value that is set and
@@ -52,6 +54,7 @@ MIN_VM_BYTES = 12348030976
 WAIT_TIMEOUT_S = 300
 PROFILE_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
 CANARY_PREFIX = "shpst_"
+FERNET_KEY_NAME = "AIRFLOW_FERNET_KEY"
 COLIMA_START = "colima start --vm-type vz --memory 12 --cpu 4"
 _TEMPLATE_VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _MIN_SIGNING_KEY_BYTES = 16
@@ -80,6 +83,9 @@ def preflight_verdict(mem_total_bytes: int, threshold_bytes: int) -> tuple[bool,
 def generate_value(key: str) -> str:
     if key == "CANARY_TOKEN":
         return CANARY_PREFIX + secrets.token_hex(20)
+    if key == FERNET_KEY_NAME:
+        # A Fernet key is the url-safe base64 of 32 random bytes; token_hex(32) is not one.
+        return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
     return secrets.token_hex(32)
 
 
@@ -331,6 +337,20 @@ def sync_env() -> list[str]:
     raise EnvInitError("could not create the env file")
 
 
+def cmd_env() -> int:
+    """Create or top up infra/.env and render the identity file: no preflight, no docker call."""
+    with env_lock(ENV_LOCK_FILE):
+        added = sync_env()
+        if added:
+            print(f"env file: added {len(added)} keys: {', '.join(added)}", flush=True)
+        else:
+            print("env file: up to date", flush=True)
+        values = parse_dotenv(ENV_FILE.read_text(encoding="utf-8"))
+        write_identity(IDENTITY_FILE, render_identity(IDENTITY_TEMPLATE.read_text("utf-8"), values))
+        print("identity file: rendered", flush=True)
+    return 0
+
+
 def cmd_up() -> int:
     ok, message = preflight_verdict(read_mem_total(), MIN_VM_BYTES)
     print(message, flush=True)
@@ -370,12 +390,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Bring the Shopstream stack up or down.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("up", help="bring the core stack up and bootstrap the catalog")
+    commands.add_parser("env", help="create or top up infra/.env and render the identity file")
     down = commands.add_parser("down", help="remove every profile's containers")
     down.add_argument("--volumes", action="store_true", help="also delete the named volumes")
     args = parser.parse_args(argv)
     try:
         if args.command == "up":
             return cmd_up()
+        if args.command == "env":
+            return cmd_env()
         return cmd_down(args.volumes)
     except (PreflightError, EnvInitError, DotenvError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
