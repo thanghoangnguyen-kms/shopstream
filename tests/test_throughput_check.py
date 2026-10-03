@@ -797,3 +797,71 @@ def test_the_module_never_shells_out_and_builds_sql_only_from_constants_or_ident
                 and expr.func.id in {"identifier", "lakekeeper_url"}
             )
             assert is_constant or is_checked, ast.unparse(expr)
+
+
+# --- order_knobs: item 13's order rule, the same one the bronze SQL mirrors ------------------------
+
+BOUND = 600_000
+CLOCK = 1_790_000_000_000
+
+
+def knobs_of(times: list[int]) -> dict[str, int]:
+    return tc.order_knobs(list(enumerate(times)), BOUND)
+
+
+def test_order_knobs_of_no_rows_or_one_row_count_nothing() -> None:
+    assert tc.order_knobs([], BOUND) == {"out_of_order": 0, "beyond_watermark": 0}
+    assert tc.order_knobs([(0, CLOCK)], BOUND) == {"out_of_order": 0, "beyond_watermark": 0}
+
+
+def test_a_strictly_rising_sequence_and_equal_times_count_nothing() -> None:
+    assert knobs_of([CLOCK, CLOCK + 50, CLOCK + 100]) == {"out_of_order": 0, "beyond_watermark": 0}
+    assert knobs_of([CLOCK, CLOCK]) == {"out_of_order": 0, "beyond_watermark": 0}
+
+
+def test_a_row_90_seconds_back_is_out_of_order_but_inside_the_bound() -> None:
+    assert knobs_of([CLOCK, CLOCK + 150, CLOCK + 60]) == {"out_of_order": 1, "beyond_watermark": 0}
+
+
+def test_a_row_15_minutes_back_is_out_of_order_and_beyond_the_watermark() -> None:
+    found = knobs_of([CLOCK, CLOCK + 150, CLOCK + 150 - 900_000])
+    assert found == {"out_of_order": 1, "beyond_watermark": 1}
+
+
+def test_the_row_after_a_late_one_back_on_the_normal_clock_adds_nothing() -> None:
+    times = [CLOCK, CLOCK + 150, CLOCK + 150 - 900_000, CLOCK + 300, CLOCK + 450]
+    assert knobs_of(times) == {"out_of_order": 1, "beyond_watermark": 1}
+
+
+def test_the_watermark_line_is_strict_at_the_bound() -> None:
+    running_max = CLOCK + 1_000_000
+    on_the_line = running_max - BOUND
+    assert knobs_of([running_max, on_the_line])["beyond_watermark"] == 0
+    assert knobs_of([running_max, on_the_line - 1])["beyond_watermark"] == 1
+    assert knobs_of([running_max, on_the_line - 1])["out_of_order"] == 1
+
+
+def test_an_immediate_duplicate_is_not_out_of_order() -> None:
+    found = knobs_of([CLOCK, CLOCK + 150, CLOCK + 150, CLOCK + 300])
+    assert found == {"out_of_order": 0, "beyond_watermark": 0}
+
+
+def test_the_running_maximum_is_over_earlier_offsets_not_the_previous_row() -> None:
+    # 1,000,000 then two rows 700 s below it: both beyond the bound, but only the first is below
+    # its predecessor.
+    times = [CLOCK + 1_000_000, CLOCK + 300_000, CLOCK + 300_001]
+    assert knobs_of(times) == {"out_of_order": 1, "beyond_watermark": 2}
+
+
+def test_order_knobs_follow_the_given_offset_order_not_the_offset_values() -> None:
+    rows = [(5, CLOCK + 100), (9, CLOCK + 50), (12, CLOCK + 200)]
+    assert tc.order_knobs(rows, BOUND) == {"out_of_order": 1, "beyond_watermark": 0}
+
+
+def test_the_generator_states_the_lateness_bound_item_13_uses() -> None:
+    assert tc.LATENESS_MS == BOUND
+
+
+def test_a_negative_lateness_bound_is_refused() -> None:
+    with pytest.raises(ValueError, match="lateness"):
+        tc.order_knobs([(0, CLOCK)], -1)

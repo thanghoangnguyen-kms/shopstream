@@ -36,7 +36,7 @@ import time
 from array import array
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from typing import Any
+from typing import Any, NamedTuple
 
 import cdc_check
 import connect_admin
@@ -93,6 +93,89 @@ PACE_EVERY = 200
 FLUSH_TIMEOUT_S = 600
 ADMIN_TIMEOUT_S = 30
 
+# Item 13's knobs: one residue class per knob, all on different residues of periods that are
+# multiples of 125, so no event carries two knobs (a test pins it for every event below 1,000,000).
+DUPLICATE_EVERY = 2_000
+DUPLICATE_AT = 13
+OUT_OF_ORDER_EVERY = 1_500
+OUT_OF_ORDER_AT = 3
+OUT_OF_ORDER_SHIFT_MS = 90_000
+LATE_EVERY = 5_000
+LATE_AT = 11
+LATE_SHIFT_MS = 900_000
+MALFORMED_EVERY = 10_000
+MALFORMED_AT = 17
+NULL_REFERRER_EVERY = 3_000
+NULL_REFERRER_AT = 29
+CANARY_AT = 1_000
+CANARY_WORKER = 0
+HOT_EVERY = 4
+HOT_PRODUCT_ID = 1
+HOT_PRODUCT_AT = 1
+HOT_CUSTOMER_ID = 1
+HOT_CUSTOMER_AT = 2
+CONFIGURED_HOT_SHARE = 0.2
+MALFORMED_MARKER = b"malformed-clickstream-event-"
+KNOB_RULES = (
+    ("duplicate", DUPLICATE_EVERY, DUPLICATE_AT),
+    ("out_of_order", OUT_OF_ORDER_EVERY, OUT_OF_ORDER_AT),
+    ("late", LATE_EVERY, LATE_AT),
+    ("malformed", MALFORMED_EVERY, MALFORMED_AT),
+    ("null_referrer", NULL_REFERRER_EVERY, NULL_REFERRER_AT),
+)
+
+
+class Sent(NamedTuple):
+    """What the delivery callback needs to know about one record sent."""
+
+    event_time_ms: int
+    malformed: bool = False
+    resend: bool = False
+    null_referrer: bool = False
+    canary: bool = False
+    hot_product: bool = False
+    hot_customer: bool = False
+
+
+class Record(NamedTuple):
+    """One record to produce: the event (its id is the key) and what the callback should record."""
+
+    event: dict[str, Any]
+    sent: Sent
+
+
+def matching_knobs(n: int, worker: int) -> list[str]:
+    raise NotImplementedError
+
+
+def knob_of(n: int, worker: int) -> str | None:
+    raise NotImplementedError
+
+
+def malformed_value(n: int) -> bytes:
+    raise NotImplementedError
+
+
+def records_for(
+    rng: random.Random, seed: int, worker: int, n: int, knobs: bool, canary: str | None
+) -> list[Record]:
+    raise NotImplementedError
+
+
+class KnobLedger:
+    def __init__(self, partitions: Sequence[int]) -> None:
+        raise NotImplementedError
+
+    def delivered(self, partition: int, offset: int, sent: Sent) -> None:
+        raise NotImplementedError
+
+    def summary(self, lateness_ms: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+def merge_knob_reports(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    raise NotImplementedError
+
 
 def register_schemas() -> dict[str, int]:
     """Post the key and value schemas to Karapace; return {subject: id} for both subjects.
@@ -129,7 +212,14 @@ def encode(schema_id: int, parsed_schema: Any, record: Any) -> bytes:
     return buffer.getvalue()
 
 
-def make_event(rng: random.Random, seed: int, worker: int, n: int) -> dict[str, Any]:
+def make_event(
+    rng: random.Random,
+    seed: int,
+    worker: int,
+    n: int,
+    knobs: bool = False,
+    canary: str | None = None,
+) -> dict[str, Any]:
     """Event `n` of `worker`: every value from the worker's seeded generator."""
     product_id = rng.randint(1, PRODUCTS)
     return {
@@ -290,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     go.add_argument("--rate", type=float, default=20_000.0, help="total events/s; 0 is unthrottled")
     go.add_argument("--procs", type=int, default=2, help="producer processes: 1, 2, 3 or 6")
     go.add_argument("--seed", type=int, default=1)
+    go.add_argument("--knobs", action="store_true", help="inject item 13's clickstream knobs")
     return parser
 
 

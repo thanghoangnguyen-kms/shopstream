@@ -93,6 +93,8 @@ ignore = ["E501"]
 "scripts/airflow_check.py" = ["S603", "S607"]
 # A seeded, reproducible workload, not cryptography (S311).
 "scripts/clickstream_load.py" = ["S311"]
+# The knob tests seed the generator's own random.Random, which is not used for secrets.
+"tests/test_clickstream_load.py" = ["S311"]
 # SQL built from the script's constant table and column names; the canary is a bound parameter (S608).
 "scripts/throughput_check.py" = ["S608"]
 

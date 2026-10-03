@@ -47,6 +47,8 @@ DISK_SHARE = (3, 4)
 FALLBACK = "Spark bulk-loads the Week 14 volume into its own bronze table; Kafka carries a smaller live stream"
 POLL_S = 10.0
 CANARY_ENV = "CANARY_TOKEN"
+# The lateness bound the generator states for item 13's "beyond the watermark" knob.
+LATENESS_MS = 600_000
 
 
 # --- pure rules ---------------------------------------------------------------------------------
@@ -152,6 +154,10 @@ def offset_runs(offsets: Iterable[int]) -> tuple[list[list[int]], int]:
         else:
             runs.append([offset, offset + 1])
     return runs, duplicates
+
+
+def order_knobs(rows: Iterable[Sequence[int]], lateness_ms: int) -> dict[str, int]:
+    raise NotImplementedError
 
 
 # --- the set check: interval arithmetic over half-open runs --------------------------------------
