@@ -91,6 +91,10 @@ ignore = ["E501"]
 "scripts/clock_check.py" = ["S608"]
 # Fixed docker argv lists (S603, S607), never shell strings.
 "scripts/airflow_check.py" = ["S603", "S607"]
+# A seeded, reproducible workload, not cryptography (S311).
+"scripts/clickstream_load.py" = ["S311"]
+# SQL built from the script's constant table and column names; the canary is a bound parameter (S608).
+"scripts/throughput_check.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.13"

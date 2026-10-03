@@ -751,13 +751,21 @@ def test_cdc_sql_is_idempotent_and_takes_the_password_only_as_a_psql_variable() 
 def test_create_topics_makes_every_topic_idempotently_at_replication_factor_three() -> None:
     assert "set -euo pipefail" in CREATE_TOPICS
     assert "--if-not-exists" in CREATE_TOPICS
-    assert "--replication-factor 3" in CREATE_TOPICS
-    assert "min.insync.replicas=2" in CREATE_TOPICS
+    # The three values are parameters for ADR-001's one-broker fallback; their defaults are today's
+    # literals, so the three-broker path is unchanged when they are unset.
+    assert "${TOPIC_REPLICATION_FACTOR:-3}" in CREATE_TOPICS
+    assert "${TOPIC_MIN_INSYNC_REPLICAS:-2}" in CREATE_TOPICS
+    assert "${KAFKA_BOOTSTRAP:-kafka-1:19092,kafka-2:19092,kafka-3:19092}" in CREATE_TOPICS
+    assert '--replication-factor "$REPLICATION_FACTOR"' in CREATE_TOPICS
+    assert '"min.insync.replicas=$MIN_ISR"' in CREATE_TOPICS
     topics = [
         *(f"shopstream.public.{table}" for table in CDC_TABLES),
         "control-iceberg",
         "__debezium-heartbeat.shopstream",
         "fx.refresh",
+        "clickstream",
+        "clickstream.dlq",
+        "control-iceberg-clicks",
         "connect-configs",
         "connect-offsets",
         "connect-status",
@@ -769,6 +777,9 @@ def test_create_topics_makes_every_topic_idempotently_at_replication_factor_thre
         )
     for table in CDC_TABLES:
         assert f"create shopstream.public.{table} 3 cleanup.policy=delete" in CREATE_TOPICS
+    assert "create clickstream 6 cleanup.policy=delete" in CREATE_TOPICS
+    assert "create clickstream.dlq 1\n" in CREATE_TOPICS
+    assert "create control-iceberg-clicks 1\n" in CREATE_TOPICS
 
 
 def test_the_long_running_services_of_core_streaming_and_orchestration_fit_the_vm_budget() -> None:

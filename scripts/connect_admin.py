@@ -20,6 +20,12 @@ Plan 04-03 adds the lifecycle calls the rollback paths need: `stop`, `wait_stopp
 `delete`, and the offsets PATCH (`offsets_body`, `patch_offsets`). An unexpected status raises with
 the connector name and the status only, never the response body.
 
+Plan 05-02 adds a second sink, `clickstream-sink`, for item 12's throughput run: topic `clickstream` to
+`bronze.clickstream` at a 60 s commit interval on its own control topic, with a dead-letter topic.
+`register-clickstream [--tasks-max N] [--override KEY=VALUE ...] [--branch NAME]
+[--dlq-replication-factor N]` registers it; its catalog and KafkaMetadataTransform lines are the CDC
+sink's, line for line (apache/iceberg#16601: the transform keeps its settings in a static field).
+
 CLI: `register [--no-branch]` prints one JSON line `{"connectors": {name: state}, "plugins": {class:
 version}}` (`--no-branch` registers the sink without a commit branch, bronze append-only on main);
 `status` prints the connectors' states; `stop`, `resume` and `delete` act on one connector (default
@@ -54,6 +60,21 @@ SINK_NAME = "bronze-sink"
 TABLES = ("customers", "products", "orders", "order_items", "reviews")
 TOPIC_PREFIX = "shopstream"
 CONTROL_TOPIC = "control-iceberg"
+CLICKSTREAM_SINK_NAME = "clickstream-sink"
+CLICKSTREAM_TOPIC = "clickstream"
+CLICKSTREAM_TABLE = "clickstream"
+CLICKSTREAM_CONTROL_TOPIC = "control-iceberg-clicks"
+CLICKSTREAM_DLQ_TOPIC = "clickstream.dlq"
+CLICKSTREAM_COMMIT_INTERVAL_MS = "60000"
+CLICKSTREAM_MAX_TASKS = 6
+# The only per-connector consumer overrides a tuning run may set (the worker's override policy allows them).
+CLICKSTREAM_OVERRIDE_KEYS = frozenset(
+    {
+        "consumer.override.max.poll.records",
+        "consumer.override.fetch.max.bytes",
+        "consumer.override.max.partition.fetch.bytes",
+    }
+)
 SECRET_KEY = "CDC_DB_PASSWORD"
 RUNNING = "RUNNING"
 JSON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -171,8 +192,66 @@ def sink_config(branch: str | None = "audit") -> dict[str, str]:
     return config
 
 
+def clickstream_sink_config(
+    tasks_max: int = 1,
+    overrides: Mapping[str, str] | None = None,
+    branch: str | None = None,
+    dlq_replication_factor: int = 3,
+) -> dict[str, str]:
+    """The clickstream Iceberg sink: topic `clickstream` into bronze.clickstream, committed every 60 s.
+
+    The catalog, converter and KafkaMetadataTransform lines are exactly sink_config's: the transform
+    keeps its settings in a static field, so every sink on the worker must agree
+    (apache/iceberg#16601). tasks.max stays 1 unless one task cannot keep up with the generator, and
+    then every partition must be fed (an idle task stalls a round, apache/iceberg#17193). Bad records
+    go to the dead-letter topic with their context headers; the error log never includes a record.
+    `branch` is None for main (decision 7a) or a branch name (7b passes "audit").
+    """
+    if not 1 <= tasks_max <= CLICKSTREAM_MAX_TASKS:
+        raise ValueError(f"tasks_max must be 1 to {CLICKSTREAM_MAX_TASKS}")
+    extra = dict(overrides or {})
+    refused = sorted(set(extra) - CLICKSTREAM_OVERRIDE_KEYS)
+    if refused:
+        raise ValueError(f"override not allowed: {', '.join(refused)}")
+    shared = sink_config()
+    config: dict[str, str] = {
+        "connector.class": "org.apache.iceberg.connect.IcebergSinkConnector",
+        "tasks.max": str(tasks_max),
+        "topics": CLICKSTREAM_TOPIC,
+        "iceberg.tables": f"bronze.{CLICKSTREAM_TABLE}",
+        "iceberg.tables.auto-create-enabled": "true",
+        "iceberg.tables.evolve-schema-enabled": "true",
+        "iceberg.tables.auto-create-props.format-version": "2",
+    }
+    if branch is not None:
+        config["iceberg.tables.default-commit-branch"] = branch
+    config.update(
+        {
+            "iceberg.control.topic": CLICKSTREAM_CONTROL_TOPIC,
+            "iceberg.control.commit.interval-ms": CLICKSTREAM_COMMIT_INTERVAL_MS,
+        }
+    )
+    for key, value in shared.items():
+        if key.startswith(("iceberg.catalog", "key.converter", "value.converter", "transforms")):
+            config[key] = value
+    config.update(
+        {
+            "errors.tolerance": "all",
+            "errors.deadletterqueue.topic.name": CLICKSTREAM_DLQ_TOPIC,
+            "errors.deadletterqueue.topic.replication.factor": str(dlq_replication_factor),
+            "errors.deadletterqueue.context.headers.enable": "true",
+            "errors.log.enable": "true",
+            "errors.log.include.messages": "false",
+        }
+    )
+    config.update(extra)
+    return config
+
+
 def _config_for(name: str) -> dict[str, str]:
-    return debezium_config() if name == SOURCE_NAME else sink_config()
+    if name == SOURCE_NAME:
+        return debezium_config()
+    return clickstream_sink_config() if name == CLICKSTREAM_SINK_NAME else sink_config()
 
 
 def _json(body: bytes) -> Any:
@@ -391,6 +470,31 @@ def register(branch: str | None = "audit") -> dict[str, Any]:
     return {"connectors": states, "plugins": plugins()}
 
 
+def register_clickstream(
+    tasks_max: int = 1,
+    overrides: Mapping[str, str] | None = None,
+    branch: str | None = None,
+    dlq_replication_factor: int = 3,
+) -> dict[str, Any]:
+    """Put the clickstream sink and wait for it: {"connectors": {...}, "config": {...}}.
+
+    The control topic and the dead-letter topic must exist (kafka-init creates them; the brokers
+    refuse auto-creation). `config` echoes the knobs for the evidence: tasks.max, the commit
+    interval, the branch (None is main) and the consumer overrides given.
+    """
+    config = clickstream_sink_config(tasks_max, overrides, branch, dlq_replication_factor)
+    put_config(CLICKSTREAM_SINK_NAME, config)
+    return {
+        "connectors": {CLICKSTREAM_SINK_NAME: wait_running(CLICKSTREAM_SINK_NAME)},
+        "config": {
+            "tasks.max": config["tasks.max"],
+            "commit_interval_ms": config["iceberg.control.commit.interval-ms"],
+            "branch": branch,
+            "overrides": dict(sorted((overrides or {}).items())),
+        },
+    }
+
+
 def _report() -> dict[str, str]:
     return {name: state_of(connector_status(name)) for name in (SOURCE_NAME, SINK_NAME)}
 
@@ -448,14 +552,41 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         lifecycle = commands.add_parser(verb, help=text)
         lifecycle.add_argument(
-            "connector", nargs="?", default=SINK_NAME, choices=(SOURCE_NAME, SINK_NAME)
+            "connector",
+            nargs="?",
+            default=SINK_NAME,
+            choices=(SOURCE_NAME, SINK_NAME, CLICKSTREAM_SINK_NAME),
         )
+    clicks = commands.add_parser(
+        "register-clickstream", help="put the clickstream sink and wait until it runs"
+    )
+    clicks.add_argument("--tasks-max", type=int, default=1)
+    clicks.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="a consumer.override.* setting from the allowlist (repeatable)",
+    )
+    clicks.add_argument("--branch", default=None, help="commit branch (default: main)")
+    clicks.add_argument("--dlq-replication-factor", type=int, default=3)
     counted = commands.add_parser("placeholders", help="count placeholders and plaintext on stdin")
     counted.add_argument("--key", required=True, help="name of the secret's environment variable")
     counted.add_argument("--source", required=True, help="label of the capture")
     shown = commands.add_parser("show-config", help="print a connector config as JSON")
     shown.add_argument("kind", choices=("source", "sink"))
     return parser
+
+
+def parse_overrides(pairs: Sequence[str]) -> dict[str, str]:
+    """`KEY=VALUE` strings as a dict; a pair with no `=` raises ValueError (the text is not echoed)."""
+    parsed: dict[str, str] = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise ValueError("an --override needs KEY=VALUE")
+        parsed[key] = value
+    return parsed
 
 
 def lifecycle_command(verb: str, name: str) -> dict[str, str]:
@@ -481,6 +612,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(register(None if args.no_branch else "audit"), sort_keys=True),
                 flush=True,
             )
+        elif args.command == "register-clickstream":
+            result = register_clickstream(
+                args.tasks_max,
+                parse_overrides(args.override),
+                args.branch,
+                args.dlq_replication_factor,
+            )
+            print(json.dumps(result, sort_keys=True), flush=True)
         elif args.command in {"stop", "resume", "delete"}:
             print(
                 json.dumps(lifecycle_command(args.command, args.connector), sort_keys=True),

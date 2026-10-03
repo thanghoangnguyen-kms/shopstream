@@ -153,6 +153,124 @@ def test_no_config_names_the_real_secret_or_a_password_field_other_than_the_plac
                 assert PLACEHOLDER_ONLY.match(value), key
 
 
+# --- the clickstream sink -----------------------------------------------------------------------
+
+
+def test_the_clickstream_sink_shares_the_cdc_sinks_transform_and_catalog_lines() -> None:
+    cdc = ca.sink_config()
+    clicks = ca.clickstream_sink_config()
+    cdc_transform = {k: v for k, v in cdc.items() if k.startswith("transforms")}
+    assert cdc_transform
+    assert {k: v for k, v in clicks.items() if k.startswith("transforms")} == cdc_transform
+    cdc_catalog = {k: v for k, v in cdc.items() if k.startswith("iceberg.catalog")}
+    assert cdc_catalog
+    assert {k: v for k, v in clicks.items() if k.startswith("iceberg.catalog")} == cdc_catalog
+    for key in ("key.converter", "value.converter"):
+        assert clicks[key] == cdc[key]
+        assert clicks[f"{key}.schema.registry.url"] == cdc[f"{key}.schema.registry.url"]
+
+
+def test_the_clickstream_sink_writes_v2_to_bronze_clickstream_every_60_seconds() -> None:
+    config = ca.clickstream_sink_config()
+    assert config["topics"] == "clickstream"
+    assert config["iceberg.tables"] == "bronze.clickstream"
+    assert config["iceberg.tables.auto-create-enabled"] == "true"
+    assert config["iceberg.tables.auto-create-props.format-version"] == "2"
+    assert config["iceberg.control.topic"] == "control-iceberg-clicks"
+    assert config["iceberg.control.commit.interval-ms"] == "60000"
+    assert config["tasks.max"] == "1"
+    assert "iceberg.tables.default-commit-branch" not in config
+    assert ca.clickstream_sink_config(branch="audit")["iceberg.tables.default-commit-branch"] == (
+        "audit"
+    )
+    assert "iceberg.tables.route-field" not in config
+
+
+def test_the_clickstream_sink_sends_bad_records_to_a_dlq_and_logs_no_record() -> None:
+    config = ca.clickstream_sink_config()
+    assert config["errors.tolerance"] == "all"
+    assert config["errors.deadletterqueue.topic.name"] == "clickstream.dlq"
+    assert config["errors.deadletterqueue.topic.replication.factor"] == "3"
+    assert config["errors.deadletterqueue.context.headers.enable"] == "true"
+    assert config["errors.log.enable"] == "true"
+    assert config["errors.log.include.messages"] == "false"
+    one = ca.clickstream_sink_config(dlq_replication_factor=1)
+    assert one["errors.deadletterqueue.topic.replication.factor"] == "1"
+
+
+@pytest.mark.parametrize("tasks_max", [0, 7, -1])
+def test_the_clickstream_sink_refuses_tasks_max_outside_1_to_6(tasks_max: int) -> None:
+    with pytest.raises(ValueError, match="tasks_max"):
+        ca.clickstream_sink_config(tasks_max=tasks_max)
+
+
+def test_the_clickstream_sink_accepts_one_to_six_tasks_and_allowlisted_overrides() -> None:
+    assert ca.clickstream_sink_config(tasks_max=6)["tasks.max"] == "6"
+    config = ca.clickstream_sink_config(overrides={"consumer.override.max.poll.records": "5000"})
+    assert config["consumer.override.max.poll.records"] == "5000"
+    assert all(isinstance(value, str) for value in config.values())
+
+
+def test_the_clickstream_sink_refuses_an_override_outside_the_allowlist() -> None:
+    with pytest.raises(ValueError, match="override not allowed"):
+        ca.clickstream_sink_config(overrides={"consumer.override.group.id": "x"})
+    with pytest.raises(ValueError, match="override not allowed"):
+        ca.clickstream_sink_config(overrides={"iceberg.catalog.uri": "http://elsewhere"})
+
+
+def test_no_clickstream_config_key_is_named_like_a_password_or_secret() -> None:
+    for key in ca.clickstream_sink_config():
+        assert "password" not in key
+        assert "secret" not in key
+
+
+def test_config_for_resolves_the_clickstream_sink_by_name() -> None:
+    assert ca._config_for(ca.CLICKSTREAM_SINK_NAME) == ca.clickstream_sink_config()
+    assert ca._config_for(ca.SINK_NAME) == ca.sink_config()
+
+
+def test_register_clickstream_puts_one_connector_and_reports_the_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script(
+        {
+            ("PUT", "/connectors/clickstream-sink/config"): [(201, b"{}")],
+            ("GET", "/connectors/clickstream-sink/status"): [running("clickstream-sink")],
+        }
+    )
+    monkeypatch.setattr(ca, "http_request", script)
+    result = ca.register_clickstream(branch="audit")
+    assert result == {
+        "connectors": {"clickstream-sink": "RUNNING"},
+        "config": {
+            "tasks.max": "1",
+            "commit_interval_ms": "60000",
+            "branch": "audit",
+            "overrides": {},
+        },
+    }
+    puts = [call for call in script.calls if call.method == "PUT"]
+    assert len(puts) == 1
+    assert json.loads(puts[0].body or b"{}") == ca.clickstream_sink_config(branch="audit")
+
+
+def test_parse_overrides_reads_key_value_pairs_and_refuses_a_bare_word() -> None:
+    assert ca.parse_overrides(["a=1", "b=x=y"]) == {"a": "1", "b": "x=y"}
+    with pytest.raises(ValueError, match="KEY=VALUE") as info:
+        ca.parse_overrides(["leaky-value"])
+    assert "leaky-value" not in str(info.value)
+
+
+def test_the_lifecycle_verbs_accept_the_clickstream_sink() -> None:
+    for verb in ("stop", "resume", "delete"):
+        args = ca.build_parser().parse_args([verb, "clickstream-sink"])
+        assert args.connector == "clickstream-sink"
+    args = ca.build_parser().parse_args(
+        ["register-clickstream", "--tasks-max", "3", "--override", "a=b", "--branch", "audit"]
+    )
+    assert (args.tasks_max, args.override, args.branch) == (3, ["a=b"], "audit")
+
+
 # --- registration and polling -------------------------------------------------------------------
 
 
