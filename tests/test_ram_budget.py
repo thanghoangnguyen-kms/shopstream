@@ -837,3 +837,10 @@ def test_the_size_command_needs_a_report() -> None:
 
 def test_the_window_command_needs_its_load_parameters() -> None:
     assert ram_budget.main(["window"]) == 2
+
+
+@pytest.mark.parametrize("name", ["generator", "spark", "drain"])
+def test_a_compose_run_never_restarts_the_dependencies_one_shots(name: str) -> None:
+    # without --no-deps each run re-ran lakekeeper-migrate during the load (seen in the mini window)
+    argv = BUILDERS[name]()
+    assert argv[argv.index("run") + 1] == "--no-deps"

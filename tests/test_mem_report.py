@@ -688,7 +688,7 @@ def test_report_flags_a_vm_level_oom_kill(
         "BREACH: long-running container frankfurter is exited (exit code 137), not running" in out
     )
     assert "frankfurter: OOMKilled=false RestartCount=0 Status=exited ExitCode=137" in out
-    assert fakes.profiles_seen == [["core"]]
+    assert fakes.profiles_seen == [["core"], ["core", "spike"]]
 
 
 def test_report_prints_status_and_exit_code(
@@ -1114,7 +1114,8 @@ def test_without_with_service_the_total_is_the_active_profiles_only(
     assert mem_report.main(["report", "--samples", str(run_samples(tmp_path))]) == 0
     out = capsys.readouterr().out
     assert "sum(mem_limit) for profiles core: 1.50 GiB" in out
-    assert "sum(mem_limit) with" not in out
+    assert "sum(mem_limit) with spark-job" not in out
+    assert "sum(mem_limit) with cdc-run" not in out
 
 
 def test_with_service_adds_the_named_spike_limit_and_judges_the_ceiling_on_it(
@@ -1275,8 +1276,22 @@ def test_json_out_holds_every_figure_and_is_identical_on_a_rerun(
     assert report["ceiling"] == MEM_TOTAL - GIB
     assert report["events"] == [{"service": "spark-job", "action": "die", "exit_code": 0}]
     assert report["breaches"] == []
-    assert report["inspect"][0] == {"service": "postgres", "oom_killed": False, "restarts": 0}
-    assert report["states"][0] == {"service": "postgres", "status": "running", "exit_code": 0}
+    # inspect and states are sorted by service, so the file does not depend on docker's list order
+    assert [row["service"] for row in report["inspect"]] == [
+        "frankfurter",
+        "lakekeeper",
+        "postgres",
+    ]
+    assert {row["service"]: row for row in report["inspect"]}["postgres"] == {
+        "service": "postgres",
+        "oom_killed": False,
+        "restarts": 0,
+    }
+    assert {row["service"]: row for row in report["states"]}["postgres"] == {
+        "service": "postgres",
+        "status": "running",
+        "exit_code": 0,
+    }
     names = [row["service"] for row in report["per_service"]]
     assert names == ["spark-job", "cdc-run", "frankfurter", "postgres", "lakekeeper"]
     assert report["per_service"][0] == {

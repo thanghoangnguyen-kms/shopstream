@@ -54,6 +54,7 @@ PEAK_BUDGET_BYTES = 10 * 1024**3  # INV-20: the peak summed sample stays within 
 VM_HEADROOM_BYTES = 1024**3  # sum(mem_limit) stays within MemTotal minus 1 GiB
 W05_RESERVE_BYTES = 384 * 1024**2  # informational: the Week 5 streaming reserve
 PROJECT = "shopstream"
+SPIKE_PROFILE = "spike"
 DOCKER_TIMEOUT_S = 120
 INSPECT_FORMAT = "{{.Name}} {{.State.OOMKilled}} {{.RestartCount}}"  # PLAT-09, kept verbatim
 STATE_FORMAT = "{{.Name}} {{.State.Status}} {{.State.ExitCode}}"
@@ -133,18 +134,56 @@ def parse_mem_usage(text: str) -> tuple[int, int] | None:
 
 
 def service_of(name: str, project: str = PROJECT) -> str:
-    """`shopstream-lakekeeper-migrate-1` and `/shopstream-postgres-1` to the service name."""
-    return re.sub(rf"^{re.escape(project)}-|-\d+$", "", name.lstrip("/"))
+    """`shopstream-lakekeeper-migrate-1` and `/shopstream-postgres-1` to the service name.
+
+    A `compose run` container (`shopstream-spark-job-run-4f87af04bf9d`, and for the service named
+    cdc-run `shopstream-cdc-run-run-0123456789ab`) maps to its service, so the table shows its limit.
+    """
+    return re.sub(rf"^{re.escape(project)}-|-run-[0-9a-f]{{12}}$|-\d+$", "", name.lstrip("/"))
 
 
 def events_argv(since: str) -> list[str]:
-    """The fixed `docker events` argv for the oom and die events of the project's containers."""
-    raise NotImplementedError("events_argv is not written yet")
+    """The fixed `docker events` argv for the oom and die events of the project's containers.
+
+    It streams until it is stopped. Every call carries an explicit --format, never the default
+    JSON, so an event's attributes (an environment-derived label, say) never reach the capture.
+    """
+    return [
+        "docker",
+        "events",
+        "--since",
+        since,
+        "--filter",
+        f"label=com.docker.compose.project={PROJECT}",
+        "--filter",
+        "event=oom",
+        "--filter",
+        "event=die",
+        "--format",
+        EVENTS_FORMAT,
+    ]
 
 
 def parse_events(text: str) -> list[tuple[str, str, int | None]]:
-    """(service, action, exit code or None) per line of EVENTS_FORMAT, in capture order."""
-    raise NotImplementedError("parse_events is not written yet")
+    """(service, action, exit code or None) per line of EVENTS_FORMAT, in capture order.
+
+    Anything that is not `<epoch seconds> oom|die <name> <exit code or ->` raises ValueError
+    without echoing the line.
+    """
+    rows: list[tuple[str, str, int | None]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if (
+            len(parts) != 4
+            or not parts[0].isdigit()
+            or parts[1] not in EVENT_ACTIONS
+            or (parts[3] != "-" and _EXIT_CODE.fullmatch(parts[3]) is None)
+        ):
+            raise ValueError("unexpected docker events line")
+        rows.append((service_of(parts[2]), parts[1], None if parts[3] == "-" else int(parts[3])))
+    return rows
 
 
 def read_samples(path: Path) -> tuple[list[Frame], int]:
@@ -310,7 +349,11 @@ def evaluate(
     long_running: Collection[str] = (),
     events: Sequence[tuple[str, str, int | None]] = (),
 ) -> list[str]:
-    """Breach messages; an empty list means every threshold holds."""
+    """Breach messages; an empty list means every threshold holds.
+
+    `events` is a `docker events` capture: each oom event, and each die with exit code 137, is a
+    breach even for a container `--rm` has already removed.
+    """
     breaches: list[str] = []
     if peak_sum > PEAK_BUDGET_BYTES:
         breaches.append(
@@ -342,6 +385,14 @@ def evaluate(
         f"long-running service {service} has no container"
         for service in sorted(set(long_running) - with_container)
     )
+    for service, action, event_code in events:
+        if action == "oom":
+            breaches.append(f"container {service} had an OOM event")
+        elif action == "die" and event_code == OOM_KILL_EXIT_CODE:
+            breaches.append(
+                f"container {service} exited with code {OOM_KILL_EXIT_CODE} in the events capture "
+                "(SIGKILL, which the out-of-memory killer sends)"
+            )
     return breaches
 
 
@@ -391,8 +442,12 @@ def compose_config(profiles: Sequence[str]) -> dict[str, object]:
 
 
 def container_ids(profiles: Sequence[str]) -> list[str]:
-    """Ids of every container of the project, one-shots included (bootstrap is added)."""
-    listing = _docker(compose_argv([*profiles, "bootstrap"], "ps", "-aq"))
+    """Ids of every container of the project, one-shots and spike one-offs included.
+
+    `bootstrap` and `spike` are added so a `compose run` container that still exists (a Spark job
+    run without `--rm`) is inspected too.
+    """
+    listing = _docker(compose_argv([*profiles, "bootstrap", "spike"], "ps", "-aq"))
     return [line.strip() for line in listing.splitlines() if line.strip()]
 
 
@@ -451,6 +506,57 @@ def cmd_sample(duration: float | None, interval: float, append: bool, path: Path
     return 0
 
 
+def _report_json(
+    *,
+    frames: Sequence[Frame],
+    peaks: Sequence[tuple[str, int]],
+    peak_ts: str,
+    peak_sum: int,
+    all_limits: Mapping[str, int],
+    limit_total_profiles: int,
+    limit_total: int,
+    with_services: Sequence[str],
+    mem_total: int,
+    ceiling: int,
+    rows: Sequence[tuple[str, bool, int]],
+    states: Sequence[tuple[str, str, int]],
+    events: Sequence[tuple[str, str, int | None]],
+    breaches: Sequence[str],
+    long_running: Sequence[str],
+    missing: Sequence[str],
+) -> dict[str, object]:
+    """Every figure of the report as plain JSON values, in a fixed order."""
+    return {
+        "frames": len(frames),
+        "peak_sum": peak_sum,
+        "peak_ts": peak_ts,
+        "per_service": [
+            {"service": service, "peak_bytes": peak, "limit_bytes": all_limits.get(service)}
+            for service, peak in peaks
+        ],
+        "limit_total_profiles": limit_total_profiles,
+        "limit_total": limit_total,
+        "with_services": list(with_services),
+        "mem_total": mem_total,
+        "ceiling": ceiling,
+        "inspect": [
+            {"service": service, "oom_killed": oom_killed, "restarts": restarts}
+            for service, oom_killed, restarts in sorted(rows)
+        ],
+        "states": [
+            {"service": service, "status": status, "exit_code": code}
+            for service, status, code in sorted(states)
+        ],
+        "events": [
+            {"service": service, "action": action, "exit_code": code}
+            for service, action, code in events
+        ],
+        "breaches": list(breaches),
+        "long_running": list(long_running),
+        "missing_limits": list(missing),
+    }
+
+
 def cmd_report(
     samples: Path,
     min_frames: int = 1,
@@ -475,10 +581,23 @@ def cmd_report(
             f"fewer than --min-frames {min_frames}"
         )
         return 2
+    events = parse_events(events_path.read_text(encoding="utf-8")) if events_path else []
     profiles = parse_profiles(os.environ)
     config = compose_config(profiles)
+    # The active profiles give the totals and the long-running set; adding `spike` gives the limit
+    # of a service only an explicit `run` starts (spark-job), for the table and --with-service.
+    all_limits = limits_by_service(compose_config([*profiles, SPIKE_PROFILE]))[0]
     limits, missing = limits_by_service(config)
-    limit_total = sum(limits.values())
+    extra = list(dict.fromkeys(with_services))
+    unusable = [name for name in extra if name not in all_limits or name in limits]
+    if unusable:
+        print(
+            f"mem-report: --with-service {', '.join(unusable)}: not a spike-only service with a "
+            "mem_limit (unknown, already in the active profiles, or without a limit)"
+        )
+        return 2
+    limit_total_profiles = sum(limits.values())
+    limit_total = limit_total_profiles + sum(all_limits[name] for name in extra)
     mem_total = read_mem_total()
     long_running = long_running_services(config)
     rows = inspect_rows(profiles)
@@ -491,13 +610,16 @@ def cmd_report(
         "without container rows"
     )
     print(f"{'service':<22}{'peak MiB':>10}{'mem_limit MiB':>15}")
-    for service, peak in service_peaks(frames):
-        limit = _mib(limits[service]) if service in limits else "-"
+    peaks = service_peaks(frames)
+    for service, peak in peaks:
+        limit = _mib(all_limits[service]) if service in all_limits else "-"
         print(f"{service:<22}{_mib(peak):>10}{limit:>15}")
     peak_ts, peak_sum = peak_frame(frames)
     print(f"peak summed sample: {_gib(peak_sum)} at {peak_ts} (budget {_gib(PEAK_BUDGET_BYTES)})")
     listed = ", ".join(profiles)
-    print(f"sum(mem_limit) for profiles {listed}: {_gib(limit_total)}")
+    print(f"sum(mem_limit) for profiles {listed}: {_gib(limit_total_profiles)}")
+    if extra:
+        print(f"sum(mem_limit) with {', '.join(extra)}: {_gib(limit_total)}")
     print(f"sum(mem_limit) with the 384 MiB W05 reserve: {_gib(limit_total + W05_RESERVE_BYTES)}")
     ceiling = mem_total - VM_HEADROOM_BYTES
     verdict = "ok" if limit_total <= ceiling else "over"
@@ -511,14 +633,44 @@ def cmd_report(
         )
     if not rows:
         print("  no containers found")
+    if events_path is not None:
+        print(f"events capture {events_path.name}: {len(events)} oom or die events")
     print(CAVEAT)
 
     breaches = evaluate(
-        peak_sum, limit_total, missing, mem_total, rows, states=states, long_running=long_running
+        peak_sum,
+        limit_total,
+        missing,
+        mem_total,
+        rows,
+        states=states,
+        long_running=long_running,
+        events=events,
     )
     breaches.extend(coverage_breaches(frames, long_running))
     for message in breaches:
         print(f"BREACH: {message}")
+    if json_out is not None:
+        body = _report_json(
+            frames=frames,
+            peaks=peaks,
+            peak_ts=peak_ts,
+            peak_sum=peak_sum,
+            all_limits=all_limits,
+            limit_total_profiles=limit_total_profiles,
+            limit_total=limit_total,
+            with_services=extra,
+            mem_total=mem_total,
+            ceiling=ceiling,
+            rows=rows,
+            states=states,
+            events=events,
+            breaches=breaches,
+            long_running=long_running,
+            missing=missing,
+        )
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if breaches:
         return 1
     print("mem-report: ok")
@@ -561,11 +713,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "sample":
-            return cmd_sample(args.duration, args.interval, args.append, SAMPLES_FILE)
+            return cmd_sample(args.duration, args.interval, args.append, args.out or SAMPLES_FILE)
         return cmd_report(
             args.samples, args.min_frames, args.with_service, args.events, args.json_out
         )
-    except (DockerError, PreflightError, ValueError) as exc:
+    except (DockerError, PreflightError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
