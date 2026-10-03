@@ -89,6 +89,8 @@ ignore = ["E501"]
 "scripts/bronze_wap.py" = ["S108", "S608"]
 # The test_decoding peek uses a constant slot name and a pg_lsn bind value; SQL text is built from constants only (S608).
 "scripts/clock_check.py" = ["S608"]
+# Fixed docker argv lists (S603, S607), never shell strings.
+"scripts/airflow_check.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.13"
