@@ -72,8 +72,9 @@ services:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:5432:5432"
-    mem_limit: 512m
-    memswap_limit: 512m
+    # Sized from Phase 5's calibration run: peak 281.9 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 384m
+    memswap_limit: 384m
     healthcheck:
       # TCP, because the init-time server listens on the socket only.
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
@@ -97,6 +98,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Kept: not sampled (a one-shot shorter than one 5 s frame)
     mem_limit: 128m
     memswap_limit: 128m
 
@@ -113,8 +115,9 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8181:8181"
-    mem_limit: 256m
-    memswap_limit: 256m
+    # Sized from Phase 5's calibration run: peak 50.6 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 64m
+    memswap_limit: 64m
     healthcheck:
       # The image is FROM scratch: only the binary itself can probe.
       test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
@@ -140,8 +143,9 @@ services:
       - ./.generated/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
     ports:
       - "127.0.0.1:8333:8333"
-    mem_limit: 768m
-    memswap_limit: 768m
+    # Sized from Phase 5's calibration run: peak 548.8 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 704m
+    memswap_limit: 704m
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8333/status"]
       interval: 5s
@@ -159,6 +163,7 @@ services:
     command: []
     volumes:
       - frankfurter-data:/app/data
+    # Kept: not sampled (a one-shot shorter than one 5 s frame)
     mem_limit: 32m
     memswap_limit: 32m
 
@@ -184,10 +189,10 @@ services:
       - "127.0.0.1:8090:8080"
     # History: the default foreman mode ran the all-provider scheduler, whose backfill reached 493 MiB and
     # was OOM-killed on a filled volume (Plan 01-04 sized it at 640m). The web-only server peaked at
-    # 88.5 MiB in item 10, so 256m is the limit it ran under there. Plan 05-05 sizes the final value
-    # from the calibration run.
-    mem_limit: 256m
-    memswap_limit: 256m
+    # 88.5 MiB in item 10. Phase 5's calibration run sized the final value, below.
+    # Sized from Phase 5's calibration run: peak 142.4 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 192m
+    memswap_limit: 192m
     healthcheck:
       # The root route answers before the provider backfill finishes; backfill completeness is item 10's check.
       test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
@@ -308,8 +313,9 @@ services:
     tmpfs:
       - /tmp:size=512m,exec
     user: "65534:65534"
-    mem_limit: 3g
-    memswap_limit: 3g
+    # Sized from Phase 5's calibration run: peak 985.7 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 1248m
+    memswap_limit: 1248m
 
   # Items 3, 9, 4 and 7's dbt runner, never started by `just up`. No infra/.env key reaches it:
   # Lakekeeper vends the storage credentials to DuckDB. The analytics tree is mounted read-write
@@ -470,13 +476,14 @@ services:
     tmpfs:
       - /tmp:size=512m
     user: "65534:65534"
+    # Kept at 2g: the load generator, never part of the platform, peak 263.7 MiB
     mem_limit: 2g
     memswap_limit: 2g
 
   # The `streaming` profile (Phase 4): three combined KRaft nodes, the topic one-shot, Karapace, a
   # Connect worker and the Postgres CDC one-shot. No port is published: every probe runs in the
-  # network. Start it by name (`up -d --wait connect`), never with `just up`. Memory limits are
-  # provisional until Phase 5's item 8 measures under load.
+  # network. Start it by name (`up -d --wait connect`), never with `just up`. Memory limits come from
+  # Phase 5's calibration run (item 8), each with its measured peak in a comment.
   #
   # Three combined broker/controller nodes (Kafka 4.3.1). Settings come from the x-kafka-env anchor.
   kafka-1:
@@ -489,6 +496,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:19092
     volumes:
       - kafka-1-data:/var/lib/kafka/data
+    # Sized from Phase 5's calibration run: peak 815.3 MiB x 1.25, rounded up to 32 MiB
     mem_limit: 1g
     memswap_limit: 1g
     healthcheck:
@@ -508,6 +516,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:19092
     volumes:
       - kafka-2-data:/var/lib/kafka/data
+    # Kept at the current limit: page-cache service (owner decision 2), peak 825.9 MiB
     mem_limit: 1g
     memswap_limit: 1g
     healthcheck:
@@ -527,6 +536,7 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:19092
     volumes:
       - kafka-3-data:/var/lib/kafka/data
+    # Sized from Phase 5's calibration run: peak 813.9 MiB x 1.25, rounded up to 32 MiB
     mem_limit: 1g
     memswap_limit: 1g
     healthcheck:
@@ -555,8 +565,9 @@ services:
         condition: service_healthy
       kafka-3:
         condition: service_healthy
-    mem_limit: 384m
-    memswap_limit: 384m
+    # Sized from Phase 5's calibration run: peak 107.8 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 160m
+    memswap_limit: 160m
 
   # Runs infra/postgres/cdc.sql (role, grants, reviews stand-in table, publication) on every start
   # through the superuser password it already holds, so a clean clone and the existing volume both
@@ -575,6 +586,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Kept: not sampled (a one-shot shorter than one 5 s frame)
     mem_limit: 64m
     memswap_limit: 64m
 
@@ -601,8 +613,9 @@ services:
     depends_on:
       kafka-init:
         condition: service_completed_successfully
-    mem_limit: 512m
-    memswap_limit: 512m
+    # Sized from Phase 5's calibration run: peak 111.4 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 160m
+    memswap_limit: 160m
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8081/_health"]
       interval: 5s
@@ -651,8 +664,9 @@ services:
         condition: service_healthy
       seaweedfs:
         condition: service_healthy
-    mem_limit: 1536m
-    memswap_limit: 1536m
+    # Sized from Phase 5's calibration run: peak 1294.3 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 1632m
+    memswap_limit: 1632m
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8083/"]
       interval: 10s
@@ -667,7 +681,8 @@ services:
   # database and the `airflow` CLI inside the network. Start it by name (`up -d --wait airflow-apiserver
   # airflow-scheduler airflow-dag-processor airflow-triggerer`), never with `just up`. The DAGs and the
   # plugins are mounted read-only; the apply function lives in plugins because the triggerer imports it
-  # from there. Memory limits are provisional until Phase 5's item 8 measures under load.
+  # from there. Memory limits come from Phase 5's calibration run (item 8), each with its measured peak
+  # in a comment.
   #
   # The one-shot that migrates the airflow database. The four services below wait for it.
   airflow-init:
@@ -685,8 +700,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    mem_limit: 768m
-    memswap_limit: 768m
+    # Sized from Phase 5's calibration run: peak 179.6 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 256m
+    memswap_limit: 256m
 
   airflow-apiserver:
     <<: *defaults
@@ -704,8 +720,9 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-    mem_limit: 512m
-    memswap_limit: 512m
+    # Sized from Phase 5's calibration run: peak 282.9 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 384m
+    memswap_limit: 384m
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
       interval: 30s
@@ -713,9 +730,9 @@ services:
       retries: 5
       start_period: 60s
 
-  # Provisional 1536m until Plan 05-05's calibration: LocalExecutor runs the dbt_build_lk task in this
-  # container (item 8), so the limit covers the scheduler's idle ~430 MiB plus dbt and DuckDB's 512MiB
-  # memory_limit. It alone mounts the dbt project, read-only; the task copies it to /tmp.
+  # LocalExecutor runs the dbt_build_lk task in this container (item 8), so the calibration run's
+  # peak covers the scheduler's idle ~430 MiB plus dbt and DuckDB's 512MiB memory_limit. It alone
+  # mounts the dbt project, read-only; the task copies it to /tmp.
   airflow-scheduler:
     <<: *defaults
     build:
@@ -733,8 +750,9 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-    mem_limit: 1536m
-    memswap_limit: 1536m
+    # Sized from Phase 5's calibration run: peak 720.5 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 928m
+    memswap_limit: 928m
     healthcheck:
       # `$$HOSTNAME` is the container's own shell variable, not a Compose interpolation.
       test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$HOSTNAME\""]
@@ -759,8 +777,9 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-    mem_limit: 512m
-    memswap_limit: 512m
+    # Sized from Phase 5's calibration run: peak 352.5 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 448m
+    memswap_limit: 448m
     healthcheck:
       test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$$HOSTNAME\""]
       interval: 30s
@@ -786,6 +805,7 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 400.4 MiB x 1.25, rounded up to 32 MiB
     mem_limit: 512m
     memswap_limit: 512m
     healthcheck:

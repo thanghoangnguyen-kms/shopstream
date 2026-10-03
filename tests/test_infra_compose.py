@@ -84,8 +84,9 @@ W05_RESERVE = 384 * MIB
 VM_BUDGET = 10 * 2**30
 CAPTURED_TABLES = ["customers", "products", "orders", "order_items"]
 CDC_TABLES = [*CAPTURED_TABLES, "reviews"]
-# ADR-001 go criterion 8: the Colima VM is 12 GiB and one GiB stays free. Provisional until Phase 5.
-LONG_RUNNING_BUDGET = 11 * 2**30
+# ADR-001 go criterion 8: one GiB of the VM stays free. The smaller of the two MemTotal figures
+# recorded for the 12 GiB Colima VM (`docker info` and the kernel's own), measured in Phase 5.
+MEASURED_MEM_TOTAL = 12_515_221_504
 
 
 def memory_bytes(value: str | int) -> int:
@@ -158,11 +159,12 @@ def test_every_service_has_equal_literal_memory_and_swap_limits() -> None:
 
 def test_the_starting_memory_limits() -> None:
     limits = {name: memory_bytes(service["mem_limit"]) for name, service in SERVICES.items()}
-    assert limits["postgres"] == 512 * MIB
-    assert limits["seaweedfs"] == 768 * MIB
-    assert limits["lakekeeper"] == 256 * MIB
-    # Plan 01-04 may raise Frankfurter's limit from the measured peak, never lower it.
-    assert limits["frankfurter"] >= 192 * MIB
+    # Phase 5's calibration run sized each of these from its measured peak (x 1.25, rounded up to a
+    # multiple of 32 MiB); the compose comments name the peaks.
+    assert limits["postgres"] == 384 * MIB
+    assert limits["seaweedfs"] == 704 * MIB
+    assert limits["lakekeeper"] == 64 * MIB
+    assert limits["frankfurter"] == 192 * MIB
 
 
 def test_core_limits_plus_the_w05_reserve_fit_the_vm_budget() -> None:
@@ -466,10 +468,10 @@ def test_the_probe_has_no_ambient_aws_configuration() -> None:
         assert ambient not in environment
 
 
-def test_the_spark_job_limits_are_the_literal_three_gigabyte_pair() -> None:
+def test_the_spark_job_limits_are_the_calibrated_literal_pair() -> None:
     service = SERVICES["spark-job"]
-    assert service["mem_limit"] == "3g"
-    assert service["memswap_limit"] == "3g"
+    assert service["mem_limit"] == "1248m"
+    assert service["memswap_limit"] == "1248m"
 
 
 def test_the_spark_job_tmpfs_is_exec_because_zstd_jni_maps_a_native_library_from_it() -> None:
@@ -562,8 +564,8 @@ def test_frankfurter_is_sized_for_its_memory_limit() -> None:
     assert "puma" in entrypoint
     assert "foreman" not in entrypoint
     assert frankfurter["command"] == []
-    assert memory_bytes(frankfurter["mem_limit"]) == 256 * MIB
-    assert memory_bytes(frankfurter["memswap_limit"]) == 256 * MIB
+    assert memory_bytes(frankfurter["mem_limit"]) == 192 * MIB
+    assert memory_bytes(frankfurter["memswap_limit"]) == 192 * MIB
 
 
 def test_the_frankfurter_volume_is_chowned_before_the_service_starts() -> None:
@@ -784,11 +786,13 @@ def test_create_topics_makes_every_topic_idempotently_at_replication_factor_thre
     assert "create control-iceberg-clicks 1\n" in CREATE_TOPICS
 
 
-def test_the_long_running_services_of_core_streaming_and_orchestration_fit_the_vm_budget() -> None:
-    # Provisional until Phase 5's item 8 measures under load.
-    long_running = (CORE | STREAMING | ORCHESTRATION) - one_shots()
-    total = sum(memory_bytes(SERVICES[name]["mem_limit"]) for name in long_running)
-    assert total <= LONG_RUNNING_BUDGET
+def test_the_measured_combination_fits_the_vm_ceiling() -> None:
+    # What `mem_report` sums for item 8: every limit of the three profiles, one-shots included,
+    # plus spark-job (owner decision 2 counts it). The ceiling is the measured MemTotal minus the
+    # 1 GiB that ADR-001's go criterion 8 keeps free; the calibration run is never judged by it.
+    counted = CORE | STREAMING | ORCHESTRATION | {"spark-job"}
+    total = sum(memory_bytes(SERVICES[name]["mem_limit"]) for name in counted)
+    assert total <= MEASURED_MEM_TOTAL - 2**30
 
 
 # --- the orchestration profile ----------------------------------------------------------------
@@ -829,11 +833,12 @@ def test_only_the_scheduler_mounts_the_dbt_project_and_it_is_read_only() -> None
         assert not [v for v in SERVICES[name]["volumes"] if "analytics" in v], name
 
 
-def test_the_scheduler_holds_the_provisional_dbt_task_limit_pair() -> None:
-    # LocalExecutor runs dbt_build_lk's task in this container. Plan 05-05 sizes it from measurement.
+def test_the_scheduler_holds_the_calibrated_dbt_task_limit_pair() -> None:
+    # LocalExecutor runs dbt_build_lk's task in this container; Phase 5's calibration run, which
+    # held that DAG run, measured a 720.5 MiB peak and sized the pair from it.
     scheduler = SERVICES["airflow-scheduler"]
-    assert scheduler["mem_limit"] == "1536m"
-    assert scheduler["memswap_limit"] == "1536m"
+    assert scheduler["mem_limit"] == "928m"
+    assert scheduler["memswap_limit"] == "928m"
 
 
 @pytest.mark.parametrize("name", sorted(ORCHESTRATION))
