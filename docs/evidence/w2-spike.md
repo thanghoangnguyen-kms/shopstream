@@ -82,6 +82,120 @@ catalog bootstrap: created
 exit=0
 ```
 
+### Second just up
+
+A second `uv run just up` of core on the running stack, on the memory limits sized under Item 8, recorded 2026-10-03. The `Creating`, `Created`, `Starting`, `Waiting` and `Running` state lines are dropped as above, and the bootstrap container's log, which keeps one pair of lines for every earlier run, is cut to its last pair. The transcript ends with the exit code.
+
+```text
+uv run python scripts/stack.py up
+VM memory ok: MemTotal 12515221504 B (11.66 GiB), threshold 12348030976 B (11.50 GiB)
+env file: up to date
+identity file: rendered
++ docker compose -f infra/compose.yaml --profile core up --wait --wait-timeout 300
+ Container shopstream-frankfurter-init-1 Started
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-lakekeeper-migrate-1 Started
+ Container shopstream-frankfurter-init-1 Exited
+ Container shopstream-lakekeeper-migrate-1 Exited
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-seaweedfs-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-frankfurter-init-1 Exited
+ Container shopstream-lakekeeper-migrate-1 Exited
+ Container shopstream-lakekeeper-1 Healthy
+ Container shopstream-frankfurter-1 Healthy
++ docker compose -f infra/compose.yaml --profile core --profile bootstrap run --rm warehouse
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-lakekeeper-migrate-1 Started
+ Container shopstream-lakekeeper-migrate-1 Exited
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-lakekeeper-1 Healthy
+ Container shopstream-seaweedfs-1 Healthy
+ Container shopstream-bootstrap-1 Started
+ Container shopstream-bootstrap-1 Exited
+ Container shopstream-seaweedfs-1 Healthy
+ Container shopstream-lakekeeper-1 Healthy
+warehouse spike: exists
++ docker compose -f infra/compose.yaml --profile core --profile bootstrap logs --no-log-prefix bootstrap
+bucket warehouse: exists
+catalog bootstrap: exists
+exit=0
+```
+
+### Combined profiles just up
+
+`COMPOSE_PROFILES=streaming,orchestration uv run just up` starting item 8's combination (core, streaming and orchestration) on the same limits, recorded 2026-10-03 and trimmed the same way. The transcript ends with the exit code.
+
+```text
+uv run python scripts/stack.py up
+VM memory ok: MemTotal 12515221504 B (11.66 GiB), threshold 12348030976 B (11.50 GiB)
+env file: up to date
+identity file: rendered
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration up --wait --wait-timeout 300
+ Container shopstream-frankfurter-init-1 Started
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-kafka-3-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-kafka-2-1 Healthy
+ Container shopstream-kafka-1-1 Healthy
+ Container shopstream-frankfurter-init-1 Exited
+ Container shopstream-airflow-init-1 Started
+ Container shopstream-kafka-init-1 Started
+ Container shopstream-lakekeeper-migrate-1 Started
+ Container shopstream-cdc-init-1 Started
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-lakekeeper-migrate-1 Exited
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-airflow-init-1 Exited
+ Container shopstream-airflow-init-1 Exited
+ Container shopstream-airflow-init-1 Exited
+ Container shopstream-airflow-init-1 Exited
+ Container shopstream-kafka-init-1 Exited
+ Container shopstream-karapace-1 Healthy
+ Container shopstream-seaweedfs-1 Healthy
+ Container shopstream-kafka-init-1 Exited
+ Container shopstream-cdc-init-1 Exited
+ Container shopstream-lakekeeper-1 Healthy
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-connect-1 Healthy
+ Container shopstream-cdc-init-1 Exited
+ Container shopstream-airflow-apiserver-1 Healthy
+ Container shopstream-lakekeeper-migrate-1 Exited
+ Container shopstream-frankfurter-init-1 Exited
+ Container shopstream-kafka-init-1 Exited
+ Container shopstream-seaweedfs-1 Healthy
+ Container shopstream-airflow-dag-processor-1 Healthy
+ Container shopstream-airflow-triggerer-1 Healthy
+ Container shopstream-lakekeeper-1 Healthy
+ Container shopstream-airflow-scheduler-1 Healthy
+ Container shopstream-airflow-init-1 Exited
+ Container shopstream-frankfurter-1 Healthy
+ Container shopstream-kafka-3-1 Healthy
+ Container shopstream-karapace-1 Healthy
+ Container shopstream-kafka-1-1 Healthy
+ Container shopstream-kafka-2-1 Healthy
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration --profile bootstrap run --rm warehouse
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-lakekeeper-migrate-1 Started
+ Container shopstream-lakekeeper-migrate-1 Exited
+ Container shopstream-postgres-1 Healthy
+ Container shopstream-seaweedfs-1 Healthy
+ Container shopstream-lakekeeper-1 Healthy
+ Container shopstream-bootstrap-1 Started
+ Container shopstream-bootstrap-1 Exited
+ Container shopstream-lakekeeper-1 Healthy
+ Container shopstream-seaweedfs-1 Healthy
+warehouse spike: exists
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration --profile bootstrap logs --no-log-prefix bootstrap
+bucket warehouse: exists
+catalog bootstrap: exists
+exit=0
+```
+
 ### Services
 
 ```text
@@ -1097,7 +1211,150 @@ Timing: poll interval median 99.9 ms, maximum 297.3 ms; switch duration median 1
 
 ## Item 8: RAM budget
 
-Not run.
+Recorded 2026-10-03.
+
+Verdict: go. The peak summed sample of the three-broker combination under the Week 14 load was 6.74 GiB against the 10 GiB budget, the sum of the compose `mem_limit` values (core, streaming and orchestration plus `spark-job`) was 10.12 GiB against 10.66 GiB (MemTotal minus 1 GiB), and no container was OOM-killed, restarted or stopped with exit code 137.
+
+A tested rule (`item8_verdict` in `scripts/ram_budget.py`) decides, over `just mem-report`'s `--json-out` and the run's window record. It never judges an uncalibrated run, so the calibration run below was never judged. It calls a harness failure inconclusive (too few frames with container rows, a window in which the generator, a Spark run and the DAG run were not all active at one instant, a long-running service never sampled, a service with no `mem_limit`). Otherwise it gives go only when the peak summed sample is at most 10 GiB, the limits sum is at most MemTotal minus 1 GiB (both hold at equality) and no container was OOM-killed or exited 137. The calibration policy is the owner's: `spark-job` counts in the total, every sampled service's limit is its calibration peak x 1.25 rounded up to a multiple of 32 MiB, a page-cache service (the three brokers and SeaweedFS) is never raised by that formula, and a limits-only failure before calibration is tuning, not a verdict.
+
+### Versions and runtime
+
+- Colima 0.10.3 on the Apple Virtualization framework (`vz`) with virtiofs mounts; Docker 29.6.2 client and 29.5.2 server; Docker Compose 5.3.1.
+- VM size: 12 GiB of memory, 4 CPUs and a 40 GiB disk. `docker info` reports MemTotal 12,515,221,504 B (11.66 GiB) on 2026-10-03, 4,096 B below the 12,515,225,600 B the Platform base recorded on 2026-09-30, so the smaller figure sets the ceiling: 11,441,479,680 B (10.66 GiB).
+- The run: the sampler and the load started at 16:21:05 UTC on 2026-10-03, and the drain check ended at 16:27:14 UTC, a duration of 368.9 s (6 min 9 s) with 74 frames, one every 5 s.
+- Kafka 4.3.1 at three combined broker and controller nodes; Connect 4.3.0 (the Debezium 3.6.3.Final image) with the Iceberg sink 1.11.0; Karapace 6.2.3; Lakekeeper 0.13.6; SeaweedFS 4.47; Postgres 17.11.
+- Airflow 3.3.2 with dbt-core 1.12.5, dbt-duckdb 1.11.0 and DuckDB 1.5.5 in the scheduler's `/opt/dbt` environment.
+- The Spark job runs on item 14's image: Spark and PySpark 4.1.3, Iceberg 1.11.0, OpenJDK 21 and Python 3.13.15.
+
+### Combination
+
+- Profiles: `core`, `streaming` and `orchestration`, started by `just up`, plus two `spike` containers that never belong to the platform: `spark-job` and the load generator `cdc-run`. The thirteen long-running services were healthy before the window and still healthy after it, with an unbroken uptime, so none restarted.
+- The clickstream sink ran under item 12's load (7,003,500 events at about 20,000 events/s through three brokers at replication factor 3, a 60 s commit interval). The Postgres CDC source and its Iceberg sink were registered and idle (no CDC workload ran in the window): after the run all three connectors reported RUNNING with one RUNNING task each.
+- Item 2's MERGE job looped on item 14's image: 9 runs, all exit 0, of 46.0, 51.3, 20.1, 26.8, 27.3, 29.1, 32.0, 37.6, 27.7 s.
+- One `dbt_build_lk` DAG run (item 3's `dbt build --target lk --select +inc_v3`, four of four steps) ran inside the scheduler on LocalExecutor from 16:22:41 to 16:23:18 UTC, 37.2 s, state success, with DuckDB's `memory_limit` set to 512MiB in the `lk` profile (a `dbt show` in the scheduler prints 512.0 MiB, so the setting is applied).
+- The core `frankfurter` ran web-only (the owner's choice, serving only the ECB-seeded volume), peak 91.0 MiB.
+- The load generator's own container is counted in the peak summed sample. `cdc-run` peaked at 219.8 MiB (the generator and the drain check both run in it), so a reader who wants the platform alone subtracts about 0.21 GiB.
+
+### Calibration
+
+The calibration run used the same window as the verdict run (7,003,500 events with knobs, the Spark loop and one `dbt_build_lk` run, 74 frames) on the limits that were in the compose file before it, and its report is not judged: on those limits it showed `sum(mem_limit)` over the ceiling (11.09 GiB, 14.09 GiB with `spark-job`), as expected. The limits were then sized from the largest peak of three captures: the calibration window, a bring-up sample of `just up` (8 frames) and a re-run of the two one-shots under a 1 s sampler (72 frames), because the bring-up sample saw `kafka-init` in three frames and `airflow-init` in one. Each limit is the peak x 1.25 rounded up to a multiple of 32 MiB, as equal literal `mem_limit` and `memswap_limit` values, and the compose file names the peak beside each. A one-shot that was never sampled keeps its limit. Peaks come from `docker stats`, which counts page cache and prints four significant digits.
+
+| Service | Calibration peak (MiB) | Old limit (MiB) | New limit (MiB) | Rule |
+| --- | ---: | ---: | ---: | --- |
+| connect | 1,294.3 | 1,536 | 1,632 | sized |
+| kafka-1 | 815.3 | 1,024 | 1,024 | sized (the formula gives 1,024) |
+| kafka-2 | 825.9 | 1,024 | 1,024 | capped: page cache, the formula would raise it to 1,056 |
+| kafka-3 | 813.9 | 1,024 | 1,024 | sized (the formula gives 1,024) |
+| spark-job | 985.7 | 3,072 | 1,248 | sized (counted in the total) |
+| airflow-scheduler | 720.5 | 1,536 | 928 | sized |
+| seaweedfs | 548.8 | 768 | 704 | sized (the formula lowers it, so no cap applies) |
+| airflow-triggerer | 400.4 | 512 | 512 | sized (the formula gives 512) |
+| airflow-dag-processor | 352.5 | 512 | 448 | sized |
+| airflow-apiserver | 282.9 | 512 | 384 | sized |
+| postgres | 281.9 | 512 | 384 | sized |
+| cdc-run | 263.7 | 2,048 | 2,048 | kept: the load generator, never part of the platform |
+| frankfurter | 142.4 | 256 | 192 | sized |
+| karapace | 111.4 | 512 | 160 | sized |
+| airflow-init | 179.6 | 768 | 256 | sized, from the one-shot re-run |
+| kafka-init | 107.8 | 384 | 160 | sized, from the one-shot re-run |
+| lakekeeper | 50.6 | 256 | 64 | sized |
+| lakekeeper-migrate | not sampled | 128 | 128 | kept: a one-shot shorter than one 5 s frame |
+| frankfurter-init | not sampled | 32 | 32 | kept: a one-shot shorter than one 5 s frame |
+| cdc-init | not sampled | 64 | 64 | kept: a one-shot shorter than one 5 s frame |
+
+The `mem_limit` sum over the three profiles went from 11.09 GiB to 8.91 GiB, and with `spark-job` from 14.09 GiB to 10.12 GiB.
+
+### Command and output
+
+`window` starts the sampler and `docker events`, runs the generator, the Spark loop (from 60 s) and the DAG run (from 90 s), drains the sink and writes the window record. The verdict reads the report and the record.
+
+```text
+$ uv run --frozen python scripts/ram_budget.py window --cap verdict --events 7000000 --rate 20000 --procs 2 --seed 20261008 --knobs --spark-delay 60 --dag-delay 90
+$ COMPOSE_PROFILES=streaming,orchestration uv run just mem-report --samples samples.jsonl --events events.txt --json-out mem-report.json --min-frames 60 --with-service spark-job
+$ uv run --frozen python scripts/ram_budget.py verdict --report mem-report.json --window window.json --calibrated --min-frames 60
+{"calibrated": true, "ceiling": 11441479680, "fallback": null, "headroom": {"limit_headroom_bytes": 569843712, "peak_headroom_bytes": 3497841919, "w05_reserve_bytes": 402653184, "w05_reserve_fits": true}, "limit_total": 10871635968, "overlap": {"all_active": true, "overlap_ms": 36173, "window": [1791044561677, 1791044598855]}, "peak_sum": 7239576321, "reasons": [], "verdict": "go"}
+```
+
+The report, trimmed: the per-service table, the totals, the VM line, the OOM and restart check and the events summary. Mem-report prints one identical line for each of the nine Spark run containers, and one is shown here. Docker stats samples every 5 s, so a short peak can fall between two frames, which is why the OOM, restart, state and event checks sit beside the peaks; every service has restart `no`, so RestartCount stays 0 unless a restart policy is added.
+
+```text
+uv run python scripts/mem_report.py report "$@"
+mem-report: 74 frames with container rows, 2026-10-03T16:21:05Z to 2026-10-03T16:27:11Z; 0 lines skipped, 0 frames without container rows
+service                 peak MiB  mem_limit MiB
+connect                   1400.8         1632.0
+kafka-1                    811.3         1024.0
+kafka-2                    800.9         1024.0
+kafka-3                    798.5         1024.0
+spark-job                  794.8         1248.0
+airflow-scheduler          675.0          928.0
+seaweedfs                  488.2          704.0
+airflow-triggerer          382.5          512.0
+airflow-dag-processor      345.4          448.0
+airflow-apiserver          280.2          384.0
+cdc-run                    219.8         2048.0
+postgres                   165.8          384.0
+karapace                   118.9          160.0
+frankfurter                 91.0          192.0
+lakekeeper                  39.9           64.0
+peak summed sample: 6.74 GiB at 2026-10-03T16:26:36Z (budget 10.00 GiB)
+sum(mem_limit) for profiles core, streaming, orchestration: 8.91 GiB
+sum(mem_limit) with spark-job: 10.12 GiB
+sum(mem_limit) with the 384 MiB W05 reserve: 10.50 GiB
+VM MemTotal 11.66 GiB, minus 1 GiB leaves 10.66 GiB: limits ok
+OOMKilled and RestartCount per container:
+  airflow-apiserver: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  airflow-dag-processor: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  airflow-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  airflow-scheduler: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  airflow-triggerer: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  bootstrap: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  cdc-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  connect: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  frankfurter: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  frankfurter-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  kafka-1: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  kafka-2: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  kafka-3: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  kafka-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  karapace: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  lakekeeper: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  lakekeeper-migrate: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+  postgres: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  seaweedfs: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+  spark-job: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+events capture events.txt: 11 oom or die events
+mem-report: ok
+exit=0
+```
+
+### Overlap
+
+All times are UTC on 2026-10-03.
+
+- Generator: 16:21:06 to 16:26:56.
+- Spark runs: 9 back to back from 16:22:06 to 16:27:12; run 1 ran 16:22:06 to 16:22:52 and run 2 16:22:53 to 16:23:44.
+- `dbt_build_lk` DAG run: 16:22:41 to 16:23:18.
+- All three were active at once for 36,173 ms: the DAG run's 37,178 ms less the 1,005 ms between Spark runs 1 and 2. The sink was committing every 60 s throughout. The peak summed sample (16:26:36) fell after the DAG run had finished, with the generator, a Spark run and the sink still active.
+
+### Headroom
+
+- Under the peak budget: 10 GiB minus the peak summed sample leaves 3,497,841,919 B (3.26 GiB).
+- Under the ceiling: 11,441,479,680 B minus `sum(mem_limit)` of 10,871,635,968 B leaves 569,843,712 B (543.4 MiB).
+- The 384 MiB (402,653,184 B) Week 5 reserve for OpenFGA and mock-oauth2-server fits both headrooms, leaving 167,190,528 B (159.4 MiB) of limit headroom beyond it. The reserve is an allowance, not a measurement of those two services.
+
+### VM check
+
+`colima ssh -- sudo dmesg`, filtered in memory for out-of-memory killer lines (only the count was kept), found 0 such lines after the run.
+
+### FALL-03
+
+FALL-03: N/A. Item 8 is go at three brokers (this section's verdict), so the one-broker rerun is not needed.
+
+### Consequences
+
+- ADR-001 item 8 is go: three KRaft brokers at replication factor 3 stand, and the combination of core, streaming and orchestration plus the Spark job fits the 12 GiB VM on the sized limits.
+- The limits are 1.25 x the peak of this load and no more: `lakekeeper` is at 64 MiB, `kafka-init` at 160 MiB and `airflow-init` at 256 MiB. The `dbt_build_lk` build is item 3's four-step build over a handful of rows, so Week 8's heavier models will need the scheduler's 928 MiB re-measured.
+- Phase 6 mirrors this verdict into ADR-001's Results table.
 
 ## Item 9: dbt login
 
@@ -1506,11 +1763,160 @@ For analytics-eng, who owns SCD2. These are measurements; no decision is written
 
 ## Item 12: Throughput
 
-Not run.
+Recorded 2026-10-03.
+
+Verdict: go. The clickstream sink committed 7,002,800 events in 6 commits at 60 s, a committed throughput of 19,199.4 events/s against the 14,000 events/s floor (the rows of commits 2 to 6 over the time from commit 1 to commit 6), and the 50,000,000-event projection of 7.02 GiB is 17.5 percent of the 40 GiB VM disk against the 75 percent limit.
+
+A tested rule (`item12_verdict` in `scripts/throughput_check.py`) decides, over files captured from the run. It gives go only when there are at least 5 commits and 5,000,000 committed events, committed throughput is at least 14,000 events/s, bronze's (partition, offset) islands equal the generator's delivered runs minus its malformed offsets, no (partition, offset) is held twice, event duplicates equal the generator's intended count, the malformed offsets equal the dead-letter topic's record count, and the projection is within 75 percent of the primary disk. A failed criterion is a fallback that names it; a harness failure (fewer than 5,000,000 delivered events, a generator-bound run, counts that disagree with Kafka's offsets, a missing input) is inconclusive and was never recorded.
+
+### Versions
+
+- Kafka 4.3.1, three combined nodes; Karapace 6.2.3 with `confluent-kafka` 2.15.1 and `fastavro` 1.12.2 in the generator.
+- Connect 4.3.0 (the Debezium 3.6.3.Final image) with the Iceberg sink 1.11.0; Lakekeeper 0.13.6; SeaweedFS 4.47.
+- DuckDB 1.5.5 reads bronze for the set check.
+- Colima 0.10.3, Docker 29.6.2 and Compose 5.3.1 on a 12 GiB, 4 CPU VM (see Item 8).
+
+### Load
+
+The generator is a one-off load script (`scripts/clickstream_load.py`), so its command line and seed are recorded here, as ADR-001's Evidence rules ask. It ran inside the `cdc-run` container, started by `ram_budget.py window`:
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --no-deps -T --rm cdc-run python /app/clickstream_load.py run --events 7000000 --rate 20000.0 --procs 2 --seed 20261008 --knobs
+```
+
+- Events: `event_id`, `session_id`, `customer_id`, `product_id`, `event_type`, `event_time` (timestamp-millis), `page`, `user_agent`, `referrer` (a union with the default "direct") and `tag` (a union with null), Avro in Confluent's wire format with schema ids 14 and 15 under the Karapace subjects `clickstream-key` and `clickstream-value`. The key is the `event_id` string. A seed repeats a batch exactly.
+- Topic: 6 partitions at replication factor 3 and `min.insync.replicas` 2, from `kafka-topics.sh --describe`:
+
+```text
+Topic: clickstream	TopicId: rxiasWEdRcO1TB62DBuIiQ	PartitionCount: 6	ReplicationFactor: 3	Configs: min.insync.replicas=2,cleanup.policy=delete
+```
+
+- Producer: idempotent, `acks` all, `compression.type` lz4, `linger.ms` 20, `batch.size` 131072 (128 KiB), in 2 processes that own three partitions each.
+- Target 20,000 events/s, achieved 20,009.3 events/s. The generator delivered 7,003,500 records (7,000,000 events plus 3,500 intended duplicate sends) in 350.0 s with 0 failed, and its offsets agreed with Kafka's.
+- The knobs rode in the run: duplicates, out-of-order and late events, malformed values, explicit null referrers, a hot product and customer, and one canary event (Item 13).
+
+### Sink
+
+- `clickstream-sink`, `iceberg.control.commit.interval-ms` 60000, `tasks.max` 1. No tuning lever was pulled: the sink kept up with the default consumer settings.
+- It appends to `bronze.clickstream`, a v2 table the sink created on the `main` branch (the owner's choice; the sink is append-only, G3).
+- The dead-letter topic `clickstream.dlq` has one partition at replication factor 3, with `errors.tolerance` all and the record contents kept out of the Connect log.
+
+### Commits
+
+Commits are read from the table's snapshot metadata. The first commit landed 53.3 s after the generator started.
+
+| Commit | Offset from commit 1 (s) | Gap since the previous commit (s) | Rows |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.0 | n/a | 1,040,892 |
+| 2 | 64.9 | 64.9 | 1,133,686 |
+| 3 | 120.4 | 55.5 | 1,285,364 |
+| 4 | 180.5 | 60.1 | 1,202,124 |
+| 5 | 241.6 | 61.1 | 1,197,157 |
+| 6 | 310.5 | 69.0 | 1,143,577 |
+
+Committed throughput over commits 2 to 6 is 5,961,908 rows over 310.525 s (the time from commit 1 to commit 6), 19,199.4 events/s. Commit 6 holds the drain's remainder.
+
+### Set check
+
+```text
+$ RUN /app/throughput_check.py analyze > analysis.json        (RUN: docker compose ... run --rm -T cdc-run python)
+$ throughput_check.py verdict --analysis analysis.json --generator gen.json --logdirs logdirs.txt --disk disk.json
+set_check: equal true, missing 0, extra 0, missing_allowed 700
+sink_duplicates: 0
+event_duplicates_intended: 3500
+event_duplicates_observed: 3500
+malformed_allowed_missing: 700 (dead-letter records 700)
+```
+
+The generator's delivered offsets form per-partition runs (7,003,500 records over 6 partitions, equal to Kafka's end offsets). Bronze holds 7,002,800 rows, which is those records minus the 700 malformed ones, and its islands equal the generator's runs minus the malformed offsets: missing 0, extra 0. The 700 allowed-missing records equal the dead-letter topic's 700, and no (partition, offset) is held twice in bronze (7,002,800 distinct offsets), so sink duplicates are 0. The 3,500 intended duplicates are the same bytes sent twice, and 3,500 event duplicates (rows minus distinct `event_id`) were observed beside them.
+
+### Disk
+
+```text
+$ docker compose -f infra/compose.yaml --profile core --profile streaming exec -T kafka-1 /opt/kafka/bin/kafka-log-dirs.sh --bootstrap-server localhost:19092 --describe --topic-list clickstream
+$ colima ssh -- df -B1 --output=size,used,avail /var/lib/docker
+$ throughput_check.py disk --colima-list colima-list.json --df df.txt --primary colima
+kafka_bytes: 960779925 (18 replicas on 3 brokers)
+kafka_bytes_per_million_events: 137185683
+bronze_bytes: 94352678 (6 data files)
+bronze_bytes_per_million_events: 13473565
+projected_bytes_for_50000000_events: 7532962337
+colima_disk_bytes: 42949672960   threshold 32212254720 (75 percent)   projection 17.5 percent
+df_size_bytes: 63088406528       threshold 47316304896 (75 percent)   projection 11.9 percent
+```
+
+- Kafka's bytes come from `kafka-log-dirs.sh` for the `clickstream` topic: 18 replicas (6 partitions x 3), so every replica is already in the figure and nothing is multiplied by the replication factor again. That is 137,185,683 B per million events across the cluster, and bronze's data files are 13,473,565 B per million rows.
+- The 50,000,000-event projection is 7,532,962,337 B (7.02 GiB). The owner chose the stricter `colima list` figure as the primary disk: 40 GiB, so the 75 percent threshold is 30 GiB (32,212,254,720 B) and the projection is 17.5 percent of the disk. Against `df` inside the VM (a 59 GiB `/var/lib/docker` shared with unrelated images) the threshold is 47,316,304,896 B and the projection is 11.9 percent. Both pass.
+- SeaweedFS's `du -sk /data` read 124,588 KB before the run and 219,436 KB after, a rise of about 97 MB against bronze's 94.4 MB of data files, as a cross-check only.
+- The projection depends on the producer's lz4 compression, and on this generator's data: its synthetic events compress far better than real clickstream (137 B per event across the 18 replicas here), so Week 14's real events will need more space than this figure.
+
+### Consequences
+
+- ADR-001 item 12 is go: Kafka carries the Week 14 volume at three brokers through the Iceberg sink at a 60 s commit interval, and the fallback (Spark bulk-loading the volume into its own bronze table with a disjoint `event_id` range, Kafka carrying a smaller live stream) is not taken.
+- Week 14 should size its disk check on real event sizes, not on this projection alone.
+- Phase 6 mirrors this verdict into ADR-001's Results table.
 
 ## Item 13: Knob reachability
 
-Not run.
+Recorded 2026-10-03.
+
+Verdict: go. All eleven of the eleven Knob paths rows were detected: the five CDC rows and the CDC half of the canary from item 11's main run, the five clickstream rows and the clickstream canary from this run, and the FX row from item 10's check in the dlt destination.
+
+A tested rule (`item13_verdict` in `scripts/throughput_check.py`) decides, over the eleven rows of ADR-001's Knob paths table in order (a test compares its rows with the ADR's). Each row has its own check, and a knob counts as detected only when its detected count is above 0 and equals the generator's expected count where one exists. A missing input (no bronze table, no dead-letter count, no item 11 or item 10 capture) is inconclusive, never go or fallback, and any undetected knob is a fallback that names it.
+
+### Commands
+
+```text
+$ RUN /app/throughput_check.py knobs --lateness-ms 600000 --hot-product 1 --hot-customer 1 > knobs.json
+$ RUN /app/throughput_check.py dlq > dlq.json
+$ throughput_check.py item13 --cdc item11.json --fx item10.log --knobs knobs.json --dlq dlq.json --generator gen.json --fx-decision 5a
+verdict: go, 11 of 11 rows detected
+```
+
+The clickstream checks ran after the sampler stopped. The generator command line and seed (20261008) are under Item 12.
+
+### Knob paths
+
+| Knob | Path | Check | Result | Source |
+| --- | --- | --- | --- | --- |
+| Inserts, updates, deletes and SCD2 changes | CDC | op counts per table in bronze | all five tables carry `c`, `u` and `d` rows: 1,589 to 1,658 inserts, 1,960 to 1,999 updates, 713 to 756 deletes | Item 11's main run |
+| `ALTER TABLE` schema drift | CDC | Karapace subject versions and the optional bronze column | versions 1 and 2, and 443 customer changes carry the new `tier` value | Item 11's main run |
+| Late-arriving product | CDC | `source.lsn` order of an `order_items` row against its product | 5 of 5 | Item 11's main run |
+| Erasure canary | CDC and clickstream | rows holding the canary, compared in memory and counted | CDC 1, clickstream 1 | Item 11's main run for CDC and this run for clickstream |
+| Seeded prompt-injection review | CDC | a known `reviews` row and the hash of its body | 1 row, the hash matched | Item 11's main run |
+| Duplicate events | Clickstream | bronze rows minus distinct `event_id` | 3,500 of 3,500 | this run |
+| Out-of-order events | Clickstream | a row's event time below the previous row's in offset order | 6,068 of 6,068 | this run |
+| Malformed events | Clickstream | records on the dead-letter topic, and their header offsets | 700 of 700, header offsets equal the generator's malformed runs | this run |
+| Events beyond the watermark | Clickstream | a row more than 10 minutes (600,000 ms) behind the running maximum event time | 1,400 of 1,400 | this run |
+| Hot key | Clickstream | top product and customer shares against the configured 0.2 | product 1 at 0.2503, customer 1 at 0.2499 | this run |
+| FX weekend and holiday gaps | dlt FX pipeline | item 10's check in the dlt destination | 134 missing weekdays, all 134 are TARGET closing days, 0 weekend rows, 0 closing days with rows | Item 10, with Iceberg landing deferred to Week 9 |
+
+### Clickstream knobs
+
+| Knob | Expected | Detected |
+| --- | ---: | ---: |
+| Duplicate events | 3,500 | 3,500 |
+| Out-of-order events (90 s back) | 6,068 | 6,068 |
+| Malformed events | 700 | 700 |
+| Events beyond the watermark (15 minutes back) | 1,400 | 1,400 |
+| Hot product 1 rows | 1,752,800 | 1,752,800 |
+| Hot customer 1 rows | 1,750,000 | 1,750,000 |
+| Canary events | 1 | 1 |
+
+- The lateness bound is 10 minutes (600,000 ms). The out-of-order count includes the beyond-watermark rows, because a row 15 minutes back is also below the previous row.
+- The configured hot share is 0.2. The generator injects 0.25 of the events on each hot key, and bronze shows 0.2503 for product 1 and 0.2499 for customer 1, both at or above 0.2.
+- The canary count is 1: one event carried it, and it was compared in memory and counted. Its value is in no capture, and the hit count of the canary over this run's captures is 0.
+- The dead-letter records carry these header keys: `__connect.errors.class.name`, `__connect.errors.connector.name`, `__connect.errors.exception.class.name`, `__connect.errors.exception.message`, `__connect.errors.exception.stacktrace`, `__connect.errors.offset`, `__connect.errors.partition`, `__connect.errors.stage`, `__connect.errors.task.id`, `__connect.errors.topic`. Only the keys and the two numeric offset headers were read; the failing record's contents were not.
+- The rates (about 0.09 percent out of order, 0.05 percent duplicate, 0.01 percent malformed) are the generator's own choice, a stand-in for Week 13's messiness, not a measured clickstream.
+
+### Null-default observation (apache/iceberg#17652)
+
+An observation beside the verdict, outside it. The generator sent 2,334 events with an explicit null `referrer`, whose schema default is "direct". Bronze holds 2,334 rows with a null `referrer` and 0 rows holding the default. In this run the sink kept the explicit nulls, so the default was not substituted for them.
+
+### Consequences
+
+- ADR-001 item 13 is go: every knob reaches bronze on a path that can detect it, so no knob moves to a different path. The FX row's Iceberg landing is deferred to Week 9, where the dlt destination is chosen.
+- Phase 6 mirrors this verdict into ADR-001's Results table.
 
 ## Item 14: Spark on Python 3.13
 
