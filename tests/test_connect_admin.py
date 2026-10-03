@@ -280,6 +280,23 @@ def test_wait_running_polls_until_the_tasks_are_running(monkeypatch: pytest.Monk
     assert slept == [2.0, 2.0]
 
 
+def test_wait_running_waits_through_a_status_that_does_not_exist_yet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = Script(
+        {
+            ("GET", "/connectors/shopstream-cdc/status"): [
+                (404, b'{"message": "No status found for connector shopstream-cdc"}'),
+                running("x"),
+            ]
+        }
+    )
+    monkeypatch.setattr(ca, "http_request", script)
+    slept: list[float] = []
+    assert ca.wait_running(ca.SOURCE_NAME, sleep=slept.append) == "RUNNING"
+    assert slept == [2.0]
+
+
 def test_wait_running_raises_on_a_failed_task_and_the_message_holds_no_config_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -201,9 +201,15 @@ def put_config(name: str, config: Mapping[str, str]) -> None:
         raise RuntimeError(_error_line(name, status, payload))
 
 
-def connector_status(name: str) -> dict[str, Any]:
-    """GET /connectors/<name>/status as a dict; a missing connector raises."""
+def connector_status(name: str, *, allow_pending: bool = False) -> dict[str, Any]:
+    """GET /connectors/<name>/status as a dict; a missing connector raises.
+
+    With `allow_pending`, a 404 returns {} instead: right after a PUT on a freshly started worker
+    the connector exists before Connect has written its first status.
+    """
     status, payload = http_request("GET", f"{CONNECT_URL}/connectors/{name}/status", {}, None)
+    if allow_pending and status == 404:
+        return {}
     parsed = _json(payload)
     if status != 200 or not isinstance(parsed, dict):
         raise RuntimeError(_error_line(name, status, payload))
@@ -259,7 +265,7 @@ def wait_running(
     deadline = clock() + timeout_s
     state = "UNKNOWN"
     while True:
-        report = connector_status(name)
+        report = connector_status(name, allow_pending=True)
         state = state_of(report)
         if state == RUNNING:
             return state
