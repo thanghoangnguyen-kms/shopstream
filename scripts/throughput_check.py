@@ -150,6 +150,65 @@ def offset_runs(offsets: Iterable[int]) -> tuple[list[list[int]], int]:
     return runs, duplicates
 
 
+# --- RED stubs: signatures only, each failure is the planned behaviour missing -------------------
+
+RESET_CONNECTOR = "clickstream-sink"
+RESET_TABLE = "clickstream"
+RESET_TOPICS = ("clickstream", "clickstream.dlq", "control-iceberg-clicks")
+
+
+def compare_runs(
+    expected: Mapping[Any, Sequence[Sequence[int]]],
+    bronze: Mapping[Any, Sequence[Sequence[int]]],
+    allowed_missing: Mapping[Any, Sequence[Sequence[int]]],
+) -> dict[str, Any]:
+    raise NotImplementedError
+
+
+def islands_from_rows(rows: Iterable[Sequence[int]]) -> dict[int, list[list[int]]]:
+    raise NotImplementedError
+
+
+def parse_log_dirs(text: str, topic: str = TOPIC) -> dict[str, int]:
+    raise NotImplementedError
+
+
+def parse_df(text: str) -> dict[str, int]:
+    raise NotImplementedError
+
+
+def parse_colima_list(text: str, profile: str = "default") -> dict[str, int]:
+    raise NotImplementedError
+
+
+def disk_projection(
+    kafka_bytes: int, kafka_records: int, bronze_bytes: int, bronze_rows: int
+) -> int:
+    raise NotImplementedError
+
+
+def within_disk(projected: int, disk_bytes: int) -> bool:
+    raise NotImplementedError
+
+
+def item12_verdict(
+    analysis: Mapping[str, Any],
+    generator: Mapping[str, Any],
+    logdirs: Mapping[str, Any],
+    disk: Mapping[str, Any],
+    primary: str | None = None,
+) -> dict[str, Any]:
+    raise NotImplementedError
+
+
+def groups_to_delete(group_ids: Iterable[str]) -> list[str]:
+    raise NotImplementedError
+
+
+def reset() -> dict[str, Any]:
+    raise NotImplementedError
+
+
 # --- live: bronze.clickstream's snapshot metadata (cdc-run) -------------------------------------
 
 
