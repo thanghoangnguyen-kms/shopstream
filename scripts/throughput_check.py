@@ -635,6 +635,95 @@ def item12_verdict(
     return _verdict_result("fallback" if reasons else "go", reasons, figures)
 
 
+# --- item 13: the knob rows, each clickstream knob's own check, the verdict ------------------------
+
+# ADR-001's Knob paths table, row for row (a test reads the ADR and compares).
+KNOB_ROWS: tuple[dict[str, str], ...] = (
+    {
+        "knob": "Inserts, updates, deletes and SCD2 changes",
+        "path": "CDC",
+        "detected_by": "One row per change, with `op` in `c`, `u` or `d`",
+    },
+    {
+        "knob": "`ALTER TABLE` schema drift",
+        "path": "CDC",
+        "detected_by": "A new column appears in the bronze schema, and Karapace records a new schema version",
+    },
+    {
+        "knob": "Late-arriving product",
+        "path": "CDC",
+        "detected_by": "An `order_items` row whose commit LSN is lower than its product's insert LSN (there's no foreign key on `product_id`)",
+    },
+    {
+        "knob": "Erasure canary",
+        "path": "CDC and clickstream",
+        "detected_by": "The canary's hashed token is found in both bronze tables, counted, never printed",
+    },
+    {
+        "knob": "Seeded prompt-injection review",
+        "path": "CDC",
+        "detected_by": "Its row lands in bronze; it has to reach gold, which only CDC feeds, and the Week 3 generator names the column",
+    },
+    {
+        "knob": "Duplicate events",
+        "path": "Clickstream",
+        "detected_by": "The same `event_id` at two offsets",
+    },
+    {
+        "knob": "Out-of-order events",
+        "path": "Clickstream",
+        "detected_by": "Event-time order differs from offset order within a partition",
+    },
+    {
+        "knob": "Malformed events",
+        "path": "Clickstream",
+        "detected_by": "A record in the sink's dead-letter topic; Postgres rejects wrong types, so CDC can't carry one",
+    },
+    {
+        "knob": "Events beyond the watermark",
+        "path": "Clickstream",
+        "detected_by": "Event time older than the running maximum event time over earlier offsets in its partition, minus the lateness bound the load generator states (Week 13's watermark may change it)",
+    },
+    {
+        "knob": "Hot key",
+        "path": "Clickstream",
+        "detected_by": "One product and one customer each hold at least the configured share of events",
+    },
+    {
+        "knob": "FX weekend and holiday gaps",
+        "path": "dlt FX pipeline",
+        "detected_by": "Missing dates in `bronze.fx_rates` match the ECB calendar (item 10)",
+    },
+)
+
+
+def knob_checks(
+    bronze: Mapping[str, Any] | None,
+    dlq: Mapping[str, Any] | None,
+    generator_knobs: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    raise NotImplementedError
+
+
+def item13_verdict(
+    cdc_knobs: Mapping[str, Any] | None,
+    clickstream: Mapping[str, Any] | None,
+    fx: Mapping[str, Any] | None,
+    fx_decision: str,
+) -> dict[str, Any]:
+    raise NotImplementedError
+
+
+def summarize_dlq(messages: Iterable[Any]) -> dict[str, Any]:
+    raise NotImplementedError
+
+
+def knob_queries(
+    con: Any, lateness_ms: int, hot_product_id: int, hot_customer_id: int, canary: str
+) -> dict[str, Any]:
+    raise NotImplementedError
+
+
 # --- reset: the clickstream objects only (constants, no run-time input) -------------------------
 
 RESET_CONNECTOR = "clickstream-sink"

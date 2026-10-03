@@ -12,7 +12,9 @@ import ast
 import inspect
 import io
 import json
+import random
 import re
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -865,3 +867,582 @@ def test_the_generator_states_the_lateness_bound_item_13_uses() -> None:
 def test_a_negative_lateness_bound_is_refused() -> None:
     with pytest.raises(ValueError, match="lateness"):
         tc.order_knobs([(0, CLOCK)], -1)
+
+
+# --- knob_checks: each clickstream knob by its own check ------------------------------------------
+
+TABLES = ("customers", "products", "orders", "order_items", "reviews")
+MALFORMED_RUNS = {"0": [[10, 15]], "3": [[2, 3], [9, 13]]}
+
+
+def gen_knobs(**over: Any) -> dict[str, Any]:
+    knobs: dict[str, Any] = {
+        "intended_duplicates": 50,
+        "malformed": {
+            "count": 10,
+            "runs": {p: [list(r) for r in rs] for p, rs in MALFORMED_RUNS.items()},
+        },
+        "out_of_order_expected": 87,
+        "beyond_watermark_expected": 20,
+        "lateness_ms": 600_000,
+        "configured_hot_share": 0.2,
+        "hot_product_id": 1,
+        "hot_customer_id": 1,
+        "hot_product_rows_expected": 25_040,
+        "hot_customer_rows_expected": 25_000,
+        "explicit_null_referrers": 34,
+        "canary_events": 1,
+    }
+    knobs.update(over)
+    return knobs
+
+
+def bronze_figures(**over: Any) -> dict[str, Any]:
+    figures: dict[str, Any] = {
+        "rows": 100_000,
+        "event_duplicates": 50,
+        "out_of_order": 87,
+        "beyond_watermark": 20,
+        "top_product": {"id": 1, "rows": 25_040},
+        "top_customer": {"id": 1, "rows": 25_000},
+        "referrer": {"null": 34, "direct": 0},
+        "canary": {"rows": 1},
+    }
+    figures.update(over)
+    return figures
+
+
+def dlq_figures(**over: Any) -> dict[str, Any]:
+    figures: dict[str, Any] = {
+        "records": 10,
+        "headers_present": True,
+        "header_keys": ["__connect.errors.offset", "__connect.errors.partition"],
+        "runs": {p: [list(r) for r in rs] for p, rs in MALFORMED_RUNS.items()},
+    }
+    figures.update(over)
+    return figures
+
+
+def checks(bronze: Any = None, dlq: Any = None, knobs: Any = None) -> dict[str, Any]:
+    return tc.knob_checks(
+        bronze_figures() if bronze is None else bronze,
+        dlq_figures() if dlq is None else dlq,
+        gen_knobs() if knobs is None else knobs,
+    )
+
+
+def test_every_clickstream_knob_ok_when_each_detected_count_equals_the_expected_one() -> None:
+    found = checks()
+    for name in (
+        "duplicates",
+        "out_of_order",
+        "beyond_watermark",
+        "malformed",
+        "hot_key",
+        "canary_clickstream",
+    ):
+        assert found[name]["ok"] is True, name
+    assert found["duplicates"] == {"expected": 50, "detected": 50, "ok": True}
+    assert found["malformed"]["headers_present"] is True
+    assert found["malformed"]["header_runs_match"] is True
+    assert found["missing"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "key", "gen_key"),
+    [
+        ("duplicates", "event_duplicates", "intended_duplicates"),
+        ("out_of_order", "out_of_order", "out_of_order_expected"),
+        ("beyond_watermark", "beyond_watermark", "beyond_watermark_expected"),
+    ],
+)
+def test_a_count_detected_zero_times_is_not_detected_even_when_zero_was_expected(
+    name: str, key: str, gen_key: str
+) -> None:
+    found = checks(bronze=bronze_figures(**{key: 0}), knobs=gen_knobs(**{gen_key: 0}))
+    assert found[name]["ok"] is False
+    assert found[name]["detected"] == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "key", "gen_key"),
+    [
+        ("duplicates", "event_duplicates", "intended_duplicates"),
+        ("out_of_order", "out_of_order", "out_of_order_expected"),
+        ("beyond_watermark", "beyond_watermark", "beyond_watermark_expected"),
+    ],
+)
+def test_a_count_one_off_the_expected_one_is_not_detected(
+    name: str, key: str, gen_key: str
+) -> None:
+    expected = gen_knobs()[gen_key]
+    assert checks(bronze=bronze_figures(**{key: expected + 1}))[name]["ok"] is False
+    assert checks(bronze=bronze_figures(**{key: expected - 1}))[name]["ok"] is False
+
+
+def test_the_hot_key_needs_the_hot_id_on_top_and_each_share_at_or_above_the_configured_one() -> (
+    None
+):
+    assert (
+        checks(bronze=bronze_figures(top_product={"id": 2, "rows": 30_000}))["hot_key"]["ok"]
+        is False
+    )
+    assert (
+        checks(bronze=bronze_figures(top_customer={"id": 7, "rows": 30_000}))["hot_key"]["ok"]
+        is False
+    )
+    on_the_line = checks(bronze=bronze_figures(top_product={"id": 1, "rows": 20_000}))
+    assert on_the_line["hot_key"]["ok"] is True
+    below = checks(bronze=bronze_figures(top_product={"id": 1, "rows": 19_999}))
+    assert below["hot_key"]["ok"] is False
+    shown = checks()["hot_key"]
+    assert shown["product"]["share"] == pytest.approx(0.2504)
+    assert shown["customer"]["share"] == pytest.approx(0.25)
+    assert shown["configured_share"] == 0.2
+
+
+def test_malformed_equals_the_dlq_count_and_the_header_offsets_match_the_runs() -> None:
+    assert checks(dlq=dlq_figures(records=9))["malformed"]["ok"] is False
+    assert (
+        checks(dlq=dlq_figures(records=0), knobs=gen_knobs(malformed={"count": 0, "runs": {}}))[
+            "malformed"
+        ]["ok"]
+        is False
+    )
+    moved = {"0": [[10, 15]], "3": [[2, 3], [9, 12], [20, 21]]}
+    differing = checks(dlq=dlq_figures(runs=moved))["malformed"]
+    assert differing["ok"] is False
+    assert differing["header_runs_match"] is False
+
+
+def test_a_dlq_without_the_headers_falls_back_to_the_count_and_says_so() -> None:
+    found = checks(dlq=dlq_figures(headers_present=False, header_keys=[], runs={}))["malformed"]
+    assert found["ok"] is True
+    assert found["headers_present"] is False
+    assert found["header_runs_match"] is None
+
+
+def test_the_clickstream_canary_is_exactly_one_row() -> None:
+    assert checks(bronze=bronze_figures(canary={"rows": 2}))["canary_clickstream"]["ok"] is False
+    assert checks(bronze=bronze_figures(canary={"rows": 0}))["canary_clickstream"]["ok"] is False
+    assert checks()["canary_clickstream"] == {"expected": 1, "detected": 1, "ok": True}
+
+
+def test_a_missing_bronze_table_or_dlq_count_is_missing_not_undetected() -> None:
+    no_table = checks(bronze={})
+    assert no_table["duplicates"]["detected"] is None
+    assert no_table["duplicates"]["ok"] is False
+    assert {
+        "duplicates",
+        "out_of_order",
+        "beyond_watermark",
+        "hot_key",
+        "canary_clickstream",
+    } <= set(no_table["missing"])
+    no_dlq = checks(dlq={})
+    assert no_dlq["malformed"]["detected"] is None
+    assert "malformed" in no_dlq["missing"]
+    assert "malformed" in tc.knob_checks(bronze_figures(), None, gen_knobs())["missing"]
+
+
+def test_the_null_default_observation_counts_nulls_and_defaults_and_is_never_a_check() -> None:
+    kept = checks()["null_default"]
+    assert kept == {
+        "explicit_nulls_sent": 34,
+        "bronze_null": 34,
+        "bronze_direct": 0,
+        "accounted": True,
+    }
+    replaced = checks(bronze=bronze_figures(referrer={"null": 0, "direct": 34}))["null_default"]
+    assert replaced["bronze_direct"] == 34
+    assert replaced["accounted"] is True
+    assert "ok" not in replaced
+
+
+def test_knob_checks_results_never_carry_a_token_placed_in_the_inputs() -> None:
+    token = secrets.token_urlsafe(24)
+    found = tc.knob_checks(
+        bronze_figures(tag=token, canary={"rows": 1, "token": token}),
+        dlq_figures(sample=token),
+        gen_knobs(tag=token),
+    )
+    assert token not in json.dumps(found)
+
+
+# --- item13_verdict: all eleven Knob paths rows ---------------------------------------------------
+
+CLOSING = ["2026-01-01", "2026-04-03", "2026-04-06", "2026-05-01", "2026-12-25"]
+
+
+def cdc_figures() -> dict[str, Any]:
+    return {
+        "alter": {
+            "bronze_has_tier": True,
+            "rows_with_tier": 443,
+            "subject_http": 200,
+            "subject_versions": [1, 2],
+        },
+        "canary": {"rows": 1},
+        "late_products": {"expected": 5, "found": 5, "missing_product": 0},
+        "ops": {t: {"c": 10, "d": 4, "r": 3, "u": 8} for t in TABLES},
+        "review": {"body_sha256_matches": True, "rows": 1},
+    }
+
+
+def fx_figures() -> dict[str, Any]:
+    return {
+        "load": {"rows": 270_096, "weekend_rows": 0},
+        "gaps": {
+            "missing_weekdays": list(CLOSING),
+            "closing_weekdays": list(CLOSING),
+            "missing_not_closing": [],
+            "closing_with_rows": [],
+        },
+        "verdict": {"verdict": "go", "reasons": []},
+    }
+
+
+def judged(
+    cdc: Any = "default", clicks: Any = "default", fx: Any = "default", decision: str = "5a"
+) -> dict[str, Any]:
+    return tc.item13_verdict(
+        cdc_figures() if cdc == "default" else cdc,
+        checks() if clicks == "default" else clicks,
+        fx_figures() if fx == "default" else fx,
+        decision,
+    )
+
+
+def detected_by_name(result: dict[str, Any]) -> dict[str, Any]:
+    return {row["knob"]: row["detected"] for row in result["rows"]}
+
+
+def test_knob_rows_are_the_eleven_adr_rows_in_order() -> None:
+    adr = Path(__file__).resolve().parent.parent / "docs/adr/adr-001-feasibility-spike.md"
+    text = adr.read_text(encoding="utf-8")
+    section = text.split("### Knob paths", 1)[1].split("\n### ", 1)[0]
+    table = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in section.splitlines()
+        if line.startswith("|")
+    ][2:]
+    assert len(tc.KNOB_ROWS) == 11
+    for row, cells in zip(tc.KNOB_ROWS, table, strict=True):
+        assert row["knob"] == cells[0]
+        assert row["path"] == cells[1]
+        assert row["detected_by"] == cells[2]
+
+
+def test_item_13_is_go_when_all_eleven_rows_are_detected() -> None:
+    result = judged()
+    assert result["verdict"] == "go"
+    assert result["fallback"] is None
+    assert result["reasons"] == []
+    assert [row["knob"] for row in result["rows"]] == [row["knob"] for row in tc.KNOB_ROWS]
+    assert all(row["detected"] is True for row in result["rows"])
+    assert all(row["path"] and row["source"] for row in result["rows"])
+
+
+@pytest.mark.parametrize(
+    ("check", "row"),
+    [
+        ("duplicates", "Duplicate events"),
+        ("out_of_order", "Out-of-order events"),
+        ("beyond_watermark", "Events beyond the watermark"),
+        ("malformed", "Malformed events"),
+        ("hot_key", "Hot key"),
+    ],
+)
+def test_one_undetected_clickstream_knob_is_a_fallback_naming_it(check: str, row: str) -> None:
+    broken = checks()
+    broken[check] = {**broken[check], "ok": False}
+    result = judged(clicks=broken)
+    assert result["verdict"] == "fallback"
+    assert "moves to a path" in result["fallback"]
+    assert [r["knob"] for r in result["rows"] if r["detected"] is False] == [row]
+    assert any(row in reason for reason in result["reasons"])
+
+
+def test_decision_5b_records_the_fx_row_undetected_and_5a_cites_item_10() -> None:
+    chosen_5b = judged(decision="5b")
+    assert chosen_5b["verdict"] == "fallback"
+    assert [r["knob"] for r in chosen_5b["rows"] if r["detected"] is False] == [
+        "FX weekend and holiday gaps"
+    ]
+    assert judged(decision="5a")["verdict"] == "go"
+    fx_row = judged()["rows"][-1]
+    assert "Week 9" in fx_row["source"]
+
+
+def test_the_fx_row_needs_item_10s_go_no_weekend_rows_and_missing_equal_closing_days() -> None:
+    for broken in (
+        {**fx_figures(), "verdict": {"verdict": "fallback", "reasons": ["x"]}},
+        {**fx_figures(), "load": {"weekend_rows": 1}},
+        {**fx_figures(), "gaps": {**fx_figures()["gaps"], "missing_not_closing": ["2026-02-03"]}},
+        {**fx_figures(), "gaps": {**fx_figures()["gaps"], "closing_with_rows": ["2026-12-25"]}},
+        {**fx_figures(), "gaps": {**fx_figures()["gaps"], "closing_weekdays": CLOSING[:-1]}},
+        {
+            **fx_figures(),
+            "gaps": {**fx_figures()["gaps"], "missing_weekdays": [], "closing_weekdays": []},
+        },
+    ):
+        result = judged(fx=broken)
+        assert result["verdict"] == "fallback"
+        assert detected_by_name(result)["FX weekend and holiday gaps"] is False
+
+
+def test_the_cdc_rows_read_item_11s_figures() -> None:
+    def changed(section: str, value: Any) -> dict[str, Any]:
+        figures = cdc_figures()
+        figures[section] = value
+        return figures
+
+    drift = judged(cdc=changed("alter", {**cdc_figures()["alter"], "subject_versions": [1]}))
+    assert detected_by_name(drift)["`ALTER TABLE` schema drift"] is False
+    late = judged(cdc=changed("late_products", {"expected": 5, "found": 4, "missing_product": 0}))
+    assert detected_by_name(late)["Late-arriving product"] is False
+    review = judged(cdc=changed("review", {"rows": 1, "body_sha256_matches": False}))
+    assert detected_by_name(review)["Seeded prompt-injection review"] is False
+    canary = judged(cdc=changed("canary", {"rows": 0}))
+    assert detected_by_name(canary)["Erasure canary"] is False
+    no_delete = cdc_figures()
+    del no_delete["ops"]["reviews"]["d"]
+    ops = judged(cdc=no_delete)
+    assert detected_by_name(ops)["Inserts, updates, deletes and SCD2 changes"] is False
+    for result in (drift, late, review, canary, ops):
+        assert result["verdict"] == "fallback"
+
+
+def test_the_canary_row_needs_cdc_rows_and_exactly_one_clickstream_row() -> None:
+    twice = checks()
+    twice["canary_clickstream"] = {"expected": 1, "detected": 2, "ok": False}
+    assert detected_by_name(judged(clicks=twice))["Erasure canary"] is False
+    assert detected_by_name(judged())["Erasure canary"] is True
+
+
+def test_a_missing_input_is_inconclusive_not_go_or_fallback() -> None:
+    for result in (
+        judged(cdc=None),
+        judged(cdc={}),
+        judged(clicks=None),
+        judged(clicks=checks(bronze={})),
+        judged(clicks=checks(dlq={})),
+        judged(fx=None),
+        judged(fx={}),
+    ):
+        assert result["verdict"] == "inconclusive"
+        assert result["fallback"] is None
+        assert result["reasons"]
+
+
+def test_decision_5b_does_not_need_the_fx_capture() -> None:
+    result = judged(fx=None, decision="5b")
+    assert result["verdict"] == "fallback"
+
+
+def test_an_unknown_fx_decision_is_refused() -> None:
+    with pytest.raises(ValueError, match="5a"):
+        judged(decision="5c")
+
+
+def test_the_null_default_observation_rides_beside_the_verdict_and_never_changes_it() -> None:
+    kept = judged()
+    replaced = judged(clicks=checks(bronze=bronze_figures(referrer={"null": 0, "direct": 34})))
+    assert replaced["verdict"] == kept["verdict"] == "go"
+    assert replaced["observations"]["null_default"]["bronze_direct"] == 34
+    assert kept["observations"]["null_default"]["bronze_direct"] == 0
+    assert all("17652" not in reason for reason in replaced["reasons"])
+
+
+def test_item_13_results_never_carry_a_token_placed_in_the_inputs() -> None:
+    token = secrets.token_urlsafe(24)
+    cdc = cdc_figures()
+    cdc["canary"] = {"rows": 1, "token": token}
+    result = tc.item13_verdict(
+        cdc,
+        tc.knob_checks(bronze_figures(tag=token), dlq_figures(), gen_knobs(tag=token)),
+        fx_figures(),
+        "5a",
+    )
+    assert token not in json.dumps(result)
+
+
+# --- summarize_dlq: headers and counts, never a record's value ------------------------------------
+
+
+class FakeMessage:
+    """A DLQ record whose key and value raise: the summary must never ask for either."""
+
+    def __init__(self, headers: list[tuple[str, bytes]] | None) -> None:
+        self._headers = headers
+
+    def headers(self) -> list[tuple[str, bytes]] | None:
+        return self._headers
+
+    def value(self) -> bytes:
+        raise AssertionError("the DLQ check read a record's value")
+
+    def key(self) -> bytes:
+        raise AssertionError("the DLQ check read a record's key")
+
+
+def dlq_message(partition: int, offset: int) -> FakeMessage:
+    return FakeMessage(
+        [
+            ("__connect.errors.topic", b"clickstream"),
+            ("__connect.errors.partition", str(partition).encode()),
+            ("__connect.errors.offset", str(offset).encode()),
+        ]
+    )
+
+
+def test_the_dlq_summary_counts_records_and_makes_runs_from_the_headers() -> None:
+    messages = [dlq_message(0, 10), dlq_message(0, 11), dlq_message(3, 2), dlq_message(0, 13)]
+    found = tc.summarize_dlq(messages)
+    assert found == {
+        "records": 4,
+        "headers_present": True,
+        "header_keys": [
+            "__connect.errors.offset",
+            "__connect.errors.partition",
+            "__connect.errors.topic",
+        ],
+        "runs": {"0": [[10, 12], [13, 14]], "3": [[2, 3]]},
+    }
+
+
+def test_the_dlq_summary_never_reads_a_key_or_a_value() -> None:
+    found = tc.summarize_dlq([dlq_message(0, 1), FakeMessage(None)])
+    assert found["records"] == 2
+    assert not {"value", "payload", "key"} & set(found)
+
+
+def test_records_without_the_headers_are_counted_and_headers_present_is_false() -> None:
+    assert tc.summarize_dlq([FakeMessage(None), FakeMessage([])])["headers_present"] is False
+    mixed = tc.summarize_dlq([dlq_message(0, 1), FakeMessage([("other", b"x")])])
+    assert mixed["records"] == 2
+    assert mixed["headers_present"] is False
+    assert tc.summarize_dlq([]) == {
+        "records": 0,
+        "headers_present": False,
+        "header_keys": [],
+        "runs": {},
+    }
+
+
+def test_a_header_that_is_not_a_number_counts_as_missing() -> None:
+    bad = FakeMessage([("__connect.errors.partition", b"zero"), ("__connect.errors.offset", b"12")])
+    assert tc.summarize_dlq([bad])["headers_present"] is False
+
+
+# --- the knob SQL against an in-memory DuckDB (skipped without the spike group) -------------------
+
+
+def test_the_bronze_knob_sql_agrees_with_the_order_rule_and_binds_the_canary() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    rng = random.Random(11)  # noqa: S311 - seeded test data, not a secret
+    con = duckdb.connect(":memory:")
+    con.execute("ATTACH ':memory:' AS lk")
+    con.execute("CREATE SCHEMA lk.bronze")
+    con.execute(
+        "CREATE TABLE lk.bronze.clickstream (event_id VARCHAR, customer_id BIGINT, "
+        "product_id BIGINT, event_time TIMESTAMP, referrer VARCHAR, tag VARCHAR, "
+        "_kafka_metadata_partition INTEGER, _kafka_metadata_offset BIGINT)"
+    )
+    token = secrets.token_urlsafe(24)
+    rows = []
+    expected = {"out_of_order": 0, "beyond_watermark": 0}
+    for partition in range(3):
+        times = []
+        clock = 1_790_000_000_000
+        for offset in range(400):
+            clock += 150
+            shift = rng.choice([0, 0, 0, 0, 90_000, 900_000, 0, 0])
+            times.append((offset * 2, clock - shift))
+            rows.append(
+                (
+                    f"e{partition}-{offset}",
+                    1 if offset % 4 == 2 else rng.randint(2, 50),
+                    1 if offset % 4 == 1 else rng.randint(2, 50),
+                    clock - shift,
+                    None if offset % 50 == 0 else ("direct" if offset % 50 == 1 else "ads"),
+                    token if (partition, offset) == (1, 7) else None,
+                    partition,
+                    offset * 2,
+                )
+            )
+        found = tc.order_knobs(times, 600_000)
+        expected = {k: expected[k] + found[k] for k in expected}
+    rows.append(rows[5])  # one repeated event_id
+    con.executemany(
+        "INSERT INTO lk.bronze.clickstream VALUES (?, ?, ?, epoch_ms(?), ?, ?, ?, ?)", rows
+    )
+    result = tc.knob_queries(con, 600_000, 1, 1, token)
+    assert result["out_of_order"] == expected["out_of_order"] > 0
+    assert result["beyond_watermark"] == expected["beyond_watermark"] > 0
+    assert result["rows"] == 1_201
+    assert result["event_duplicates"] == 1
+    assert result["top_product"]["id"] == 1
+    assert result["top_customer"]["id"] == 1
+    assert result["referrer"]["null"] > 0
+    assert result["referrer"]["direct"] > 0
+    assert result["canary"] == {"rows": 1}
+    assert token not in json.dumps(result)
+
+
+# --- the CLI: item13, knobs and dlq ---------------------------------------------------------------
+
+
+def write_json(path: Path, payload: Any) -> Path:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def item13_args(tmp_path: Path, decision: str = "5a") -> list[str]:
+    log = tmp_path / "load-full.log"
+    log.write_text("progress line\n" + json.dumps(fx_figures()) + "\n", encoding="utf-8")
+    return [
+        "item13",
+        "--cdc",
+        str(write_json(tmp_path / "cdc.json", {"knobs": cdc_figures(), "verdict": "x"})),
+        "--fx",
+        str(log),
+        "--knobs",
+        str(write_json(tmp_path / "knobs.json", bronze_figures())),
+        "--dlq",
+        str(write_json(tmp_path / "dlq.json", dlq_figures())),
+        "--generator",
+        str(write_json(tmp_path / "gen.json", {"knobs": gen_knobs()})),
+        "--fx-decision",
+        decision,
+    ]
+
+
+def test_the_item13_command_prints_one_json_line_and_exits_0_for_go(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert tc.main(item13_args(tmp_path)) == 0
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    result = json.loads(last)
+    assert result["verdict"] == "go"
+    assert len(result["rows"]) == 11
+
+
+def test_the_item13_command_exits_0_for_a_fallback_and_1_for_a_missing_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert tc.main(item13_args(tmp_path, "5b")) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["verdict"] == "fallback"
+    args = item13_args(tmp_path)
+    args[args.index("--dlq") + 1] = str(tmp_path / "absent.json")
+    assert tc.main(args) == 1
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["verdict"] == "inconclusive"
+
+
+def test_the_knobs_and_dlq_commands_parse_their_flags() -> None:
+    parser = tc.build_parser()
+    knobs = parser.parse_args(
+        ["knobs", "--lateness-ms", "600000", "--hot-product", "1", "--hot-customer", "1"]
+    )
+    assert (knobs.lateness_ms, knobs.hot_product, knobs.hot_customer) == (600_000, 1, 1)
+    assert parser.parse_args(["dlq"]).command == "dlq"
