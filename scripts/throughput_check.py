@@ -26,7 +26,7 @@ import os
 import re
 import sys
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -697,12 +697,270 @@ KNOB_ROWS: tuple[dict[str, str], ...] = (
 )
 
 
+NOT_DETECTED = (
+    "a knob that can't reach bronze moves to a path that can; the owner records it in ADR-001"
+)
+FX_DECISIONS = ("5a", "5b")
+HEADER_PARTITION = "__connect.errors.partition"
+HEADER_OFFSET = "__connect.errors.offset"
+CDC_OPS = ("c", "u", "d")
+CDC_TABLES = tuple(cdc_check.PK_COLUMNS)
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _count(source: Any, key: str) -> int | None:
+    return _int_or_none(_mapping(source).get(key))
+
+
+def _count_check(expected: int | None, detected: int | None) -> dict[str, Any]:
+    """ok only when both are known, detected is above 0 and equals expected (0 detections is none)."""
+    ok = expected is not None and detected is not None and detected > 0 and detected == expected
+    return {"expected": expected, "detected": detected, "ok": ok}
+
+
+def _runs_by_partition(value: Any) -> dict[int, Runs]:
+    return {int(p): _clean_runs(runs) for p, runs in _mapping(value).items()}
+
+
+def _share(value: Any) -> Fraction | None:
+    """The configured share as an exact fraction of its decimal text (0.2 is 1/5), or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        return None
+    return Fraction(str(value))
+
+
+def _hot_side(
+    top: Any, hot_id: int | None, share: Fraction | None, total: int | None, expected_rows: Any
+) -> dict[str, Any] | None:
+    """One side (product or customer) of the hot-key check, or None when an input is missing."""
+    top_id, rows = _count(top, "id"), _count(top, "rows")
+    if top_id is None or rows is None or hot_id is None or share is None or not total:
+        return None
+    return {
+        "id": top_id,
+        "expected_id": hot_id,
+        "rows": rows,
+        "share": float(round(Fraction(rows, total), 4)),
+        "rows_expected": _int_or_none(expected_rows),
+        "ok": top_id == hot_id and rows * share.denominator >= share.numerator * total,
+    }
+
+
 def knob_checks(
     bronze: Mapping[str, Any] | None,
     dlq: Mapping[str, Any] | None,
     generator_knobs: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    """Each clickstream knob by its own check: {knob: {expected, detected, ok}} plus `missing`.
+
+    `bronze` is `bronze_knobs`' result, `dlq` is `summarize_dlq`'s and `generator_knobs` is the
+    generator report's `knobs` block. A check is ok only when its detected count is above 0 and
+    equals the generator's expected count (an event's knob is counted once, by its own check, so
+    the counts are equal, never "at least"). An input that is absent leaves detected None and names
+    the check in `missing`, which makes item 13 inconclusive rather than a verdict. `null_default`
+    is an observation about apache/iceberg#17652 and never a check.
+    """
+    found, lost, gen = _mapping(bronze), _mapping(dlq), _mapping(generator_knobs)
+    result: dict[str, Any] = {}
+    missing: list[str] = []
+    for name, bronze_key, generator_key in (
+        ("duplicates", "event_duplicates", "intended_duplicates"),
+        ("out_of_order", "out_of_order", "out_of_order_expected"),
+        ("beyond_watermark", "beyond_watermark", "beyond_watermark_expected"),
+    ):
+        check = _count_check(_count(gen, generator_key), _count(found, bronze_key))
+        result[name] = check
+        if check["expected"] is None or check["detected"] is None:
+            missing.append(name)
+
+    expected_malformed = _count(gen.get("malformed"), "count")
+    check = _count_check(expected_malformed, _count(lost, "records"))
+    headers_present = lost.get("headers_present") is True
+    runs_match: bool | None = None
+    if headers_present:
+        try:
+            runs_match = _runs_by_partition(lost.get("runs")) == _runs_by_partition(
+                _mapping(gen.get("malformed")).get("runs")
+            )
+        except (TypeError, ValueError):
+            runs_match = False
+    result["malformed"] = {
+        **check,
+        "ok": check["ok"] and runs_match is not False,
+        "headers_present": headers_present,
+        "header_runs_match": runs_match,
+    }
+    if check["expected"] is None or check["detected"] is None:
+        missing.append("malformed")
+
+    total, share = _count(found, "rows"), _share(gen.get("configured_hot_share"))
+    product = _hot_side(
+        found.get("top_product"),
+        _int_or_none(gen.get("hot_product_id")),
+        share,
+        total,
+        gen.get("hot_product_rows_expected"),
+    )
+    customer = _hot_side(
+        found.get("top_customer"),
+        _int_or_none(gen.get("hot_customer_id")),
+        share,
+        total,
+        gen.get("hot_customer_rows_expected"),
+    )
+    result["hot_key"] = {
+        "configured_share": float(share) if share is not None else None,
+        "total_rows": total,
+        "product": product,
+        "customer": customer,
+        "ok": bool(product and customer and product["ok"] and customer["ok"]),
+    }
+    if product is None or customer is None:
+        missing.append("hot_key")
+
+    canary = _count_check(_count(gen, "canary_events"), _count(found.get("canary"), "rows"))
+    canary["ok"] = canary["detected"] == 1 and canary["expected"] == 1
+    result["canary_clickstream"] = canary
+    if canary["expected"] is None or canary["detected"] is None:
+        missing.append("canary_clickstream")
+
+    referrer = _mapping(found.get("referrer"))
+    sent, nulls, direct = (
+        _count(gen, "explicit_null_referrers"),
+        _count(referrer, "null"),
+        _count(referrer, "direct"),
+    )
+    result["null_default"] = {
+        "explicit_nulls_sent": sent,
+        "bronze_null": nulls,
+        "bronze_direct": direct,
+        "accounted": (
+            sent == nulls + direct
+            if sent is not None and nulls is not None and direct is not None
+            else None
+        ),
+    }
+    result["missing"] = missing
+    return result
+
+
+def _cdc_ops_row(cdc: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    ops = cdc.get("ops")
+    if not isinstance(ops, Mapping):
+        return None, {}
+    figures = {
+        table: {op: _count(ops.get(table), op) or 0 for op in CDC_OPS} for table in CDC_TABLES
+    }
+    return all(count > 0 for per_table in figures.values() for count in per_table.values()), figures
+
+
+def _cdc_alter_row(cdc: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    alter = cdc.get("alter")
+    if not isinstance(alter, Mapping):
+        return None, {}
+    versions = alter.get("subject_versions")
+    rows = _count(alter, "rows_with_tier") or 0
+    detected = (
+        alter.get("bronze_has_tier") is True
+        and rows > 0
+        and alter.get("subject_http") == 200
+        and isinstance(versions, list)
+        and 2 in versions
+    )
+    return detected, {"rows_with_tier": rows, "subject_versions": versions}
+
+
+def _cdc_late_row(cdc: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    late = cdc.get("late_products")
+    if not isinstance(late, Mapping):
+        return None, {}
+    expected, found = _count(late, "expected") or 0, _count(late, "found") or 0
+    detected = expected > 0 and found == expected and _count(late, "missing_product") == 0
+    return detected, {"expected": expected, "found": found}
+
+
+def _cdc_review_row(cdc: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    review = cdc.get("review")
+    if not isinstance(review, Mapping):
+        return None, {}
+    rows = _count(review, "rows") or 0
+    detected = rows >= 1 and review.get("body_sha256_matches") is True
+    return detected, {"rows": rows}
+
+
+def _canary_row(
+    cdc: Mapping[str, Any], clickstream: Mapping[str, Any] | None
+) -> tuple[bool | None, dict[str, Any]]:
+    cdc_rows = _count(cdc.get("canary"), "rows")
+    clicks = _mapping(clickstream)
+    checked = clicks.get("canary_clickstream")
+    if (
+        cdc_rows is None
+        or not isinstance(checked, Mapping)
+        or "canary_clickstream" in clicks.get("missing", [])
+    ):
+        return None, {}
+    return cdc_rows >= 1 and checked.get("ok") is True, {
+        "cdc_rows": cdc_rows,
+        "clickstream_rows": _count(checked, "detected"),
+    }
+
+
+def _fx_row(fx: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    gaps = fx.get("gaps")
+    verdict = _mapping(fx.get("verdict")).get("verdict")
+    weekend = _count(fx.get("load"), "weekend_rows")
+    if not isinstance(gaps, Mapping) or verdict is None or weekend is None:
+        return None, {}
+    lists: dict[str, list[Any]] = {}
+    for key in ("missing_weekdays", "closing_weekdays", "missing_not_closing", "closing_with_rows"):
+        value = gaps.get(key)
+        if not isinstance(value, list):
+            return None, {}
+        lists[key] = value
+    missing, closing = set(lists["missing_weekdays"]), set(lists["closing_weekdays"])
+    detected = (
+        verdict == "go"
+        and weekend == 0
+        and bool(closing)
+        and missing == closing
+        and not lists["missing_not_closing"]
+        and not lists["closing_with_rows"]
+    )
+    return detected, {
+        "weekend_rows": weekend,
+        "missing_weekdays": len(missing),
+        "closing_weekdays": len(closing),
+        "missing_not_closing": len(lists["missing_not_closing"]),
+        "closing_with_rows": len(lists["closing_with_rows"]),
+    }
+
+
+CLICKSTREAM_CHECKS = {
+    "Duplicate events": "duplicates",
+    "Out-of-order events": "out_of_order",
+    "Malformed events": "malformed",
+    "Events beyond the watermark": "beyond_watermark",
+    "Hot key": "hot_key",
+}
+ROW_SOURCES = {
+    "Inserts, updates, deletes and SCD2 changes": "item 11 capture (ops by table)",
+    "`ALTER TABLE` schema drift": "item 11 capture (bronze column and Karapace versions)",
+    "Late-arriving product": "item 11 capture (late products found)",
+    "Erasure canary": "item 11 capture (CDC rows) and the clickstream run (counted in bronze)",
+    "Seeded prompt-injection review": "item 11 capture (review row and its hash match)",
+    "Duplicate events": "the clickstream run (bronze rows against distinct event_id)",
+    "Out-of-order events": "the clickstream run (bronze offset order against event time)",
+    "Malformed events": "the clickstream run (the sink's dead-letter topic)",
+    "Events beyond the watermark": "the clickstream run (bronze running maximum minus the bound)",
+    "Hot key": "the clickstream run (top product and customer shares)",
+    "FX weekend and holiday gaps": (
+        "decision 5a: item 10's check in the dlt destination (Iceberg landing deferred to Week 9)"
+    ),
+}
 
 
 def item13_verdict(
@@ -711,17 +969,151 @@ def item13_verdict(
     fx: Mapping[str, Any] | None,
     fx_decision: str,
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    """Item 13 over all eleven rows of ADR-001's Knob paths table, in the ADR's order.
+
+    The five CDC rows come from item 11's capture (`knobs`), the clickstream rows and the
+    clickstream half of the canary row from `knob_checks`, and the FX row from item 10's capture
+    under decision 5a (5b records it undetected and reads no capture). go when every row is
+    detected; fallback names each undetected knob as moving to a path that can reach bronze (the
+    owner records it in ADR-001); inconclusive when an input is missing, never go or fallback. The
+    null-default observation rides beside the verdict in `observations` and never changes it.
+    """
+    if fx_decision not in FX_DECISIONS:
+        raise ValueError("fx_decision must be 5a or 5b")
+    cdc = _mapping(cdc_knobs)
+    clicks = _mapping(clickstream)
+    outcomes: dict[str, tuple[bool | None, dict[str, Any]]] = {
+        "Inserts, updates, deletes and SCD2 changes": _cdc_ops_row(cdc),
+        "`ALTER TABLE` schema drift": _cdc_alter_row(cdc),
+        "Late-arriving product": _cdc_late_row(cdc),
+        "Erasure canary": _canary_row(cdc, clickstream),
+        "Seeded prompt-injection review": _cdc_review_row(cdc),
+    }
+    for knob, check in CLICKSTREAM_CHECKS.items():
+        entry = clicks.get(check)
+        if not isinstance(entry, Mapping) or check in clicks.get("missing", []):
+            outcomes[knob] = (None, {})
+        else:
+            outcomes[knob] = (entry.get("ok") is True, _clickstream_figures(entry))
+    if fx_decision == "5b":
+        outcomes["FX weekend and holiday gaps"] = (
+            False,
+            {"decision": "5b", "reason": "dlt lands in its own DuckDB file, not in bronze Iceberg"},
+        )
+    else:
+        outcomes["FX weekend and holiday gaps"] = _fx_row(_mapping(fx))
+    sources = {**ROW_SOURCES}
+    if fx_decision == "5b":
+        sources["FX weekend and holiday gaps"] = "decision 5b: recorded undetected"
+
+    rows: list[dict[str, Any]] = []
+    absent: list[str] = []
+    undetected: list[str] = []
+    for definition in KNOB_ROWS:
+        knob = definition["knob"]
+        detected, figures = outcomes[knob]
+        rows.append(
+            {
+                "knob": knob,
+                "path": definition["path"],
+                "detected": detected,
+                "source": sources[knob],
+                "figures": figures,
+            }
+        )
+        if detected is None:
+            absent.append(knob)
+        elif detected is False:
+            undetected.append(knob)
+    observations = {
+        "null_default": {
+            key: _mapping(clicks.get("null_default")).get(key)
+            for key in ("explicit_nulls_sent", "bronze_null", "bronze_direct", "accounted")
+        }
+        if isinstance(clicks.get("null_default"), Mapping)
+        else None
+    }
+    if absent:
+        verdict = "inconclusive"
+        reasons = [
+            f"{knob}: an input is missing, so it is neither detected nor undetected"
+            for knob in absent
+        ]
+    elif undetected:
+        verdict = "fallback"
+        reasons = [
+            f"{knob}: not detected by its own check; it moves to a path that can reach bronze (the owner records it in ADR-001)"
+            for knob in undetected
+        ]
+    else:
+        verdict, reasons = "go", []
+    return {
+        "verdict": verdict,
+        "fallback": NOT_DETECTED if verdict == "fallback" else None,
+        "reasons": reasons,
+        "rows": rows,
+        "observations": observations,
+    }
+
+
+def _clickstream_figures(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The figures of one knob_checks entry for a verdict row (counts and shares only)."""
+    keys = (
+        "expected",
+        "detected",
+        "headers_present",
+        "header_runs_match",
+        "configured_share",
+        "total_rows",
+    )
+    figures: dict[str, Any] = {key: entry[key] for key in keys if key in entry}
+    for side in ("product", "customer"):
+        if isinstance(entry.get(side), Mapping):
+            figures[side] = dict(entry[side])
+    return figures
+
+
+def _header_int(value: Any) -> int | None:
+    """A Connect context header's number: the decimal text of the partition or offset."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = bytes(value).decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value)
+    return None
 
 
 def summarize_dlq(messages: Iterable[Any]) -> dict[str, Any]:
-    raise NotImplementedError
+    """Counts and context headers of dead-letter records; never a record's key or value.
 
-
-def knob_queries(
-    con: Any, lateness_ms: int, hot_product_id: int, hot_customer_id: int, canary: str
-) -> dict[str, Any]:
-    raise NotImplementedError
+    The DLQ holds the raw, PII-shaped records, so only `headers()` is ever called. `runs` are the
+    half-open offset runs per source partition from `__connect.errors.partition` and
+    `__connect.errors.offset`; `headers_present` is true only when every record carried both.
+    """
+    records = 0
+    every_record_has_both = True
+    keys: set[str] = set()
+    offsets: dict[int, list[int]] = {}
+    for message in messages:
+        records += 1
+        headers = {
+            str(name): value for name, value in (message.headers() or []) if name is not None
+        }
+        keys.update(headers)
+        partition = _header_int(headers.get(HEADER_PARTITION))
+        offset = _header_int(headers.get(HEADER_OFFSET))
+        if partition is None or offset is None:
+            every_record_has_both = False
+        else:
+            offsets.setdefault(partition, []).append(offset)
+    return {
+        "records": records,
+        "headers_present": records > 0 and every_record_has_both,
+        "header_keys": sorted(keys),
+        "runs": {str(p): offset_runs(taken)[0] for p, taken in sorted(offsets.items())},
+    }
 
 
 # --- reset: the clickstream objects only (constants, no run-time input) -------------------------
@@ -811,13 +1203,8 @@ SOURCE = f"lk.{identifier(cdc_check.NAMESPACE)}.{identifier(TABLE)}"
 KAFKA_TIMEOUT_S = 30
 
 
-def islands() -> dict[str, Any]:
-    """Bronze's (partition, offset) islands and counts, read through DuckDB in the spike image.
-
-    Per partition one aggregate gives min, max, rows and distinct offsets; a partition whose
-    distinct offsets fill min..max is one island with no window at all, and only a partition with a
-    hole runs the gaps-and-islands query (dense_rank, so a repeated offset stays in its island).
-    """
+def _lakehouse_connection() -> Any:
+    """A DuckDB connection with the lakehouse attached as `lk` (1 GB, no insertion order)."""
     from read_v3 import duckdb_connect
 
     con = duckdb_connect()
@@ -827,6 +1214,17 @@ def islands() -> dict[str, Any]:
     )
     con.execute("SET memory_limit='1GB'")
     con.execute("SET preserve_insertion_order=false")
+    return con
+
+
+def islands() -> dict[str, Any]:
+    """Bronze's (partition, offset) islands and counts, read through DuckDB in the spike image.
+
+    Per partition one aggregate gives min, max, rows and distinct offsets; a partition whose
+    distinct offsets fill min..max is one island with no window at all, and only a partition with a
+    hole runs the gaps-and-islands query (dense_rank, so a repeated offset stays in its island).
+    """
+    con = _lakehouse_connection()
     summary = con.execute(
         f"SELECT {PARTITION_COLUMN}, min({OFFSET_COLUMN}), max({OFFSET_COLUMN}), count(*), "
         f"count(DISTINCT {OFFSET_COLUMN}) FROM {SOURCE} GROUP BY {PARTITION_COLUMN} "
@@ -855,6 +1253,142 @@ def islands() -> dict[str, Any]:
         "distinct_offsets": distinct,
         "distinct_event_ids": int(events[0]) if events else 0,
     }
+
+
+TOP_PRODUCT_SQL = (
+    f"SELECT product_id, count(*) AS n FROM {SOURCE} GROUP BY product_id "
+    "ORDER BY n DESC, product_id LIMIT 1"
+)
+TOP_CUSTOMER_SQL = (
+    f"SELECT customer_id, count(*) AS n FROM {SOURCE} GROUP BY customer_id "
+    "ORDER BY n DESC, customer_id LIMIT 1"
+)
+
+
+def knob_queries(
+    con: Any, lateness_ms: int, hot_product_id: int, hot_customer_id: int, canary: str
+) -> dict[str, Any]:
+    """Item 13's bronze counts over lk.bronze.clickstream, from a connected DuckDB.
+
+    Order is counted one partition at a time, as the generator counts it: a row is out of order when
+    its event time is below the previous row's by offset, and beyond the watermark when it is below
+    the maximum over the earlier offsets minus the bound (a bound parameter). The canary is a bound
+    parameter in a count, so the token is never in the SQL text and only a row count comes back.
+    """
+    total, distinct = con.execute(
+        f"SELECT count(*), count(DISTINCT {EVENT_ID_COLUMN}) FROM {SOURCE}"
+    ).fetchone()
+    partitions = [
+        int(row[0])
+        for row in con.execute(
+            f"SELECT DISTINCT {PARTITION_COLUMN} FROM {SOURCE} ORDER BY 1"
+        ).fetchall()
+    ]
+    out_of_order = beyond_watermark = 0
+    for partition in partitions:
+        late, behind = con.execute(
+            "SELECT count(*) FILTER (WHERE event_time < previous), "
+            "count(*) FILTER (WHERE epoch_ms(event_time) < running_max - ?) FROM ("
+            "SELECT event_time, lag(event_time) OVER (ORDER BY "
+            f"{OFFSET_COLUMN}) AS previous, max(epoch_ms(event_time)) OVER (ORDER BY "
+            f"{OFFSET_COLUMN} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS running_max "
+            f"FROM {SOURCE} WHERE {PARTITION_COLUMN} = ?)",
+            [int(lateness_ms), partition],
+        ).fetchone()
+        out_of_order += int(late)
+        beyond_watermark += int(behind)
+
+    def top(sql: str) -> dict[str, int | None]:
+        row = con.execute(sql).fetchone()
+        return {"id": int(row[0]), "rows": int(row[1])} if row else {"id": None, "rows": 0}
+
+    hot_product, hot_customer = con.execute(
+        "SELECT count(*) FILTER (WHERE product_id = ?), "
+        f"count(*) FILTER (WHERE customer_id = ?) FROM {SOURCE}",
+        [int(hot_product_id), int(hot_customer_id)],
+    ).fetchone()
+    nulls, direct = con.execute(
+        "SELECT count(*) FILTER (WHERE referrer IS NULL), "
+        f"count(*) FILTER (WHERE referrer = 'direct') FROM {SOURCE}"
+    ).fetchone()
+    canary_rows = con.execute(f"SELECT count(*) FROM {SOURCE} WHERE tag = ?", [canary]).fetchone()
+    return {
+        "rows": int(total),
+        "event_duplicates": int(total) - int(distinct),
+        "out_of_order": out_of_order,
+        "beyond_watermark": beyond_watermark,
+        "lateness_ms": int(lateness_ms),
+        "top_product": top(TOP_PRODUCT_SQL),
+        "top_customer": top(TOP_CUSTOMER_SQL),
+        "hot_product_rows": int(hot_product),
+        "hot_customer_rows": int(hot_customer),
+        "referrer": {"null": int(nulls), "direct": int(direct)},
+        "canary": {"rows": int(canary_rows[0]) if canary_rows else 0},
+    }
+
+
+def bronze_knobs(lateness_ms: int, hot_product_id: int, hot_customer_id: int) -> dict[str, Any]:
+    """item 13's bronze counts over the live table; the canary comes from CANARY_TOKEN and is a count only."""
+    token = os.environ.get(CANARY_ENV, "")
+    if not token:
+        raise RuntimeError(f"{CANARY_ENV} is not set")
+    return knob_queries(
+        _lakehouse_connection(), lateness_ms, hot_product_id, hot_customer_id, token
+    )
+
+
+DLQ_TIMEOUT_S = 120.0
+
+
+def _dlq_messages(consumer: Any) -> Iterator[Any]:
+    """Every record of the DLQ topic up to its end offsets, read_committed; callers read headers only."""
+    from confluent_kafka import KafkaException, TopicPartition
+
+    meta = consumer.list_topics(DLQ_TOPIC, timeout=KAFKA_TIMEOUT_S).topics[DLQ_TOPIC]
+    ends: dict[int, int] = {}
+    assignment = []
+    for partition in sorted(meta.partitions):
+        low, high = consumer.get_watermark_offsets(
+            TopicPartition(DLQ_TOPIC, partition), timeout=KAFKA_TIMEOUT_S
+        )
+        if high > low:
+            ends[partition] = high
+            assignment.append(TopicPartition(DLQ_TOPIC, partition, low))
+    if not assignment:
+        return
+    consumer.assign(assignment)
+    deadline = time.monotonic() + DLQ_TIMEOUT_S
+    while True:
+        positions = {tp.partition: tp.offset for tp in consumer.position(assignment)}
+        if all(positions.get(p, 0) >= end for p, end in ends.items()):
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"the DLQ was not read to its end within {DLQ_TIMEOUT_S:g} s")
+        message = consumer.poll(1.0)
+        if message is None:
+            continue
+        if message.error():
+            raise KafkaException(message.error())
+        yield message
+
+
+def dlq_headers() -> dict[str, Any]:
+    """The DLQ's record count, header keys and offset runs; headers only, never a value."""
+    from confluent_kafka import Consumer
+
+    consumer = Consumer(
+        {
+            "bootstrap.servers": cdc_check.BOOTSTRAP,
+            "group.id": "throughput-check-dlq-reader",
+            "enable.auto.commit": False,
+            "isolation.level": "read_committed",
+            "auto.offset.reset": "earliest",
+        }
+    )
+    try:
+        return summarize_dlq(_dlq_messages(consumer))
+    finally:
+        consumer.close()
 
 
 def bronze_files() -> dict[str, int]:
@@ -995,6 +1529,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "reset", help="remove the clickstream sink, topics, groups and table (in cdc-run)"
     )
+    knobs = sub.add_parser("knobs", help="item 13's bronze knob counts (in cdc-run)")
+    knobs.add_argument("--lateness-ms", type=int, required=True)
+    knobs.add_argument("--hot-product", type=int, required=True)
+    knobs.add_argument("--hot-customer", type=int, required=True)
+    sub.add_parser("dlq", help="the DLQ's record count, header keys and offset runs (in cdc-run)")
     sub.add_parser("logdirs", help="parse kafka-log-dirs output from stdin (host)")
     figures = sub.add_parser("disk", help="the colima and df disk figures with the primary (host)")
     figures.add_argument("--colima-list", type=Path, required=True)
@@ -1005,6 +1544,15 @@ def build_parser() -> argparse.ArgumentParser:
     judged.add_argument("--generator", type=Path, required=True)
     judged.add_argument("--logdirs", type=Path, required=True)
     judged.add_argument("--disk", type=Path, required=True)
+    item13 = sub.add_parser("item13", help="item 13's verdict over the Knob paths table (host)")
+    item13.add_argument("--cdc", type=Path, required=True, help="item 11's capture (its `knobs`)")
+    item13.add_argument(
+        "--fx", type=Path, required=True, help="item 10's load log (last JSON line)"
+    )
+    item13.add_argument("--knobs", type=Path, required=True, help="the `knobs` command's output")
+    item13.add_argument("--dlq", type=Path, required=True, help="the `dlq` command's output")
+    item13.add_argument("--generator", type=Path, required=True, help="the generator report")
+    item13.add_argument("--fx-decision", choices=FX_DECISIONS, required=True)
     return parser
 
 
@@ -1058,6 +1606,31 @@ def _verdict_command(args: argparse.Namespace) -> int:
     return 1 if result["verdict"] == "inconclusive" else 0
 
 
+def _read_optional(path: Path) -> dict[str, Any] | None:
+    """A capture's JSON object, or None when the file is missing or is not one."""
+    try:
+        return _read_json(path)
+    except (OSError, ValueError):
+        return None
+
+
+def _item13_command(args: argparse.Namespace) -> int:
+    cdc, fx = _read_optional(args.cdc), _read_optional(args.fx)
+    bronze, dlq = _read_optional(args.knobs), _read_optional(args.dlq)
+    generator = _read_optional(args.generator)
+    clickstream = knob_checks(
+        bronze, dlq, _mapping(generator).get("knobs") if generator is not None else None
+    )
+    result = item13_verdict(
+        _mapping(cdc).get("knobs") if cdc is not None else None,
+        clickstream,
+        fx,
+        args.fx_decision,
+    )
+    _emit(result)
+    return 1 if result["verdict"] == "inconclusive" else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
@@ -1073,6 +1646,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit(wait_rows(args.expect, args.timeout))
         elif args.command == "analyze":
             _emit(analyze())
+        elif args.command == "knobs":
+            _emit(bronze_knobs(args.lateness_ms, args.hot_product, args.hot_customer))
+        elif args.command == "dlq":
+            _emit(dlq_headers())
+        elif args.command == "item13":
+            return _item13_command(args)
         elif args.command == "reset":
             _emit(reset())
         elif args.command == "logdirs":
