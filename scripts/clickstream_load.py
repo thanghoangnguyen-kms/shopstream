@@ -1,19 +1,32 @@
-"""The throwaway clickstream generator for item 12 (and, later, item 13's knobs), run by `cdc-run`.
+"""The throwaway clickstream generator for item 12, with item 13's knobs, run by `cdc-run`.
 
-ADR-001's Evidence rules exempt a one-off load script from unit tests, so this file has none; the
-evidence page records its command line and its seed. Its one pure rule, `offset_runs`, lives in
-throughput_check.py, where it is tested, so the generator's runs and bronze's islands come from one rule.
+ADR-001's Evidence rules exempt a one-off load script from unit tests for its load loop, which has
+none; the knob plan, the events, the delivery tally and the report are pure and tested in
+tests/test_clickstream_load.py. The order rule lives in throughput_check.py (`order_knobs`) and so
+does `offset_runs`, so the generator's expectations and bronze's checks come from one rule.
 
-Mode: `run --events N --rate R --procs P --seed S` sends N Avro events to the `clickstream` topic.
-P (1, 2, 3 or 6) worker processes each own the partitions p with p % P == worker and send their events
-to those partitions round-robin with an explicit `partition=`; each builds its own Producer after the
-fork (idempotent, acks all, lz4, linger 20 ms, batch 128 KiB). R is the total events per second
-(0 is unthrottled). Event values come from `random.Random(seed * 1000 + worker)`, so a seed repeats a
-batch exactly: event_id is `<seed>-<worker>-<n>`, event_time is 2026-01-01T00:00:00Z plus n x 50 ms per
-worker, `referrer` is drawn from search, email, social and ads (never the schema default "direct", the
-apache/iceberg#17652 null-default carrier) and `tag` is null in every event here. The wire format is
-Confluent's: 0x00, a big-endian schema id from Karapace, then the Avro binary. The key is the event_id
-string, registered under `clickstream-key` (the value under `clickstream-value`).
+Mode: `run --events N --rate R --procs P --seed S [--knobs]` sends N Avro events to the `clickstream`
+topic. P (1, 2, 3 or 6) worker processes each own the partitions p with p % P == worker and send
+their events to those partitions round-robin with an explicit `partition=`; each builds its own
+Producer after the fork (idempotent, acks all, lz4, linger 20 ms, batch 128 KiB). R is the total
+events per second (0 is unthrottled). Event values come from `random.Random(seed * 1000 + worker)`,
+so a seed repeats a batch exactly: event_id is `<seed>-<worker>-<n>`, event_time is
+2026-01-01T00:00:00Z plus n x 50 ms per worker, `referrer` is drawn from search, email, social and
+ads (never the schema default "direct", the apache/iceberg#17652 null-default carrier) and `tag` is
+null in every event unless `--knobs` puts the canary in one. The wire format is Confluent's: 0x00, a
+big-endian schema id from Karapace, then the Avro binary. The key is the event_id string, registered
+under `clickstream-key` (the value under `clickstream-value`).
+
+`--knobs` (needs CANARY_TOKEN in the environment) injects item 13's knobs on fixed residues of the
+event number n that never coincide: every 2,000th event (n % 2,000 == 13) is sent twice back to back
+(same key, same value); n % 1,500 == 3 is 90 s back in event time; n % 5,000 == 11 is 15 minutes back,
+beyond the stated 10-minute lateness bound; n % 10,000 == 17 is sent as a value that is not Avro (the
+sink moves it to the dead-letter topic); n % 3,000 == 29 sends referrer null explicitly; worker 0's
+event 1,000 carries the canary token in `tag`; product 1 takes every fourth event and customer 1
+another fourth (configured share 0.2). The report's `knobs` block gives, per knob, the count the
+generator meant to inject: the order counts come from `order_knobs` over each partition's
+well-formed delivered records, the malformed offsets are per-partition runs, and the canary is a
+count of 1.
 
 The delivery callback records every acknowledged offset per partition; the report holds the offset
 runs (through throughput_check.offset_runs), duplicates and counts, Kafka's latest offsets before and
@@ -27,6 +40,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
+import itertools
 import json
 import multiprocessing
 import os
@@ -34,14 +49,14 @@ import random
 import sys
 import time
 from array import array
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, NamedTuple
 
 import cdc_check
 import connect_admin
 from read_v3 import error_text
-from throughput_check import offset_runs
+from throughput_check import LATENESS_MS, offset_runs, order_knobs
 
 TOPIC = "clickstream"
 PARTITIONS = 6
@@ -145,36 +160,145 @@ class Record(NamedTuple):
 
 
 def matching_knobs(n: int, worker: int) -> list[str]:
-    raise NotImplementedError
+    """Every knob that event `n` of `worker` carries (the residues make it at most one)."""
+    found = [name for name, every, at in KNOB_RULES if n % every == at]
+    if worker == CANARY_WORKER and n == CANARY_AT:
+        found.append("canary")
+    return found
 
 
 def knob_of(n: int, worker: int) -> str | None:
-    raise NotImplementedError
+    """The one knob on event `n` of `worker`, or None."""
+    found = matching_knobs(n, worker)
+    return found[0] if found else None
 
 
 def malformed_value(n: int) -> bytes:
-    raise NotImplementedError
-
-
-def records_for(
-    rng: random.Random, seed: int, worker: int, n: int, knobs: bool, canary: str | None
-) -> list[Record]:
-    raise NotImplementedError
+    """A value that is never valid Confluent Avro: 0x7f (not the 0x00 magic byte), a marker, the event number."""
+    return b"\x7f" + MALFORMED_MARKER + str(n).encode()
 
 
 class KnobLedger:
+    """One worker's tally of its delivery reports, for the report's `knobs` block.
+
+    Memory is two 8-byte integers per delivered record (offset and event time) and one per malformed
+    record; the order rule runs over each partition's well-formed records in offset order when the
+    summary is asked for, so the expected counts come from `throughput_check.order_knobs`, the rule
+    the bronze checks mirror.
+    """
+
     def __init__(self, partitions: Sequence[int]) -> None:
-        raise NotImplementedError
+        self._offsets = {p: array("q") for p in partitions}
+        self._times = {p: array("q") for p in partitions}
+        self._malformed = {p: array("q") for p in partitions}
+        self._duplicates = 0
+        self._null_referrers = 0
+        self._canaries = 0
+        self._hot_product = 0
+        self._hot_customer = 0
 
     def delivered(self, partition: int, offset: int, sent: Sent) -> None:
-        raise NotImplementedError
+        if sent.malformed:
+            self._malformed[partition].append(offset)
+            return
+        self._offsets[partition].append(offset)
+        self._times[partition].append(sent.event_time_ms)
+        self._duplicates += int(sent.resend)
+        self._null_referrers += int(sent.null_referrer)
+        self._canaries += int(sent.canary)
+        self._hot_product += int(sent.hot_product)
+        self._hot_customer += int(sent.hot_customer)
 
     def summary(self, lateness_ms: int) -> dict[str, Any]:
-        raise NotImplementedError
+        out_of_order = beyond_watermark = malformed_count = 0
+        runs: dict[str, list[list[int]]] = {}
+        for partition in sorted(self._offsets):
+            found = order_knobs(
+                _in_offset_order(self._offsets[partition], self._times[partition]), lateness_ms
+            )
+            out_of_order += found["out_of_order"]
+            beyond_watermark += found["beyond_watermark"]
+            taken = self._malformed[partition]
+            if len(taken):
+                malformed_count += len(taken)
+                runs[str(partition)] = offset_runs(taken)[0]
+        return {
+            "intended_duplicates": self._duplicates,
+            "malformed": {"count": malformed_count, "runs": runs},
+            "out_of_order_expected": out_of_order,
+            "beyond_watermark_expected": beyond_watermark,
+            "hot_product_rows_expected": self._hot_product,
+            "hot_customer_rows_expected": self._hot_customer,
+            "explicit_null_referrers": self._null_referrers,
+            "canary_events": self._canaries,
+        }
+
+
+def _in_offset_order(offsets: Sequence[int], times: Sequence[int]) -> Iterator[tuple[int, int]]:
+    """(offset, event_time) pairs by offset; delivery reports normally arrive in offset order already."""
+    order: Sequence[int] = range(len(offsets))
+    if any(a > b for a, b in zip(offsets, itertools.islice(offsets, 1, None), strict=False)):
+        order = sorted(order, key=offsets.__getitem__)
+    return ((offsets[i], times[i]) for i in order)
+
+
+def _union_runs(runs: Iterable[Sequence[int]]) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for start, stop in sorted((int(r[0]), int(r[1])) for r in runs):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], stop)
+        else:
+            merged.append([start, stop])
+    return merged
+
+
+def knob_rates() -> dict[str, dict[str, int]]:
+    """Every knob's `every` and `residue` (the canary's `at` and `worker`), as the report states them."""
+    rates: dict[str, dict[str, int]] = {
+        name: {"every": every, "residue": at} for name, every, at in KNOB_RULES
+    }
+    rates["canary"] = {"at": CANARY_AT, "worker": CANARY_WORKER}
+    rates["hot_product"] = {"every": HOT_EVERY, "residue": HOT_PRODUCT_AT}
+    rates["hot_customer"] = {"every": HOT_EVERY, "residue": HOT_CUSTOMER_AT}
+    return rates
 
 
 def merge_knob_reports(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    raise NotImplementedError
+    """The run's `knobs` block: the workers' counts summed, and the constants the checks read."""
+    totals = dict.fromkeys(
+        (
+            "intended_duplicates",
+            "out_of_order_expected",
+            "beyond_watermark_expected",
+            "hot_product_rows_expected",
+            "hot_customer_rows_expected",
+            "explicit_null_referrers",
+            "canary_events",
+        ),
+        0,
+    )
+    pooled: dict[str, list[Sequence[int]]] = {}
+    for part in parts:
+        for key in totals:
+            totals[key] += int(part[key])
+        for partition, runs in part["malformed"]["runs"].items():
+            pooled.setdefault(str(partition), []).extend(runs)
+    merged_runs = {
+        p: _union_runs(runs) for p, runs in sorted(pooled.items(), key=lambda kv: int(kv[0]))
+    }
+    return {
+        **totals,
+        "malformed": {
+            "count": sum(int(part["malformed"]["count"]) for part in parts),
+            "runs": merged_runs,
+        },
+        "lateness_ms": LATENESS_MS,
+        "configured_hot_share": CONFIGURED_HOT_SHARE,
+        "hot_product_id": HOT_PRODUCT_ID,
+        "hot_customer_id": HOT_CUSTOMER_ID,
+        "shifts_ms": {"out_of_order": OUT_OF_ORDER_SHIFT_MS, "late": LATE_SHIFT_MS},
+        "rates": knob_rates(),
+    }
 
 
 def register_schemas() -> dict[str, int]:
@@ -220,20 +344,70 @@ def make_event(
     knobs: bool = False,
     canary: str | None = None,
 ) -> dict[str, Any]:
-    """Event `n` of `worker`: every value from the worker's seeded generator."""
-    product_id = rng.randint(1, PRODUCTS)
-    return {
+    """Event `n` of `worker`: every value from the worker's seeded generator.
+
+    With `knobs`, the hot product and customer take every fourth event on their own residues (the
+    other draws use ids 2 and up), and the event's own knob applies: an out-of-order or late event
+    is shifted back, a null-referrer event sends referrer None, and the canary event carries the
+    token in `tag`. Without it the event is exactly the one the earlier plan sent.
+    """
+    low = 2 if knobs else 1
+    product_id = rng.randint(low, PRODUCTS)
+    customer_id = rng.randint(low, CUSTOMERS)
+    event: dict[str, Any] = {
         "event_id": f"{seed}-{worker}-{n}",
         "session_id": f"s{worker}-{n // SESSION_SIZE}",
-        "customer_id": rng.randint(1, CUSTOMERS),
+        "customer_id": customer_id,
         "product_id": product_id,
         "event_type": EVENT_TYPES[rng.randrange(len(EVENT_TYPES))],
         "event_time": EVENT_EPOCH_MS + n * EVENT_STEP_MS,
-        "page": f"/p/{product_id}",
+        "page": "",
         "user_agent": USER_AGENTS[rng.randrange(len(USER_AGENTS))],
         "referrer": REFERRERS[rng.randrange(len(REFERRERS))],
         "tag": None,
     }
+    if knobs:
+        if n % HOT_EVERY == HOT_PRODUCT_AT:
+            event["product_id"] = HOT_PRODUCT_ID
+        if n % HOT_EVERY == HOT_CUSTOMER_AT:
+            event["customer_id"] = HOT_CUSTOMER_ID
+        kind = knob_of(n, worker)
+        if kind == "out_of_order":
+            event["event_time"] -= OUT_OF_ORDER_SHIFT_MS
+        elif kind == "late":
+            event["event_time"] -= LATE_SHIFT_MS
+        elif kind == "null_referrer":
+            event["referrer"] = None
+        elif kind == "canary":
+            if not canary:
+                raise ValueError("the canary event needs a token")
+            event["tag"] = canary
+    event["page"] = f"/p/{event['product_id']}"
+    return event
+
+
+def records_for(
+    rng: random.Random, seed: int, worker: int, n: int, knobs: bool, canary: str | None
+) -> list[Record]:
+    """The records event `n` sends: one, or two for a duplicate (the same event sent twice)."""
+    event = make_event(rng, seed, worker, n, knobs, canary)
+    sent = Sent(
+        event_time_ms=int(event["event_time"]),
+        hot_product=knobs and event["product_id"] == HOT_PRODUCT_ID,
+        hot_customer=knobs and event["customer_id"] == HOT_CUSTOMER_ID,
+    )
+    if not knobs:
+        return [Record(event, sent)]
+    kind = knob_of(n, worker)
+    sent = sent._replace(
+        malformed=kind == "malformed",
+        null_referrer=kind == "null_referrer",
+        canary=kind == "canary",
+    )
+    records = [Record(event, sent)]
+    if kind == "duplicate":
+        records.append(Record(event, sent._replace(resend=True)))
+    return records
 
 
 def worker_partitions(worker: int, procs: int) -> list[int]:
@@ -255,11 +429,14 @@ def _worker(spec: Mapping[str, Any]) -> dict[str, Any]:
     count = int(spec["events"])
     partitions: list[int] = list(spec["partitions"])
     rate = float(spec["rate"])
+    knobs = bool(spec["knobs"])
+    canary = spec.get("canary")
     value_schema = fastavro.parse_schema(CLICKSTREAM_SCHEMA)
     key_schema = fastavro.parse_schema(KEY_SCHEMA)
     key_id = int(spec["key_id"])
     value_id = int(spec["value_id"])
     offsets: dict[int, array[int]] = {p: array("q") for p in partitions}
+    ledger = KnobLedger(partitions)
     failures = [0]
 
     def on_delivery(err: Any, msg: Any) -> None:
@@ -268,6 +445,11 @@ def _worker(spec: Mapping[str, Any]) -> dict[str, Any]:
             return
         offsets[msg.partition()].append(msg.offset())
 
+    def on_knob_delivery(sent: Sent, err: Any, msg: Any) -> None:
+        on_delivery(err, msg)
+        if err is None:
+            ledger.delivered(msg.partition(), msg.offset(), sent)
+
     producer = Producer(
         {
             "bootstrap.servers": cdc_check.BOOTSTRAP,
@@ -275,22 +457,39 @@ def _worker(spec: Mapping[str, Any]) -> dict[str, Any]:
             **PRODUCER_SETTINGS,
         }
     )
+
+    def send(key: bytes, value: bytes, partition: int, callback: Any) -> None:
+        while True:
+            try:
+                producer.produce(
+                    TOPIC, value=value, key=key, partition=partition, on_delivery=callback
+                )
+                return
+            except BufferError:
+                producer.poll(0.1)
+
     rng = random.Random(seed * 1000 + worker)
     started_ms = int(time.time() * 1000)
     begun = time.perf_counter()
     for n in range(count):
-        event = make_event(rng, seed, worker, n)
-        key = encode(key_id, key_schema, event["event_id"])
-        value = encode(value_id, value_schema, event)
         partition = partitions[n % len(partitions)]
-        while True:
-            try:
-                producer.produce(
-                    TOPIC, value=value, key=key, partition=partition, on_delivery=on_delivery
+        if knobs:
+            for record in records_for(rng, seed, worker, n, True, canary):
+                key = encode(key_id, key_schema, record.event["event_id"])
+                value = (
+                    malformed_value(n)
+                    if record.sent.malformed
+                    else encode(value_id, value_schema, record.event)
                 )
-                break
-            except BufferError:
-                producer.poll(0.1)
+                send(key, value, partition, functools.partial(on_knob_delivery, record.sent))
+        else:
+            event = make_event(rng, seed, worker, n)
+            send(
+                encode(key_id, key_schema, event["event_id"]),
+                encode(value_id, value_schema, event),
+                partition,
+                on_delivery,
+            )
         if n % POLL_EVERY == 0:
             producer.poll(0)
         if rate > 0 and n % PACE_EVERY == 0:
@@ -309,6 +508,7 @@ def _worker(spec: Mapping[str, Any]) -> dict[str, Any]:
         "ended_at_ms": ended_ms,
         "failed": failures[0] + remaining,
         "per_partition": per_partition,
+        "knobs": ledger.summary(LATENESS_MS) if knobs else {},
     }
 
 
@@ -323,7 +523,15 @@ def latest_offsets() -> dict[int, int]:
     return {tp.partition: int(f.result().offset) for tp, f in futures.items()}
 
 
-def run(events: int, rate: float, procs: int, seed: int, command: str) -> dict[str, Any]:
+def run(
+    events: int,
+    rate: float,
+    procs: int,
+    seed: int,
+    command: str,
+    knobs: bool = False,
+    canary: str | None = None,
+) -> dict[str, Any]:
     ids = register_schemas()
     before = latest_offsets()
     specs = [
@@ -336,6 +544,8 @@ def run(events: int, rate: float, procs: int, seed: int, command: str) -> dict[s
             "partitions": worker_partitions(w, procs),
             "key_id": ids[KEY_SUBJECT],
             "value_id": ids[VALUE_SUBJECT],
+            "knobs": knobs,
+            "canary": canary,
         }
         for w in range(procs)
     ]
@@ -368,7 +578,7 @@ def run(events: int, rate: float, procs: int, seed: int, command: str) -> dict[s
         "offsets_consistent": all(
             int(f["count"]) == int(f["end"]) - int(f["start"]) for f in per_partition.values()
         ),
-        "knobs": {},
+        "knobs": merge_knob_reports([r["knobs"] for r in results]) if knobs else {},
     }
 
 
@@ -391,6 +601,8 @@ def usage_error(args: argparse.Namespace) -> str | None:
         return "--rate must not be negative"
     if args.procs not in PROCS:
         return "--procs must be 1, 2, 3 or 6"
+    if args.knobs and not os.environ.get(CANARY_ENV):
+        return f"--knobs needs {CANARY_ENV} in the environment"
     return None
 
 
@@ -411,6 +623,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.procs,
             args.seed,
             "python /app/clickstream_load.py " + " ".join(given),
+            args.knobs,
+            os.environ.get(CANARY_ENV) if args.knobs else None,
         )
     except Exception as exc:
         print(f"error: {error_text(exc, [os.environ.get(CANARY_ENV, '')])}", file=sys.stderr)

@@ -157,7 +157,28 @@ def offset_runs(offsets: Iterable[int]) -> tuple[list[list[int]], int]:
 
 
 def order_knobs(rows: Iterable[Sequence[int]], lateness_ms: int) -> dict[str, int]:
-    raise NotImplementedError
+    """Item 13's order knobs over one partition's (offset, event_time_ms) rows, in offset order.
+
+    A row is out of order when its event time is strictly below the previous row's, and beyond the
+    watermark when it is strictly below the running maximum over the earlier rows minus
+    `lateness_ms`. Equal event times are neither, so an immediate duplicate counts as a duplicate
+    only. The generator computes its expected counts with this rule and the bronze checks mirror it
+    in SQL (lag, and max over the rows before), so the two sides count the same thing.
+    """
+    if lateness_ms < 0:
+        raise ValueError("the lateness bound must not be negative")
+    out_of_order = beyond_watermark = 0
+    previous: int | None = None
+    running_max: int | None = None
+    for row in rows:
+        event_time = int(row[1])
+        if previous is not None and event_time < previous:
+            out_of_order += 1
+        if running_max is not None and event_time < running_max - lateness_ms:
+            beyond_watermark += 1
+        previous = event_time
+        running_max = event_time if running_max is None else max(running_max, event_time)
+    return {"out_of_order": out_of_order, "beyond_watermark": beyond_watermark}
 
 
 # --- the set check: interval arithmetic over half-open runs --------------------------------------
