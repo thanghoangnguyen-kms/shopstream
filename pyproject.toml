@@ -83,6 +83,8 @@ ignore = ["E501"]
 "scripts/cdc_check.py" = ["S608"]
 # A seeded, reproducible workload, not cryptography (S311); SQL from constant names with parameterized values (S608).
 "scripts/cdc_workload.py" = ["S311", "S608"]
+# Fixed docker argv lists (S603, S607), never shell strings.
+"scripts/connect_kill.py" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.13"
