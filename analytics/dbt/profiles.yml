@@ -7,6 +7,9 @@ shopstream:
       database: lk
       threads: 1
       extensions: [iceberg, httpfs]
+      # Item 8: the dbt build also runs inside the Airflow scheduler, so DuckDB is capped at 512MiB.
+      settings:
+        memory_limit: "512MiB"
       attach:
         - path: spike
           alias: lk

@@ -16,6 +16,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 PLUGIN = REPO / "orchestration" / "plugins" / "kafka_apply.py"
 DAG = REPO / "orchestration" / "dags" / "fx_refresh_on_message.py"
+DBT_DAG = REPO / "orchestration" / "dags" / "dbt_build_lk.py"
 EVENT_KEYS = {"topic", "partition", "offset", "timestamp_ms", "value"}
 
 
@@ -103,9 +104,38 @@ def test_the_dag_names_the_trigger_the_asset_and_the_schedule(fragment: str) -> 
     assert fragment in DAG.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("path", [DAG, PLUGIN])
+@pytest.mark.parametrize("path", [DAG, PLUGIN, DBT_DAG])
 def test_neither_file_holds_a_secret_or_a_broker_address(path: Path) -> None:
     text = path.read_text(encoding="utf-8").lower()
     assert "password" not in text
     assert "bootstrap.servers" not in text
     assert "kafka-1" not in text
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        'dag_id="dbt_build_lk"',
+        "schedule=None",
+        "BashOperator",
+        'task_id="dbt_build"',
+        "DO_NOT_TRACK=1 /opt/dbt/bin/dbt build --target lk --select +inc_v3",
+        "--project-dir /tmp/dbt-work --profiles-dir /tmp/dbt-work",
+        "--vars '{batch: 2}'",
+        "cd /opt/analytics/dbt",
+        "cp -R dbt_project.yml profiles.yml macros models seeds /tmp/dbt-work/",
+        "set -euo pipefail",
+    ],
+)
+def test_the_dbt_dag_runs_item_3s_build_from_a_copy_in_tmp(fragment: str) -> None:
+    assert fragment in DBT_DAG.read_text(encoding="utf-8")
+
+
+def test_the_dbt_dag_writes_nothing_under_the_read_only_mount() -> None:
+    text = DBT_DAG.read_text(encoding="utf-8")
+    command = text[text.index('DBT_BUILD = """') :].split('"""')[1]
+    for line in command.splitlines():
+        if "/opt/analytics" not in line:
+            continue
+        # the only use of the mount is to enter it and read from it
+        assert line.startswith("cd /opt/analytics/dbt"), line

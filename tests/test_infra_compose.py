@@ -70,6 +70,8 @@ AIRFLOW_MOUNTS = [
     "../orchestration/dags:/opt/airflow/dags:ro",
     "../orchestration/plugins:/opt/airflow/plugins:ro",
 ]
+AIRFLOW_DBT_MOUNT = "../analytics/dbt:/opt/analytics/dbt:ro"
+UV_IMAGE_DIGEST = "sha256:3adc3706091ce7c2fe595e669628caedd6d951551b92b258b7e7dbe06d9440bc"
 AIRFLOW_SECRETS = {"AIRFLOW_DB_PASSWORD", "AIRFLOW_FERNET_KEY", "AIRFLOW_JWT_SECRET"}
 CDC_SQL = (INFRA / "postgres" / "cdc.sql").read_text(encoding="utf-8")
 CREATE_TOPICS = (INFRA / "kafka" / "create-topics.sh").read_text(encoding="utf-8")
@@ -814,11 +816,24 @@ def test_each_airflow_service_is_built_from_the_airflow_dockerfile(name: str) ->
     assert service["build"] == {"context": "..", "dockerfile": "infra/airflow/Dockerfile"}
 
 
-@pytest.mark.parametrize("name", sorted(ORCHESTRATION))
+@pytest.mark.parametrize("name", sorted(ORCHESTRATION - {"airflow-scheduler"}))
 def test_each_airflow_service_mounts_exactly_the_two_read_only_orchestration_paths(
     name: str,
 ) -> None:
     assert SERVICES[name]["volumes"] == AIRFLOW_MOUNTS
+
+
+def test_only_the_scheduler_mounts_the_dbt_project_and_it_is_read_only() -> None:
+    assert SERVICES["airflow-scheduler"]["volumes"] == [*AIRFLOW_MOUNTS, AIRFLOW_DBT_MOUNT]
+    for name in sorted(ORCHESTRATION - {"airflow-scheduler"}):
+        assert not [v for v in SERVICES[name]["volumes"] if "analytics" in v], name
+
+
+def test_the_scheduler_holds_the_provisional_dbt_task_limit_pair() -> None:
+    # LocalExecutor runs dbt_build_lk's task in this container. Plan 05-05 sizes it from measurement.
+    scheduler = SERVICES["airflow-scheduler"]
+    assert scheduler["mem_limit"] == "1536m"
+    assert scheduler["memswap_limit"] == "1536m"
 
 
 @pytest.mark.parametrize("name", sorted(ORCHESTRATION))
@@ -879,9 +894,9 @@ def test_the_airflow_dockerfile_pins_the_base_by_digest_and_installs_the_three_p
     assert len(froms) == 1
     assert froms[0].endswith(f"@{AIRFLOW_IMAGE_DIGEST}")
     assert ":3.3.2-python3.13" in froms[0]
-    assert not [line for line in lines if line.startswith(("ADD ", "COPY ", "ENV "))]
+    assert not [line for line in lines if line.startswith(("ADD ", "ENV "))]
     runs = [line for line in lines if line.startswith("RUN ")]
-    assert len(runs) == 1
+    assert len(runs) == 2
     pins = re.findall(r'"(apache-airflow[\w-]*==[\w.]+)"', runs[0])
     assert pins == [
         "apache-airflow==3.3.2",
@@ -892,3 +907,20 @@ def test_the_airflow_dockerfile_pins_the_base_by_digest_and_installs_the_three_p
         "--constraint "
         '"https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.13.txt"'
     ) in runs[0]
+
+
+def test_the_airflow_dockerfile_syncs_item_3s_dbt_venv_as_root_and_hands_back_to_airflow() -> None:
+    lines = dockerfile_lines(AIRFLOW_DOCKERFILE)
+    copies = [line for line in lines if line.startswith("COPY ")]
+    from_uv = [line for line in copies if line.startswith("COPY --from=")]
+    assert len(from_uv) == 1
+    assert f"ghcr.io/astral-sh/uv:0.12.18@{UV_IMAGE_DIGEST}" in from_uv[0]
+    assert [line for line in copies if not line.startswith("COPY --from=")] == [
+        "COPY analytics/dbt/pyproject.toml analytics/dbt/uv.lock /src/dbt/"
+    ]
+    runs = [line for line in lines if line.startswith("RUN ")]
+    assert "UV_PROJECT_ENVIRONMENT=/opt/dbt" in runs[1]
+    assert "uv sync --frozen --project /src/dbt" in runs[1]
+    users = [line for line in lines if line.startswith("USER ")]
+    assert users[-1] == "USER airflow"
+    assert lines.index("USER root") < lines.index(runs[1]) < lines.index(users[-1])
