@@ -7,7 +7,9 @@ lines mean which commit stage, and that every command is a fixed argv list, neve
 
 from __future__ import annotations
 
+import queue
 import re
+import time
 from pathlib import Path
 
 import connect_kill as ck
@@ -105,3 +107,35 @@ def test_both_connectors_must_be_running_with_every_task_running() -> None:
         {"connector": {"state": "UNASSIGNED"}, "tasks": [{"state": "RUNNING"}]}
     )
     assert not ck.is_running({})
+
+
+def test_a_log_line_timestamp_is_read_as_utc_microseconds() -> None:
+    line = (
+        "2026-10-03T06:10:14,536 INFO   ||  Coordinator bronze-sink-0 completed commit to table x"
+    )
+    assert ck.line_ts_us(line) == 1791007814536000
+    assert ck.line_ts_us("no timestamp here") is None
+
+
+def test_a_stage_line_written_before_the_kill_does_not_count_after_the_restart() -> None:
+    # The killed worker's own last lines can share the restart's one-second `--since` window.
+    stale = (
+        "2026-10-03T06:10:14,536 INFO   ||  Coordinator bronze-sink-0 completed commit to table x"
+    )
+    fresh = (
+        "2026-10-03T06:11:17,948 INFO   ||  Coordinator bronze-sink-0 completed commit to table y"
+    )
+    kill_us = 1791007814799710
+    lines: queue.Queue[str | None] = queue.Queue()
+    lines.put(stale + "\n")
+    lines.put(fresh + "\n")
+    found = ck.wait_for_line(lines, "completed", time.monotonic() + 5, [""], after_us=kill_us)
+    assert found is not None
+    assert found[0] == fresh
+    stale_only: queue.Queue[str | None] = queue.Queue()
+    stale_only.put(stale + "\n")
+    stale_only.put(None)
+    assert (
+        ck.wait_for_line(stale_only, "completed", time.monotonic() + 5, [""], after_us=kill_us)
+        is None
+    )

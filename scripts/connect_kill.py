@@ -51,6 +51,7 @@ STAGES = {
     "ready": re.compile(rf"Commit ({UUID}) ready, received responses for all"),
     "completed": re.compile(r"completed commit to table"),
 }
+LINE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}),(\d{3})")
 CONNECTOR_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 STATUS_INTERVAL_S = 2.0
 MATCHED_LINE_LIMIT = 160
@@ -71,6 +72,15 @@ def parse_line(line: str) -> tuple[str | None, str | None]:
             found = UUID_PATTERN.search(line)
             return stage, found.group(0) if found else None
     return None, None
+
+
+def line_ts_us(line: str) -> int | None:
+    """A Connect log line's leading UTC timestamp in microseconds, or None when it has none."""
+    match = LINE_TS.match(line)
+    if not match:
+        return None
+    moment = dt.datetime.fromisoformat(match.group(1)).replace(tzinfo=dt.UTC)
+    return int(moment.timestamp()) * 1_000_000 + int(match.group(2)) * 1000
 
 
 def logs_argv(since: str) -> list[str]:
@@ -134,12 +144,17 @@ def follow(argv: list[str]) -> tuple[subprocess.Popen[str], queue.Queue[str | No
 
 
 def wait_for_line(
-    lines: queue.Queue[str | None], stage: str, deadline: float, last_initiated: list[str]
+    lines: queue.Queue[str | None],
+    stage: str,
+    deadline: float,
+    last_initiated: list[str],
+    after_us: int | None = None,
 ) -> tuple[str, str | None] | None:
     """The first line for `stage`: (line, commit id), or None on a timeout or the end of the log.
 
     Every initiated line updates `last_initiated[0]`, the commit id a stage line without one falls
-    back to.
+    back to. With `after_us`, a line counts only when its own timestamp is later: `--since` has
+    one-second granularity, so after a restart it can replay the killed worker's last lines.
     """
     while time.monotonic() < deadline:
         try:
@@ -148,6 +163,10 @@ def wait_for_line(
             continue
         if line is None:
             return None
+        if after_us is not None:
+            stamp = line_ts_us(line)
+            if stamp is None or stamp <= after_us:
+                continue
         found, commit_id = parse_line(line)
         if found == "initiated" and commit_id:
             last_initiated[0] = commit_id
@@ -211,7 +230,12 @@ def run_kill(stage: str, delay_ms: int, timeout_s: float) -> dict[str, Any]:
         time.sleep(STATUS_INTERVAL_S)
     process, lines = follow(logs_argv(restarted))
     try:
-        if wait_for_line(lines, "completed", deadline, last_initiated) is not None:
+        if (
+            wait_for_line(
+                lines, "completed", deadline, last_initiated, after_us=record["kill_ts_us"]
+            )
+            is not None
+        ):
             record["recovered_ts_us"] = now_us()
             record["recovered"] = True
     finally:
