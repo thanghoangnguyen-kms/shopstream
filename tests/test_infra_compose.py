@@ -555,6 +555,13 @@ def test_frankfurter_is_sized_for_its_memory_limit() -> None:
     assert frankfurter["environment"]["MAX_THREADS"] == "3"
     assert frankfurter["init"] is True
     assert frankfurter["ports"] == ["127.0.0.1:8090:8080"]
+    # Web-only puma: no foreman, so no provider scheduler that the backfill peak OOM-killed.
+    entrypoint = " ".join(frankfurter["entrypoint"])
+    assert "puma" in entrypoint
+    assert "foreman" not in entrypoint
+    assert frankfurter["command"] == []
+    assert memory_bytes(frankfurter["mem_limit"]) == 256 * MIB
+    assert memory_bytes(frankfurter["memswap_limit"]) == 256 * MIB
 
 
 def test_the_frankfurter_volume_is_chowned_before_the_service_starts() -> None:
