@@ -778,6 +778,84 @@ The sources, in order: the connector config as submitted (`show-config source`);
 
 The redaction pass masks any password-named field whole, so this proof is given as placeholders and counts instead of the raw connector JSON.
 
+### Exactly-once
+
+Exactly-once: go. Three serialized SIGKILLs of the Connect worker, two of them landing after DATA_COMPLETE and before COMMIT_COMPLETE, left bronze's (topic, partition, offset) set equal to the 14,559 non-null records a `read_committed` consumer reads below the fixed end offsets, with no duplicate offset, and the 14,389 distinct (primary key, `source.lsn`) changes equal the 14,389 `test_decoding` changes.
+
+| Measure | Value |
+| ------- | ----- |
+| `count(*)` of bronze rows over the five tables | 14,559 |
+| distinct (table, primary key, `source.lsn`) | 14,389 |
+| Re-sends (`count(*)` minus distinct) | 170 |
+| `test_decoding` changes, counted by `pg_logical_slot_peek_changes` | 14,389 |
+| `test_decoding` changes, read by `pg_logical_slot_get_changes` to the same LSN | 14,389 |
+| Kafka non-null records | 14,559 |
+| Kafka tombstones | 2,416 |
+| Missing offsets (in Kafka, not in bronze) | 0 |
+| Extra offsets (in bronze, not in Kafka) | 0 |
+| Duplicate offsets | 0 |
+| Bronze rows at or beyond the end offsets | 0 |
+| Audit-branch snapshots read | 150 |
+
+The 170 re-sends are changes Debezium produced again after a restart: it resumes from its last flushed source offset, so the same `source.lsn` reappears at a new offset. They are not a failure; the silver macro collapses them across batches. The end offsets are the `read_committed` end offsets of the 15 partitions (three per topic), taken after the workload stopped and the sink caught up, once two reads 10 seconds apart agreed. Each is exclusive: the Kafka set holds the records below it, and a bronze row at or beyond it would count as beyond the end, not as extra. The end LSN for the `test_decoding` count was `0/39CC168`. `test_decoding` counted INSERT, UPDATE and DELETE lines for the five captured tables only: 2,389 DELETE, 6,605 UPDATE and 5,395 INSERT lines per the by-table counts, `cnt_slot` was created after the reset and before the first write, and the final measurement dropped it (no row of `cnt_slot` remains in `pg_replication_slots`).
+
+### Kills
+
+The kills ran one at a time. Each waited for both connectors to report RUNNING before the next began, and the next kill fired only on a later commit's log line. The kill triggers on a Connect log line because the commit window is under a second. The control topic classifies each kill by which events exist for the killed commit; the worker and the coordinator die together, so every event that exists was written before the kill.
+
+| Kill | Stage targeted | Delay | Control-topic class | Recovered | Seconds from kill to the next completed commit |
+| ---- | -------------- | ----- | ------------------- | --------- | ---------------------------------------------- |
+| 1 | initiated | 0 ms | workers_writing | yes | 61.6 |
+| 2 | ready | 200 ms | commit_to_table | yes | 63.1 |
+| 3 | completed | 0 ms | commit_to_table | yes | 69.5 |
+
+The seconds column is the time from the kill to the first table commit the restarted coordinator completed, read from the Connect log; the open control-topic transaction of the killed commit holds the partition until its 60 s timeout, so recovery takes about a minute. The harness reported kill 2's recovery after 23.2 s because its log follower replayed the killed worker's own last lines from the restart's one-second window; that was a harness defect, fixed afterwards, and it did not affect the kill, the classification or the measurement. The first ready attempt (200 ms after the "ready, received responses for all 15 partitions" line) landed in the window, so no other delay was tried. Events of the killed commit, then of the next commit in topic order, as event type and count in order:
+
+```text
+kill 1, killed commit A:  START_COMMIT
+        next commit B:    START_COMMIT, DATA_WRITTEN x5, DATA_COMPLETE, COMMIT_TO_TABLE x5, COMMIT_COMPLETE
+kill 2, killed commit C:  START_COMMIT, DATA_WRITTEN x5, DATA_COMPLETE, COMMIT_TO_TABLE x4
+        next commit D:    START_COMMIT, DATA_WRITTEN x5, DATA_COMPLETE, COMMIT_TO_TABLE x2
+kill 3, killed commit D:  START_COMMIT, DATA_WRITTEN x5, DATA_COMPLETE, COMMIT_TO_TABLE x2
+        next commit E:    START_COMMIT, DATA_WRITTEN x5, DATA_COMPLETE, COMMIT_TO_TABLE x5, COMMIT_COMPLETE
+```
+
+Commit D is both kill 2's next commit and kill 3's killed commit: kill 2's restart ran D, and kill 3 then hit it after two of its five table commits. Kills 2 and 3 therefore each landed after DATA_COMPLETE and before COMMIT_COMPLETE (two of five table commits written in kill 3, four of five in kill 2). A kill classified commit_complete would prove nothing about recovery, because the commit had already finished; none occurred here. All control events decoded; none was undecodable.
+
+### Delete and tombstone
+
+One deleted key, from `customers`: key 9 produced bronze rows `c` at partition 0 offset 0, `u` at offsets 3 and 12, and `d` at offset 13, and its tombstone sits at offset 14 of the same partition, where bronze holds no row. The sink skips a null value but still advances the offset. Across the run the distinct `op=d` changes equal the Postgres DELETE count (2,389 each), and no bronze row sits at a tombstone offset (0 of 2,416). Tombstones outnumber deletes by 27 because Debezium emits one per delete record it sends, including re-sent ones; that split was not counted separately.
+
+### Versions and workload
+
+Debezium 3.6.3.Final, the Iceberg sink 1.11.0, confluent-kafka 2.15.1, pyiceberg 0.12.0 and psycopg 3.3.6, as the measurement reported them.
+
+Workload command line, seed 5, one session at 20 transactions per second for 600 seconds (elapsed 600.002 s):
+
+```text
+docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_workload.py --mode item5 --seconds 600 --rate 20 --seed 5
+```
+
+The workload's own counts, by table and verb (a delete is an update then a delete in one transaction, so a table's `test_decoding` UPDATE count exceeds the workload's update count by its deletes):
+
+| Table | Inserts | Updates | Deletes | Key range |
+| ----- | ------- | ------- | ------- | --------- |
+| customers | 1,066 | 824 | 428 | 2 to 1067 |
+| products | 1,114 | 862 | 507 | 2 to 1115 |
+| orders | 1,077 | 858 | 509 | 2 to 1078 |
+| order_items | 1,063 | 840 | 457 | 2 to 1064 |
+| reviews | 1,075 | 832 | 488 | 2 to 1076 |
+
+The simulated business clock ran from 2026-01-01T00:00:00+00:00 to 2026-01-01T00:00:12+00:00, and the WAL position went from `0/34CB768` to `0/39BBB98` across the workload.
+
+Before the run, the scoped reset: `rm -sf` of `connect`, `karapace`, `kafka-init`, `cdc-init` and the three brokers; removal of the three Kafka volumes; `cdc_check.py reset` (drops `shopstream_dbz` and `cnt_slot`, truncates the five captured tables, drops item 11's `tier` column if present, purges every bronze table through Lakekeeper); `up -d --wait connect`; `cdc_check.py slot-create`; `connect_admin.py register`. Phases 1 to 3's tables, the warehouse and the core Frankfurter were not touched.
+
+Kill command, one per stage, from the host: `uv run --frozen python scripts/connect_kill.py --stage initiated --delay-ms 0 --timeout 240`, then `--stage ready --delay-ms 200`, then `--stage completed --delay-ms 0`. Each record was classified with `cdc_check.py classify` on stdin. Final measurement, with the kill records on stdin: `docker compose -f infra/compose.yaml --profile core --profile streaming --profile spike run --rm -T cdc-run python /app/cdc_check.py item5 --kills-stdin --final --timeout 600`.
+
+### FALL-02
+
+FALL-02: N/A. Item 5's exactly-once result is go (no lost change, no offset gap), so the Iceberg sink stays the only bronze CDC writer and no Spark Structured Streaming writer is added.
+
 ## Item 6: Event-driven orchestration
 
 Not run.
