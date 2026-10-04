@@ -1,0 +1,839 @@
+name: shopstream
+
+x-defaults: &defaults
+  restart: "no"
+
+# The Kafka settings the three combined broker/controller nodes share. Public config, so literal.
+# Replication factor 3 and min.insync.replicas 2 everywhere, including the internal topics: do not
+# copy the upstream example's single-node settings. Each node adds KAFKA_NODE_ID and its advertised
+# listener. Auto-creation is off: kafka-init creates every topic.
+x-kafka-env: &kafka-env
+  CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: "2"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+
+# The environment every Airflow service shares (the `orchestration` profile). The database password,
+# the Fernet key and the JWT secret come from infra/.env (the JWT secret must be the same value in
+# every component). DAGS_ARE_PAUSED_AT_CREATION is false because a new DAG is paused and asset events
+# then start no runs. SIMPLE_AUTH_MANAGER_ALL_ADMINS makes every user an admin: a spike posture that
+# is safe only because no Airflow service publishes a port. The Kafka connection is a JSON
+# connection in the environment, so no DAG or plugin file holds a broker address.
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?run just up}@postgres:5432/airflow
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?run just up}
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run just up}
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+  AIRFLOW_CONN_KAFKA_DEFAULT: '{"conn_type": "kafka", "extra": {"bootstrap.servers": "kafka-1:19092,kafka-2:19092,kafka-3:19092", "group.id": "airflow-fx-refresh", "auto.offset.reset": "earliest", "enable.auto.commit": false}}'
+
+services:
+  postgres:
+    <<: *defaults
+    image: docker.io/library/postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    profiles: [core]
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - track_commit_timestamp=on
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+      # Bounds the WAL a replication slot holds: a peek-only count slot never advances.
+      - -c
+      - max_slot_wal_keep_size=4GB
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run just up}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?run just up}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?run just up}
+      SHOPSTREAM_DB_PASSWORD: ${SHOPSTREAM_DB_PASSWORD:?run just up}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    # Sized from Phase 5's calibration run: peak 281.9 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 384m
+    memswap_limit: 384m
+    healthcheck:
+      # TCP, because the init-time server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  lakekeeper-migrate:
+    <<: *defaults
+    image: quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5
+    profiles: [core]
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?run just up}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?run just up}@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_PG_ENCRYPTION_KEY:?run just up}
+      # ADR-001 spike exception (G6): no authentication, loopback-only ports. Week 5 re-bootstraps with OIDC and OpenFGA.
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Kept: not sampled (a one-shot shorter than one 5 s frame)
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  lakekeeper:
+    <<: *defaults
+    image: quay.io/lakekeeper/catalog:v0.13.6@sha256:d6829722cac0d00dfc5665b0955766387b93ccadd8b1e70e679b49619bc30ea5
+    profiles: [core]
+    command: ["serve"]
+    environment: *lakekeeper-env
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8181:8181"
+    # Sized from Phase 5's calibration run: peak 50.6 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 64m
+    memswap_limit: 64m
+    healthcheck:
+      # The image is FROM scratch: only the binary itself can probe.
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  seaweedfs:
+    <<: *defaults
+    image: docker.io/chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    profiles: [core]
+    command:
+      - mini
+      - -dir=/data
+      - -s3.config=/etc/seaweedfs/iam.json
+      - -s3.iam.config=/etc/seaweedfs/iam.json
+      - -webdav=false
+      - -admin.ui=false
+    volumes:
+      - seaweedfs-data:/data
+      # The only mount from infra/.generated: on virtiofs any container uid can read the 0600 file.
+      - ./.generated/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+    ports:
+      - "127.0.0.1:8333:8333"
+    # Sized from Phase 5's calibration run: peak 548.8 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 704m
+    memswap_limit: 704m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8333/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  frankfurter-init:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [core]
+    # A fresh named volume at /app/data is root-owned and the image runs as uid 1000.
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1000:1000", "/app/data"]
+    command: []
+    volumes:
+      - frankfurter-data:/app/data
+    # Kept: not sampled (a one-shot shorter than one 5 s frame)
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  frankfurter:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [core]
+    init: true
+    # Runs db:setup (migrations and the providers seed, idempotent), then web-only puma, item 10's
+    # recipe: no foreman, so no provider scheduler and no provider fetches.
+    entrypoint: ["sh", "-c", "bundle exec rake db:setup && exec bundle exec puma -C config/puma.rb"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+      # The defaults of 4 Puma workers and 5 threads do not fit the memory limit.
+      WORKER_PROCESSES: "1"
+      MAX_THREADS: "3"
+    depends_on:
+      frankfurter-init:
+        condition: service_completed_successfully
+    volumes:
+      - frankfurter-data:/app/data
+    ports:
+      - "127.0.0.1:8090:8080"
+    # History: the default foreman mode ran the all-provider scheduler, whose backfill reached 493 MiB and
+    # was OOM-killed on a filled volume (Plan 01-04 sized it at 640m). The web-only server peaked at
+    # 88.5 MiB in item 10. The image's default command also ran db:setup first, and the entrypoint keeps
+    # that step because it is the only one that creates the schema on an empty volume. Phase 5's
+    # calibration run sized the final value, below.
+    # Sized from Phase 5's calibration run: peak 142.4 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 192m
+    memswap_limit: 192m
+    healthcheck:
+      # The root route answers once puma is up. No backfill runs here, so a fresh volume serves an empty rate table.
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 120s
+
+  bootstrap:
+    <<: *defaults
+    image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    profiles: [bootstrap]
+    command: ["python", "/app/lakekeeper_bootstrap.py", "bootstrap"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      SEAWEEDFS_ADMIN_KEY: ${SEAWEEDFS_ADMIN_KEY:?run just up}
+      SEAWEEDFS_ADMIN_SECRET: ${SEAWEEDFS_ADMIN_SECRET:?run just up}
+    volumes:
+      - ../scripts/lakekeeper_bootstrap.py:/app/lakekeeper_bootstrap.py:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  warehouse:
+    <<: *defaults
+    image: docker.io/library/python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    profiles: [bootstrap]
+    command: ["python", "/app/lakekeeper_bootstrap.py", "warehouse"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      LAKEKEEPER_S3_KEY: ${LAKEKEEPER_S3_KEY:?run just up}
+      LAKEKEEPER_S3_SECRET: ${LAKEKEEPER_S3_SECRET:?run just up}
+    volumes:
+      - ../scripts/lakekeeper_bootstrap.py:/app/lakekeeper_bootstrap.py:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 128m
+    memswap_limit: 128m
+
+  # A spike one-shot that `just up` never starts. It holds the keys item 1's positive control and
+  # AssumeRole leg need. Built from infra/spike/Dockerfile, so the policy gate checks that file's
+  # FROM and COPY --from digests instead of an image: pin.
+  probe:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/probe_scope.py", "--json"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      AWS_EC2_METADATA_DISABLED: "true"
+      LAKEKEEPER_S3_KEY: ${LAKEKEEPER_S3_KEY:?run just up}
+      LAKEKEEPER_S3_SECRET: ${LAKEKEEPER_S3_SECRET:?run just up}
+      PROBE_OTHER_KEY: ${PROBE_OTHER_KEY:?run just up}
+      PROBE_OTHER_SECRET: ${PROBE_OTHER_SECRET:?run just up}
+      SEAWEEDFS_ADMIN_KEY: ${SEAWEEDFS_ADMIN_KEY:?run just up}
+      SEAWEEDFS_ADMIN_SECRET: ${SEAWEEDFS_ADMIN_SECRET:?run just up}
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    user: "65534:65534"
+    mem_limit: 256m
+    memswap_limit: 256m
+
+  # Item 2's Spark writer (readers come in Plan 02-05) and the job item 8 runs in Phase 5. Same
+  # image as probe. No infra/.env key reaches it: Lakekeeper vends the storage credentials to
+  # the JVM. Spark needs scratch space, hence the larger /tmp tmpfs on a read-only root. The tmpfs
+  # is mounted exec because the REST client decodes Lakekeeper's zstd responses with zstd-jni,
+  # which extracts a native library into /tmp and maps it (a default noexec tmpfs refuses that).
+  spark-job:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/spark_v3_job.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_EC2_METADATA_DISABLED: "true"
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,exec
+    user: "65534:65534"
+    # Sized from Phase 5's calibration run: peak 985.7 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 1248m
+    memswap_limit: 1248m
+
+  # Items 3, 9, 4 and 7's dbt runner, never started by `just up`. No infra/.env key reaches it:
+  # Lakekeeper vends the storage credentials to DuckDB. The analytics tree is mounted read-write
+  # because dbt writes its git-ignored target/ and logs/ there and DuckDB's Iceberg writer makes an
+  # empty data/ directory. The /tmp tmpfs is exec because DuckDB loads the extensions it downloads
+  # into HOME.
+  dbt-job:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/dbt/Dockerfile
+    profiles: [spike]
+    command: ["/opt/dbt/bin/dbt", "--version"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      DO_NOT_TRACK: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    working_dir: /work/analytics/dbt
+    volumes:
+      - ../analytics:/work/analytics
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,exec
+    user: "65534:65534"
+    mem_limit: 1g
+    memswap_limit: 1g
+
+  # Item 10's spike volume owner. A copy of frankfurter-init for the dedicated frankfurter-fx-data
+  # volume, so the core frankfurter never shares a SQLite file with the item 10 services.
+  frankfurter-fx-init:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    user: "0:0"
+    entrypoint: ["chown", "-R", "1000:1000", "/app/data"]
+    command: []
+    volumes:
+      - frankfurter-fx-data:/app/data
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  # Item 10's online-once seed: the only service that talks to the ECB. It fills the empty
+  # frankfurter-fx-data volume with ECB only (db:setup, then the ECB backfill) and exits, so the
+  # SQLite file never has two writers. The default network gives it a route out.
+  frankfurter-seed:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    user: "1000:1000"
+    entrypoint: ["sh", "-c", "bundle exec rake db:setup && bundle exec rake 'backfill[ECB]'"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+    volumes:
+      - frankfurter-fx-data:/app/data
+    depends_on:
+      frankfurter-fx-init:
+        condition: service_completed_successfully
+    mem_limit: 640m
+    memswap_limit: 640m
+
+  # Item 10's web-only Frankfurter: puma without foreman, so no scheduler and no provider fetches. It
+  # sits on the internal fx_offline network only, where it answers as http://frankfurter:8080. Stop it
+  # (rm -sf) before any reseed so one SQLite file never has two writers. It never creates the schema,
+  # so an empty volume needs frankfurter-fx-init and frankfurter-seed first, as item 10 did. It stays
+  # read-only so frankfurter-seed is the volume's only writer.
+  frankfurter-offline:
+    <<: *defaults
+    image: docker.io/lineofflight/frankfurter:2.5.1@sha256:1fe11227574203d47535e784caa97fbb76b0798ac46bd09de28b7261067d4b32
+    profiles: [spike]
+    init: true
+    entrypoint: ["sh", "-c", "bundle exec puma -C config/puma.rb"]
+    command: []
+    environment:
+      DATABASE_URL: sqlite:///app/data/frankfurter.sqlite3
+      WORKER_PROCESSES: "1"
+      MAX_THREADS: "3"
+    volumes:
+      - frankfurter-fx-data:/app/data
+    networks:
+      fx_offline:
+        aliases: [frankfurter]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      # The root route answers before the backfill finishes by design; completeness is the loader's check.
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
+
+  # Item 10's throwaway dlt loader, built from the spike image and attached to fx_offline only: it
+  # has no route to the internet and no published port. scripts/fx_load.py proves the cut before it
+  # loads. dlt telemetry is off so dlt makes no call on the cut network.
+  fx-load:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/fx_load.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      FRANKFURTER_URL: http://frankfurter:8080
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    networks:
+      - fx_offline
+    depends_on:
+      frankfurter-offline:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    user: "65534:65534"
+    mem_limit: 1g
+    memswap_limit: 1g
+
+  # Items 5 and 11's CDC runner, built from the spike image and never started by `just up`. It
+  # runs scripts/cdc_check.py (the measurement and the scoped reset), scripts/cdc_workload.py and
+  # scripts/connect_admin.py against Postgres, Kafka, Karapace and Connect, which the caller
+  # starts by activating the `streaming` profile. SHOPSTREAM_DB_PASSWORD is the workload's table
+  # owner login and for the reset's TRUNCATE; CDC_DB_PASSWORD is the replication role's, for the
+  # test_decoding count slot; CANARY_TOKEN is only counted for item 11 and never printed.
+  cdc-run:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/spike/Dockerfile
+    profiles: [spike]
+    command: ["python", "/app/cdc_check.py", "refs"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      HOME: /tmp
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      AWS_EC2_METADATA_DISABLED: "true"
+      SHOPSTREAM_DB_PASSWORD: ${SHOPSTREAM_DB_PASSWORD:?run just up}
+      CDC_DB_PASSWORD: ${CDC_DB_PASSWORD:?run just up}
+      CANARY_TOKEN: ${CANARY_TOKEN:?run just up}
+    working_dir: /tmp
+    volumes:
+      - ../scripts:/app:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    user: "65534:65534"
+    # Kept at 2g: the load generator, never part of the platform, peak 263.7 MiB
+    mem_limit: 2g
+    memswap_limit: 2g
+
+  # The `streaming` profile (Phase 4): three combined KRaft nodes, the topic one-shot, Karapace, a
+  # Connect worker and the Postgres CDC one-shot. No port is published: every probe runs in the
+  # network. Start it by name (`up -d --wait connect`), never with `just up`. Memory limits come from
+  # Phase 5's calibration run (item 8), each with its measured peak in a comment.
+  #
+  # Three combined broker/controller nodes (Kafka 4.3.1). Settings come from the x-kafka-env anchor.
+  kafka-1:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:19092
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+    # Sized from Phase 5's calibration run: peak 815.3 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:19092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-2:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:19092
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+    # Kept at the current limit: page-cache service (owner decision 2), peak 825.9 MiB
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:19092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-3:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "3"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:19092
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+    # Sized from Phase 5's calibration run: peak 813.9 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:19092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Creates every topic the phase uses at replication factor 3 and min.insync.replicas=2, then
+  # describes them so its log shows the result. Idempotent.
+  kafka-init:
+    <<: *defaults
+    image: docker.io/apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: [streaming]
+    entrypoint: ["bash", "/scripts/create-topics.sh"]
+    command: []
+    environment:
+      KAFKA_HEAP_OPTS: -Xms64m -Xmx192m
+    volumes:
+      - ./kafka/create-topics.sh:/scripts/create-topics.sh:ro
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 107.8 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 160m
+    memswap_limit: 160m
+
+  # Runs infra/postgres/cdc.sql (role, grants, reviews stand-in table, publication) on every start
+  # through the superuser password it already holds, so a clean clone and the existing volume both
+  # get it. The `$$NAME` form is the container's own shell variable, not a Compose interpolation.
+  cdc-init:
+    <<: *defaults
+    image: docker.io/library/postgres:17.11-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    profiles: [streaming]
+    entrypoint: ["sh", "-c", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" exec psql -h postgres -U postgres -d postgres -v ON_ERROR_STOP=1 -v cdc_pw=\"$$CDC_DB_PASSWORD\" -f /cdc/cdc.sql"]
+    command: []
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run just up}
+      CDC_DB_PASSWORD: ${CDC_DB_PASSWORD:?run just up}
+    volumes:
+      - ./postgres/cdc.sql:/cdc/cdc.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Kept: not sampled (a one-shot shorter than one 5 s frame)
+    mem_limit: 64m
+    memswap_limit: 64m
+
+  # Schema registry. KARAPACE_REPLICATION_FACTOR defaults to 1, which fails writes under
+  # min.insync.replicas 2 while /_health still says ready, so it is set to 3.
+  karapace:
+    <<: *defaults
+    image: ghcr.io/aiven-open/karapace:6.2.3@sha256:6d5b1ff1b77c497108be8be8359c9072294847cba5aa0767fc168ec70632d78f
+    profiles: [streaming]
+    entrypoint: ["python3", "-m", "karapace"]
+    environment:
+      KARAPACE_KARAPACE_REGISTRY: "true"
+      KARAPACE_ADVERTISED_HOSTNAME: karapace
+      KARAPACE_ADVERTISED_PROTOCOL: http
+      KARAPACE_BOOTSTRAP_URI: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      KARAPACE_PORT: "8081"
+      KARAPACE_HOST: 0.0.0.0
+      KARAPACE_CLIENT_ID: karapace
+      KARAPACE_GROUP_ID: karapace
+      KARAPACE_MASTER_ELIGIBILITY: "true"
+      KARAPACE_TOPIC_NAME: _schemas
+      KARAPACE_COMPATIBILITY: BACKWARD
+      KARAPACE_REPLICATION_FACTOR: "3"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    # Sized from Phase 5's calibration run: peak 111.4 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 160m
+    memswap_limit: 160m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  # Debezium 3.6.3.Final on Connect 4.3.0 with the Iceberg sink and the Avro converter, built from
+  # infra/connect/Dockerfile (no image key, so the policy gate checks that file's digests). The
+  # worker reads the connector password through Kafka's EnvVarConfigProvider, allowlisted for exactly
+  # CDC_DB_PASSWORD, so a connector config holds only an env-provider placeholder. The
+  # secret must never carry the worker prefix: the image's entrypoint writes every such variable
+  # into a properties file and echoes its value in the log. The variable names below are the ones
+  # the entrypoint reads (/docker-entrypoint.sh): HEAP_OPTS and ADVERTISED_HOST_NAME are mapped to
+  # KAFKA_HEAP_OPTS and the worker's advertised host. The sink's AWS SDK reads AWS_REGION; Lakekeeper
+  # vends the keys.
+  connect:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/connect/Dockerfile
+    profiles: [streaming]
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      OFFSET_FLUSH_INTERVAL_MS: "5000"
+      HEAP_OPTS: -Xms512m -Xmx1g
+      ADVERTISED_HOST_NAME: connect
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CONNECT_CONFIG_PROVIDERS_ENV_PARAM_ALLOWLIST_PATTERN: CDC_DB_PASSWORD
+      CDC_DB_PASSWORD: ${CDC_DB_PASSWORD:?run just up}
+      AWS_REGION: local-01
+      AWS_EC2_METADATA_DISABLED: "true"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      cdc-init:
+        condition: service_completed_successfully
+      karapace:
+        condition: service_healthy
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 1294.3 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 1632m
+    memswap_limit: 1632m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+
+  # The `orchestration` profile (Phase 4, item 6): Airflow 3.3.2 on LocalExecutor, one image built from
+  # infra/airflow/Dockerfile (no image key, so the policy gate checks that file's FROM digest), with
+  # the existing `airflow` database on the core Postgres. It always runs with `streaming`, which owns
+  # the brokers and the fx.refresh topic. No port is published: the evidence is read through the
+  # database and the `airflow` CLI inside the network. Start it by name (`up -d --wait airflow-apiserver
+  # airflow-scheduler airflow-dag-processor airflow-triggerer`), never with `just up`. The DAGs and the
+  # plugins are mounted read-only; the apply function lives in plugins because the triggerer imports it
+  # from there. Memory limits come from Phase 5's calibration run (item 8), each with its measured peak
+  # in a comment.
+  #
+  # The one-shot that migrates the airflow database. The four services below wait for it.
+  airflow-init:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    entrypoint: ["airflow", "db", "migrate"]
+    command: []
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 179.6 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 256m
+    memswap_limit: 256m
+
+  airflow-apiserver:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["api-server"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 282.9 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 384m
+    memswap_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # LocalExecutor runs the dbt_build_lk task in this container (item 8), so this cgroup holds the
+  # scheduler, its 30 s `airflow jobs check` healthcheck and the dbt process with DuckDB inside it.
+  # Phase 5 measured by docker stats, page cache included: idle 350 to 583 MiB depending on uptime,
+  # 34 to 115 MiB more while a healthcheck runs, and about 170 to 325 MiB more during item 3's
+  # 5-row build. DuckDB's memory_limit (224MiB in analytics/dbt/profiles.yml) caps its buffer
+  # manager only. These are measurements, not a bound: a larger dbt build needs this limit
+  # re-measured. It alone mounts the dbt project, read-only; the task copies it to /tmp.
+  airflow-scheduler:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["scheduler"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+      - ../analytics/dbt:/opt/analytics/dbt:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 720.5 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 928m
+    memswap_limit: 928m
+    healthcheck:
+      # `$$HOSTNAME` is the container's own shell variable, not a Compose interpolation.
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["dag-processor"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 352.5 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 448m
+    memswap_limit: 448m
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # Runs the asset watcher's Kafka trigger. It imports the apply function from /opt/airflow/plugins,
+  # so restart it after any edit there.
+  airflow-triggerer:
+    <<: *defaults
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    profiles: [orchestration]
+    command: ["triggerer"]
+    environment: *airflow-env
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../orchestration/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    # Sized from Phase 5's calibration run: peak 400.4 MiB x 1.25, rounded up to 32 MiB
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+networks:
+  # No route out: item 10's loader and web-only Frankfurter sit here and nothing else does.
+  fx_offline:
+    internal: true
+
+volumes:
+  postgres-data:
+  seaweedfs-data:
+  frankfurter-data:
+  frankfurter-fx-data:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:

@@ -16,6 +16,7 @@ Shopstream is a public, 23-week data engineering capstone: an open lakehouse on 
 | ---------------------- | -------------------------------------------------------------------------- |
 | `packages/<member>/`   | uv workspace members (Python 3.13)                                         |
 | `scripts/`             | tested helper scripts behind `just` recipes                                |
+| `infra/`               | Docker Compose stack, secrets template, SeaweedFS identity, Postgres init  |
 | `tests/`               | repo-level gates: secrets, docs lint, workspace naming, PR titles, policy  |
 | `docs/`                | specs, ADRs, schema and evidence (see §3)                                  |
 | `.github/workflows/`   | the four required checks: `lint`, `test`, `secrets`, `pr-title`            |

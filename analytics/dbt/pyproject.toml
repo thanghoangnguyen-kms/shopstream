@@ -1,0 +1,13 @@
+[project]
+name = "shopstream-dbt"
+version = "0.0.0"
+description = "Shopstream's dbt project on dbt-core 1.12.5 with dbt-duckdb, ADR-001 item 3's fallback: a standalone uv project, outside the workspace members."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "dbt-core==1.12.5",
+    "dbt-duckdb==1.11.0",
+    "duckdb==1.5.5",
+]
+
+[tool.uv]
+package = false

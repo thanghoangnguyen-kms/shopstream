@@ -47,6 +47,7 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run just test
+      - run: uv run just dbt-ci
 
   secrets:
     name: secrets

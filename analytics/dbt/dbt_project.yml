@@ -1,0 +1,12 @@
+name: shopstream
+version: "1.0"
+profile: shopstream
+model-paths: ["models"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+flags:
+  send_anonymous_usage_stats: false
+vars:
+  catalog: lk
+seeds:
+  +database: memory

@@ -1,0 +1,10 @@
+# Build-context allowlist for the Dockerfiles under infra/: deny everything, then re-include each image's lock inputs.
+# Keeps .venv, .git, .planning, infra/.env and infra/.generated (mode-0600 secrets) out of the builder.
+*
+!pyproject.toml
+!uv.lock
+!packages/generator/pyproject.toml
+!analytics/dbt/pyproject.toml
+!analytics/dbt/uv.lock
+!analytics/metricflow/pyproject.toml
+!analytics/metricflow/uv.lock

@@ -1,0 +1,54 @@
+models:
+  - name: fct_orders
+    description: One row per order, the first gold object; item 4 serves it through MetricFlow and item 7 switches it.
+    semantic_model:
+      enabled: true
+      name: orders
+    columns:
+      - name: order_id
+        description: The order's key.
+        entity:
+          type: primary
+          name: order
+      - name: customer_id
+        description: The customer who placed the order.
+        entity:
+          type: foreign
+          name: customer
+      - name: order_date
+        description: The day the order was placed.
+        granularity: day
+        dimension:
+          type: time
+      - name: publish_id
+        description: The publish that built the row, which item 7 reads.
+        dimension:
+          type: categorical
+      - name: amount
+        description: The order's value, summed by total_revenue.
+    metrics:
+      - name: total_revenue
+        description: The sum of the order amounts.
+        type: simple
+        agg: sum
+        expr: amount
+        agg_time_dimension: order_date
+  - name: metricflow_time_spine
+    description: One row per day, the time spine MetricFlow requires in the same catalog as the gold models.
+    time_spine:
+      standard_granularity_column: date_day
+    columns:
+      - name: date_day
+        description: The day, at daily granularity.
+        granularity: day
+      - name: publish_id
+        description: The publish that built the row, which item 7 reads.
+  - name: dim_customers
+    description: One row per customer, the third gold object; item 7 switches it with the other two.
+    columns:
+      - name: customer_id
+        description: The customer's key.
+      - name: segment
+        description: The customer's segment, retail or wholesale.
+      - name: publish_id
+        description: The publish that built the row, which item 7 reads.
