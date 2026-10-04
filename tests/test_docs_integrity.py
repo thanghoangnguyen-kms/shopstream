@@ -301,6 +301,13 @@ owner: platform
 # ADR-000: Record decisions
 
 See [the reference](../specs/platform/ref-thing.md#overview).
+
+Every legal link form that resolves is fine: a title, [t](../specs/platform/ref-thing.md "Thing"),
+an angle-bracketed target, [a](<../specs/platform/ref-thing.md>), a percent-encoded name,
+[p](../specs/platform/ref%2Dthing.md), an anchor-only target, [top](#context-and-problem-statement),
+and a URL, [w](https://example.com/x). Inline code is not a link: `[x](gone-in-code.md)`.
+
+[thing]: ../specs/platform/ref-thing.md
 """
 VALID_REF = """\
 ---
@@ -351,6 +358,30 @@ def replace(path: Path, old: str, new: str) -> None:
 
 def append(path: Path, extra: str) -> None:
     path.write_text(path.read_text(encoding="utf-8") + extra, encoding="utf-8")
+
+
+def reference_with_crlf(root: Path) -> None:
+    text = (root / REF).read_text(encoding="utf-8")
+    text = text.replace("adr-000-record-decisions.md]", "adr-999-missing.md]")
+    (root / REF).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+
+def adr_without_owner(root: Path) -> str:
+    return (root / ADR).read_text(encoding="utf-8").replace("owner: platform\n", "")
+
+
+def adr_with_bom(root: Path) -> None:
+    (root / ADR).write_text("\ufeff" + adr_without_owner(root), encoding="utf-8")
+
+
+def adr_frontmatter_at_end_of_file(root: Path) -> None:
+    head = adr_without_owner(root).split("\n---\n", 1)[0]
+    (root / ADR).write_text(head + "\n---", encoding="utf-8")
+
+
+def adr_with_trailing_space_after_fence(root: Path) -> None:
+    text = adr_without_owner(root).replace("\n---\n", "\n---   \n", 1)
+    (root / ADR).write_text(text, encoding="utf-8")
 
 
 def test_valid_tree_passes_every_check(tmp_path: Path) -> None:
@@ -459,7 +490,61 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
         "absolute local path",
     ),
     ("wikilinks", lambda r: append(r / ADR, "\nSee [[Week 2 brief]].\n"), "wikilink"),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, '\nSee [t](gone-titled.md "Title").\n'),
+        "gone-titled.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [a](<gone angle.md>).\n"),
+        "gone angle.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\n[r]: gone-ref.md\n"),
+        "gone-ref.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [y](gone.yaml).\n"),
+        "gone.yaml does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [d](gone-dir/).\n"),
+        "gone-dir/ does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [p](gone_(a).md).\n"),
+        "gone_(a).md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [q](gone-query.md?plain=1).\n"),
+        "gone-query.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\n![i](gone.png)\n"),
+        "gone.png does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [c](../specs/platform/REF-THING.md).\n"),
+        "REF-THING.md does not exist",
+    ),
+    ("relationships", reference_with_crlf, "adr-999-missing.md does not exist"),
+    ("required-frontmatter", adr_with_bom, "missing owner"),
+    ("required-frontmatter", adr_frontmatter_at_end_of_file, "missing owner"),
+    ("required-frontmatter", adr_with_trailing_space_after_fence, "missing owner"),
 ]
+
+
+def test_frontmatter_pattern_accepts_crlf_line_endings() -> None:
+    """Text-mode reads normalise CRLF, but the pattern itself must not depend on that."""
+    assert FRONTMATTER.match("---\r\ntitle: x\r\n---\r\n# T\r\n") is not None
 
 
 @pytest.mark.parametrize(
