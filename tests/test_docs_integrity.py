@@ -8,12 +8,14 @@ proves nothing.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 import yaml
@@ -33,28 +35,33 @@ SKIP_DIRS = frozenset(
         ".claude",
     }
 )
-REQUIRED_FIELDS = ("title", "type", "status", "owner")
-RELATIONSHIP_KEYS = (
-    "implements",
-    "decided-by",
-    "supersedes",
-    "informs",
-    "depends-on",
-    "amends",
-    "amended-by",
-)
 # Sections written during authoring that carry no durable information. Git owns the
 # history; the typed frontmatter keys own the relationship graph.
 RESIDUE_HEADINGS = ("critique score", "change log", "changelog", "relationship updates")
 ADR_NAME = re.compile(r"adr-(\d{3})-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 SPEC_NAME = re.compile(r"(prd|trd|ref|guide|glossary)-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
-FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+# Tolerates a BOM, CRLF line endings, trailing spaces after a fence and a closing fence at the
+# end of the file.
+FRONTMATTER = re.compile(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 FENCED_BLOCK = re.compile(
     r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$",
     re.DOTALL | re.MULTILINE,
 )
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
-MD_LINK = re.compile(r"\]\(([^)\s]+?\.mdx?)(?:#[^)]*)?\)")
+CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1", re.DOTALL)
+# A path token starts after whitespace, a quote, a backtick, an opening bracket, `=` or `<`,
+# so a URL path segment (`github.com/Users/x`) or a mid-word `~/` is not a local path.
+LOCAL_PATH = re.compile(r"(?:^|[\s\"'`(\[=<])((?:/Users/|~/)[^\s)\]>\"'`]*)", re.MULTILINE)
+# A double quote inside the brackets means JSON (`[[null, "250.0"]]`), not a wikilink.
+WIKILINK = re.compile(r"\[\[[^\[\]\n\"]+\]\]")
+# An inline link or image target: optional angle brackets, one level of parentheses in the
+# path, and an optional title.
+INLINE_LINK = re.compile(
+    r"\]\(\s*(<[^>\n]*>|(?:[^\s()]|\([^\s()]*\))*)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)"
+)
+# A reference-style definition, `[label]: target`; `[^note]:` footnotes are not links.
+REFERENCE_DEFINITION = re.compile(r"^ {0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|\S+)", re.MULTILINE)
+URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 ROOT_MARKDOWN = ("README.md", "AGENTS.md")
 
 Check = Callable[[Path], list[str]]
@@ -65,6 +72,8 @@ class Schema:
     types: frozenset[str]
     statuses: frozenset[str]
     owners: frozenset[str]
+    required_fields: tuple[str, ...]
+    relationship_keys: tuple[str, ...]
 
 
 def load_schema(root: Path) -> Schema:
@@ -73,6 +82,8 @@ def load_schema(root: Path) -> Schema:
         types=frozenset(raw["type_enum"]),
         statuses=frozenset(raw["status_lifecycle"]),
         owners=frozenset(raw["owner_enum"]),
+        required_fields=tuple(raw["required_fields"]),
+        relationship_keys=tuple(raw["typed_relationship_keys"]),
     )
 
 
@@ -110,6 +121,24 @@ def body(path: Path) -> str:
     return FENCED_BLOCK.sub("", text)
 
 
+def prose(path: Path) -> str:
+    """The document text without frontmatter, fenced blocks and inline code spans."""
+    return CODE_SPAN.sub("", body(path))
+
+
+def docs_text_files(root: Path) -> list[Path]:
+    """Every Markdown and YAML file under docs/."""
+    docs = root / "docs"
+    yaml_files = (
+        path
+        for path in docs.rglob("*")
+        if path.suffix in {".yaml", ".yml"}
+        and path.is_file()
+        and not SKIP_DIRS.intersection(path.relative_to(docs).parts)
+    )
+    return sorted([*markdown_files(docs), *yaml_files])
+
+
 def spec_and_adr_files(root: Path) -> list[Path]:
     return markdown_files(root / "docs" / "specs") + markdown_files(root / "docs" / "adr")
 
@@ -130,6 +159,7 @@ def check_adr_names(root: Path) -> list[str]:
 
 
 def check_required_frontmatter(root: Path) -> list[str]:
+    required = load_schema(root).required_fields
     violations: list[str] = []
     for path in spec_and_adr_files(root):
         data, error = frontmatter(path)
@@ -140,7 +170,7 @@ def check_required_frontmatter(root: Path) -> list[str]:
         else:
             violations.extend(
                 f"{rel(root, path)}: missing {key}"
-                for key in REQUIRED_FIELDS
+                for key in required
                 if data.get(key) in (None, "")
             )
     return violations
@@ -162,10 +192,11 @@ def check_enum_values(root: Path) -> list[str]:
 
 
 def check_relationships_resolve(root: Path) -> list[str]:
+    relationship_keys = load_schema(root).relationship_keys
     violations: list[str] = []
     for path in markdown_files(root / "docs"):
         data, _ = frontmatter(path)
-        for key in RELATIONSHIP_KEYS:
+        for key in relationship_keys:
             if not data or key not in data:
                 continue
             value = data[key]
@@ -194,17 +225,74 @@ def check_residue_headings(root: Path) -> list[str]:
     return violations
 
 
+def link_targets(text: str) -> list[str]:
+    """Inline and reference-definition link targets in `text`, angle brackets removed."""
+    raw = [m.group(1) for m in INLINE_LINK.finditer(text)]
+    raw += [m.group(1) for m in REFERENCE_DEFINITION.finditer(text)]
+    return [target.strip().removeprefix("<").removesuffix(">") for target in raw]
+
+
+def exists_exact(path: Path) -> bool:
+    """True when every component of `path` exists with exactly that name (case included)."""
+    resolved = Path(os.path.normpath(path))
+    current = Path(resolved.anchor)
+    for part in resolved.parts[len(current.parts) :]:
+        try:
+            names = os.listdir(current)
+        except PermissionError:
+            names = [part]  # cannot list this directory; trust the name
+        except OSError:
+            return False
+        if part not in names:
+            return False
+        current /= part
+    return True
+
+
 def check_relative_links(root: Path) -> list[str]:
     violations: list[str] = []
     root_files = [root / name for name in ROOT_MARKDOWN if (root / name).is_file()]
     for path in markdown_files(root / "docs") + root_files:
-        for match in MD_LINK.finditer(body(path)):
-            href = match.group(1)
-            if href.startswith(("http://", "https://", "mailto:")):
+        for target in link_targets(prose(path)):
+            if not target or target.startswith(("#", "//")) or URL_SCHEME.match(target):
                 continue
-            if not (path.parent / href).exists():
-                violations.append(f"{rel(root, path)}: link -> {href} does not exist")
+            target = re.split(r"[?#]", target, maxsplit=1)[0]
+            if not target:
+                continue
+            decoded = unquote(target)
+            resolved = (
+                root / decoded.lstrip("/") if decoded.startswith("/") else path.parent / decoded
+            )
+            if not exists_exact(resolved):
+                violations.append(f"{rel(root, path)}: link -> {target} does not exist")
     return violations
+
+
+def check_local_paths(root: Path) -> list[str]:
+    """A pasted leak usually sits in output, so scan the whole text, fences included."""
+    return [
+        f"{rel(root, path)}: absolute local path {match.group(1)!r}"
+        for path in docs_text_files(root)
+        for match in LOCAL_PATH.finditer(path.read_text(encoding="utf-8"))
+    ]
+
+
+def check_wikilinks(root: Path) -> list[str]:
+    return [
+        f"{rel(root, path)}: wikilink {match.group(0)!r}"
+        for path in markdown_files(root / "docs")
+        for match in WIKILINK.finditer(prose(path))
+    ]
+
+
+def check_status_transitions(root: Path) -> list[str]:
+    lifecycle = yaml.safe_load((root / SCHEMA_PATH).read_text(encoding="utf-8"))["status_lifecycle"]
+    return [
+        f"{SCHEMA_PATH.as_posix()}: {status} -> {target} is not a defined status"
+        for status, details in lifecycle.items()
+        for target in details.get("transitions_to", [])
+        if target not in lifecycle
+    ]
 
 
 def check_spec_filenames(root: Path) -> list[str]:
@@ -235,6 +323,9 @@ CHECKS: dict[str, Check] = {
     "residue-headings": check_residue_headings,
     "relative-links": check_relative_links,
     "spec-filenames": check_spec_filenames,
+    "local-paths": check_local_paths,
+    "wikilinks": check_wikilinks,
+    "status-transitions": check_status_transitions,
 }
 
 
@@ -258,6 +349,13 @@ owner: platform
 # ADR-000: Record decisions
 
 See [the reference](../specs/platform/ref-thing.md#overview).
+
+Every legal link form that resolves is fine: a title, [t](../specs/platform/ref-thing.md "Thing"),
+an angle-bracketed target, [a](<../specs/platform/ref-thing.md>), a percent-encoded name,
+[p](../specs/platform/ref%2Dthing.md), an anchor-only target, [top](#context-and-problem-statement),
+and a URL, [w](https://example.com/x). Inline code is not a link: `[x](gone-in-code.md)`.
+
+[thing]: ../specs/platform/ref-thing.md
 """
 VALID_REF = """\
 ---
@@ -280,6 +378,15 @@ informs: [../../adr/adr-000-record-decisions.md]
    ```bash
    echo "[not a link either](missing-too.md)"
    ```
+
+A captured result is JSON, not a wikilink:
+
+```text
+{"rows": [[null, "250.0"]]}
+```
+
+Inline code such as `[[x]]` is not a wikilink either. Public forms are not local paths:
+https://github.com/Users/x, <home>/x, <repo>/x and src/Users/x.
 """
 
 
@@ -299,6 +406,40 @@ def replace(path: Path, old: str, new: str) -> None:
 
 def append(path: Path, extra: str) -> None:
     path.write_text(path.read_text(encoding="utf-8") + extra, encoding="utf-8")
+
+
+def reference_with_crlf(root: Path) -> None:
+    text = (root / REF).read_text(encoding="utf-8")
+    text = text.replace("adr-000-record-decisions.md]", "adr-999-missing.md]")
+    (root / REF).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+
+def adr_without_owner(root: Path) -> str:
+    return (root / ADR).read_text(encoding="utf-8").replace("owner: platform\n", "")
+
+
+def adr_with_bom(root: Path) -> None:
+    (root / ADR).write_text("\ufeff" + adr_without_owner(root), encoding="utf-8")
+
+
+def adr_frontmatter_at_end_of_file(root: Path) -> None:
+    head = adr_without_owner(root).split("\n---\n", 1)[0]
+    (root / ADR).write_text(head + "\n---", encoding="utf-8")
+
+
+def adr_with_trailing_space_after_fence(root: Path) -> None:
+    text = adr_without_owner(root).replace("\n---\n", "\n---   \n", 1)
+    (root / ADR).write_text(text, encoding="utf-8")
+
+
+def schema_and_reference_with_blocks_key(root: Path) -> None:
+    """Add a typed relationship key to the schema copy and use it with a dangling target."""
+    replace(
+        root / SCHEMA_PATH,
+        "\noptional_fields:",
+        '  blocks:\n    description: "This doc blocks the listed doc(s)"\n\noptional_fields:',
+    )
+    replace(root / REF, 'owner: "analytics-eng"\n', 'owner: "analytics-eng"\nblocks: [gone.md]\n')
 
 
 def test_valid_tree_passes_every_check(tmp_path: Path) -> None:
@@ -386,7 +527,109 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
         lambda r: (r / "README.md").write_text("See [gone](docs/gone.md).\n", encoding="utf-8"),
         "docs/gone.md does not exist",
     ),
+    (
+        "local-paths",
+        lambda r: append(r / ADR, "\nSee /Users/alice/notes.md.\n"),
+        "absolute local path",
+    ),
+    (
+        "local-paths",
+        lambda r: append(r / REF, "\nNotes live in ~/notes.\n"),
+        "absolute local path",
+    ),
+    (
+        "local-paths",
+        lambda r: append(r / ADR, "\n```text\n/Users/alice\n```\n"),
+        "absolute local path",
+    ),
+    (
+        "local-paths",
+        lambda r: append(r / SCHEMA_PATH, "# see ~/x\n"),
+        "absolute local path",
+    ),
+    ("wikilinks", lambda r: append(r / ADR, "\nSee [[Week 2 brief]].\n"), "wikilink"),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, '\nSee [t](gone-titled.md "Title").\n'),
+        "gone-titled.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [a](<gone angle.md>).\n"),
+        "gone angle.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\n[r]: gone-ref.md\n"),
+        "gone-ref.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [y](gone.yaml).\n"),
+        "gone.yaml does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [d](gone-dir/).\n"),
+        "gone-dir/ does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [p](gone_(a).md).\n"),
+        "gone_(a).md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [q](gone-query.md?plain=1).\n"),
+        "gone-query.md does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\n![i](gone.png)\n"),
+        "gone.png does not exist",
+    ),
+    (
+        "relative-links",
+        lambda r: append(r / ADR, "\nSee [c](../specs/platform/REF-THING.md).\n"),
+        "REF-THING.md does not exist",
+    ),
+    ("relationships", reference_with_crlf, "adr-999-missing.md does not exist"),
+    ("required-frontmatter", adr_with_bom, "missing owner"),
+    ("required-frontmatter", adr_frontmatter_at_end_of_file, "missing owner"),
+    ("required-frontmatter", adr_with_trailing_space_after_fence, "missing owner"),
+    (
+        "required-frontmatter",
+        lambda r: replace(
+            r / SCHEMA_PATH,
+            "  - owner # One of owner_enum\n",
+            "  - owner # One of owner_enum\n  - decision\n",
+        ),
+        "missing decision",
+    ),
+    (
+        "relationships",
+        schema_and_reference_with_blocks_key,
+        "blocks -> gone.md does not exist",
+    ),
+    (
+        "status-transitions",
+        lambda r: replace(
+            r / SCHEMA_PATH, "transitions_to: [Proposed]", "transitions_to: [Proposd]"
+        ),
+        "Draft -> Proposd is not a defined status",
+    ),
 ]
+
+
+def test_accepted_can_become_active() -> None:
+    """An in-use REF, GUIDE or GLOSSARY goes Accepted to Active (owner decision, 2026-09-28)."""
+    raw = yaml.safe_load((REPO / SCHEMA_PATH).read_text(encoding="utf-8"))
+    assert "Active" in raw["status_lifecycle"]["Accepted"]["transitions_to"]
+
+
+def test_frontmatter_pattern_accepts_crlf_line_endings() -> None:
+    """Text-mode reads normalise CRLF, but the pattern itself must not depend on that."""
+    assert FRONTMATTER.match("---\r\ntitle: x\r\n---\r\n# T\r\n") is not None
 
 
 @pytest.mark.parametrize(

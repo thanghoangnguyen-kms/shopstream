@@ -1,4 +1,4 @@
-# Shopstream Spec — Conventions Reference
+# Shopstream Spec: Conventions Reference
 
 Authoritative sources (reference them; don't duplicate them):
 
@@ -51,7 +51,7 @@ End every audit with `uv run pytest tests/test_docs_integrity.py -q`.
 ## Status Rules
 
 - New documents start at `status: Draft`.
-- ADR bodies are immutable after `status: Accepted`; supersede them with a new ADR.
+- Never edit an ADR's Context, Decision Outcome or Consequences after `status: Accepted`; supersede it with a new ADR. Other sections, such as More Information, can still be updated.
 - `Rejected` is for decisions that were considered and declined; keep the file.
 - `Active` is for `ref`, `guide` and `glossary` docs in use; not for `prd`, `trd` or `adr`.
 
@@ -59,7 +59,7 @@ End every audit with `uv run pytest tests/test_docs_integrity.py -q`.
 
 ## Relationship Sweep Protocol (Phase 7b)
 
-### Step 1 — Find impacted docs
+### Step 1: Find impacted docs
 
 ```bash
 # Docs that mention the same component, table or topic
@@ -69,17 +69,17 @@ grep -rl --include='*.md' '<component-or-table-or-topic>' docs/
 grep -rl --include='*.md' 'adr-NNN' docs/
 ```
 
-### Step 2 — Classify the relationship
+### Step 2: Classify the relationship
 
 | Situation                                                        | Key to add                                                                 | Direction                                     |
 | ---------------------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------------------- |
-| New TRD implements an existing PRD                               | `implements: [<prd>]` on the new TRD                                       | —                                             |
+| New TRD implements an existing PRD                               | `implements: [<prd>]` on the new TRD                                       | None                                          |
 | New TRD depends on an existing REF (e.g. `ref-architecture.md`)  | `depends-on: [<ref>]` on the new TRD                                       | REF may gain `informs:`                       |
 | New ADR ratifies a choice in an existing TRD or PRD              | `decided-by: [<adr>]` on the existing doc                                  | ADR may gain `informs:`                       |
-| New doc supersedes an existing doc                               | `supersedes: [<old>]` on the new doc; `status: Superseded` on the old one  | —                                             |
+| New doc supersedes an existing doc                               | `supersedes: [<old>]` on the new doc; `status: Superseded` on the old one  | None                                          |
 | New doc gives context an existing doc should know about          | `informs: [<existing>]` on the new doc                                     | Existing doc gains `depends-on:` if normative |
 
-### Step 3 — Emit and apply the patch list
+### Step 3: Emit and apply the patch list
 
 Put the list in the PR description (or the chat), never inside the document:
 

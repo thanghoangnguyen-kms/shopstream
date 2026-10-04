@@ -1,8 +1,9 @@
-# Shopstream — Canonical Frontmatter Schema
+# Shopstream: Canonical Frontmatter Schema
 # Version: 1.0 | Status: Active | Owner: platform
 # SSOT for frontmatter in docs/specs/ and docs/adr/. tests/test_docs_integrity.py reads
-# type_enum, status_lifecycle and owner_enum from this file, so a value added here is
-# legal everywhere at once. Adding a value is an "ask first" change (docs/CONTRIBUTING.md).
+# required_fields, type_enum, status_lifecycle (including each transitions_to), owner_enum
+# and typed_relationship_keys from this file, so a value added here is legal everywhere at
+# once. Adding a value is an "ask first" change (docs/CONTRIBUTING.md).
 
 required_fields:
   - title # Human-readable document title
@@ -11,12 +12,12 @@ required_fields:
   - owner # One of owner_enum
 
 type_enum:
-  prd: "Product Requirements Document — WHAT a data product delivers to its consumers"
-  trd: "Technical Requirements Document — HOW a pipeline, job or service is built"
-  adr: "Architecture Decision Record — point-in-time binding decision, immutable after Accepted"
-  ref: "Reference — normative SSOT for data definitions, topology, or configuration (read-only authority)"
-  guide: "Guide — procedural how-to, runbook, or operational procedure"
-  glossary: "Glossary — business and technical term definitions, each linked to the doc that defines it"
+  prd: "Product Requirements Document: WHAT a data product delivers to its consumers"
+  trd: "Technical Requirements Document: HOW a pipeline, job or service is built"
+  adr: "Architecture Decision Record: point-in-time binding decision; Context, Decision Outcome and Consequences are frozen after Accepted"
+  ref: "Reference: normative SSOT for data definitions, topology, or configuration (read-only authority)"
+  guide: "Guide: procedural how-to, runbook, or operational procedure"
+  glossary: "Glossary: business and technical term definitions, each linked to the doc that defines it"
 
 owner_enum:
   platform: "Compose stack, storage, catalog, Kafka and CDC, bronze, Spark jobs, Airflow, observability, CI and supply chain"
@@ -25,22 +26,22 @@ owner_enum:
 
 status_lifecycle:
   Draft:
-    description: "Work in progress — not ready for review"
+    description: "Work in progress, not ready for review"
     transitions_to: [Proposed]
   Proposed:
-    description: "Under review — open for comment and revision"
+    description: "Under review, open for comment and revision"
     transitions_to: [Accepted, Rejected, Draft]
   Accepted:
-    description: "Binding — implementation must comply"
-    transitions_to: [Deprecated, Superseded]
+    description: "Binding: implementation must comply"
+    transitions_to: [Active, Deprecated, Superseded]
   Active:
-    description: "In use — applies to ref, guide and glossary docs"
+    description: "In use; applies to ref, guide and glossary docs"
     transitions_to: [Deprecated, Superseded]
   Rejected:
-    description: "Considered and declined — kept so the reasoning isn't argued again (mainly ADRs)"
+    description: "Considered and declined; kept so the reasoning isn't argued again (mainly ADRs)"
     transitions_to: []
   Deprecated:
-    description: "Sunset — kept for reference only; do not implement"
+    description: "Sunset: kept for reference only; do not implement"
     sunset_field: "ISO 8601 date for planned removal"
     transitions_to: []
   Superseded:
@@ -114,7 +115,7 @@ example_frontmatter:
     ---
   trd: |
     ---
-    title: "CDC to Bronze — Pipeline Design"
+    title: "CDC to Bronze: Pipeline Design"
     type: trd
     status: Draft
     owner: platform

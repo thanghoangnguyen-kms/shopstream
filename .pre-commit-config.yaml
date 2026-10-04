@@ -1,6 +1,12 @@
 # Run by prek (drop-in compatible with pre-commit). Local hooks call the tools locked in
-# uv.lock through `uv run --frozen`. The one pin outside uv.lock is pre-commit-hooks,
-# kept current by Renovate's pre-commit manager.
+# uv.lock through `uv run --frozen`.
+# Four pins live outside uv.lock, all kept current by Renovate:
+#   - gitleaks, set by `gitleaks_version` in the justfile
+#   - the GitHub Actions SHAs in .github/workflows
+#   - the pre-commit-hooks rev below
+#   - uv itself, in ci.yml and as `required-version` in pyproject.toml
+# For the pre-commit-hooks ids below, prek runs its own built-in code, so that rev does
+# not pin the code that runs.
 default_install_hook_types: [pre-commit]
 
 repos:
