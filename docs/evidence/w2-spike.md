@@ -1440,7 +1440,7 @@ Timing: poll interval median 99.9 ms, maximum 297.3 ms; switch duration median 1
 
 Recorded 2026-10-03.
 
-Verdict: go. The peak summed sample of the three-broker combination under the Week 14 load was 6.74 GiB against the 10 GiB budget, the sum of the compose `mem_limit` values (core, streaming and orchestration plus `spark-job`) was 10.12 GiB against 10.66 GiB (MemTotal minus 1 GiB), and no container was OOM-killed, restarted or stopped with exit code 137.
+Verdict: go. Item 8 is go for the clickstream, Spark and dbt combination; CDC load not measured. The peak summed sample of the three-broker combination under item 12's clickstream load was 6.74 GiB against the 10 GiB budget, the sum of the compose `mem_limit` values (core, streaming and orchestration plus `spark-job`) was 10.12 GiB against 10.66 GiB (MemTotal minus 1 GiB), and no container was OOM-killed, restarted or stopped with exit code 137.
 
 A tested rule (`item8_verdict` in `scripts/ram_budget.py`) decides, over `just mem-report`'s `--json-out` and the run's window record. It never judges an uncalibrated run, so the calibration run below was never judged. It calls a harness failure inconclusive (too few frames with container rows, a window in which the generator, a Spark run and the DAG run were not all active at one instant, a long-running service never sampled, a service with no `mem_limit`). Otherwise it gives go only when the peak summed sample is at most 10 GiB, the limits sum is at most MemTotal minus 1 GiB (both hold at equality) and no container was OOM-killed or exited 137. The calibration policy is the owner's: `spark-job` counts in the total, every sampled service's limit is its calibration peak x 1.25 rounded up to a multiple of 32 MiB, a page-cache service (the three brokers and SeaweedFS) is never raised by that formula, and a limits-only failure before calibration is tuning, not a verdict.
 
@@ -1579,9 +1579,9 @@ FALL-03: N/A. Item 8 is go at three brokers (this section's verdict), so the one
 
 ### Consequences
 
-- ADR-001 item 8 is go: three KRaft brokers at replication factor 3 stand, and the combination of core, streaming and orchestration plus the Spark job fits the 12 GiB VM on the sized limits.
+- ADR-001 item 8 is go for the clickstream, Spark and dbt combination; CDC load not measured. Three KRaft brokers at replication factor 3 stand, and core, streaming and orchestration plus the Spark job fit the 12 GiB VM on the sized limits under item 12's clickstream load, item 2's MERGE loop and one item 3 DAG run. The CDC source and sink were registered but idle, so the Postgres, Lakekeeper and Connect limits were sized without CDC traffic; a window with item 11's CDC workload running has not been measured.
 - The limits are 1.25 x the peak of this load and no more: `lakekeeper` is at 64 MiB, `kafka-init` at 160 MiB and `airflow-init` at 256 MiB. The `dbt_build_lk` build is item 3's four-step build over a handful of rows, so Week 8's heavier models will need the scheduler's 928 MiB re-measured.
-- Phase 6 mirrors this verdict into ADR-001's Results table.
+- Phase 6 mirrors this verdict into ADR-001's Results table. The verdict cell there holds only go or fallback, so the scope (clickstream, Spark and dbt; CDC load not measured) goes in the measured-result cell.
 
 ## Item 9: dbt login
 
