@@ -102,8 +102,10 @@ def test_parse_ts_us_none_is_none() -> None:
 
 
 def test_parse_ts_us_rejects_a_non_date() -> None:
+    # The "x" keeps the text from being a digits-only ISO basic date: 8 random hex digits were all
+    # decimal in about 2 runs in 100, and fromisoformat then fails with "month must be in 1..12".
     with pytest.raises(ValueError, match="isoformat"):
-        cc.parse_ts_us(secrets.token_hex(4))
+        cc.parse_ts_us("x" + secrets.token_hex(4))
 
 
 def test_parse_ts_us_is_numeric_not_textual() -> None:
