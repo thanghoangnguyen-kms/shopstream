@@ -1,14 +1,14 @@
 ---
-title: "Shopstream — Contributing Guide"
+title: "Shopstream: Contributing Guide"
 type: guide
 status: Active
 owner: platform
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-04
 description: Conventions for authoring and maintaining docs in this repository.
 ---
 
-# Shopstream — Contributing Guide
+# Shopstream: Contributing Guide
 
 Conventions for authoring and maintaining the documentation in `docs/`. No code lives under `docs/`. `tests/test_docs_integrity.py` enforces the mechanical rules on every CI run.
 
@@ -100,7 +100,7 @@ depends-on: [../platform/ref-architecture.md]
 - Decision Outcome, with Consequences and Confirmation
 - Pros and Cons of the Options
 - More Information
-- The body is immutable after `status: Accepted`; supersede it with a new ADR
+- After `status: Accepted`, only Context, Decision Outcome and Consequences are frozen: change them through a superseding ADR. Other sections, such as More Information, can still be updated
 
 ### REF
 
@@ -109,6 +109,8 @@ depends-on: [../platform/ref-architecture.md]
 - Precedence Rules
 
 ### GUIDE
+
+Procedural guides and runbooks use these sections. A guide that sets conventions rather than steps, such as this file, chooses its own.
 
 - Overview (with Prerequisites)
 - Procedure
@@ -159,13 +161,13 @@ To extend: create a domain folder with its first doc; prefix the file by type.
 
 ## Boundaries
 
-| Tier         | Rule                                                                                              |
-| ------------ | ------------------------------------------------------------------------------------------------- |
-| ✅ Always    | Give every new doc the four required frontmatter fields                                           |
-| ✅ Always    | Run `just check` before opening a PR; the docs lint is part of it                                 |
-| ✅ Always    | Use EARS for PRD Acceptance Criteria                                                              |
-| ⚠️ Ask first | Rename or delete an existing doc (breaks cross-references)                                        |
-| ⚠️ Ask first | Add a `type`, `status` or `owner` value to the schema                                             |
-| 🚫 Never     | Put code under `docs/`                                                                            |
+| Tier         | Rule                                                                                               |
+| ------------ | -------------------------------------------------------------------------------------------------- |
+| ✅ Always    | Give every new doc the four required frontmatter fields                                            |
+| ✅ Always    | Run `just check` before opening a PR; the docs lint is part of it                                  |
+| ✅ Always    | Use EARS for PRD Acceptance Criteria                                                               |
+| ⚠️ Ask first | Rename or delete an existing doc (breaks cross-references)                                         |
+| ⚠️ Ask first | Add a `type`, `status` or `owner` value to the schema                                              |
+| 🚫 Never     | Put code under `docs/`                                                                             |
 | 🚫 Never     | Restate the writer/reader split; link to [ref-architecture.md](specs/platform/ref-architecture.md) |
-| 🚫 Never     | Edit an ADR body after `status: Accepted`                                                         |
+| 🚫 Never     | Edit an ADR's Context, Decision Outcome or Consequences after `status: Accepted`; supersede it     |
