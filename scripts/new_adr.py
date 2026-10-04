@@ -51,6 +51,14 @@ def render(template: str, number: int, title: str, owner: str, today: dt.date) -
         raise ValueError(
             "ADR titles can't contain double quotes (they sit in a quoted YAML string)"
         )
+    if "\\" in title:
+        raise ValueError(
+            "ADR titles can't contain backslashes (a quoted YAML string reads them as escapes)"
+        )
+    if any(unicodedata.category(char) == "Cc" for char in title):
+        raise ValueError("ADR titles can't contain control characters")
+    if "{{" in title or "}}" in title:
+        raise ValueError("ADR titles can't contain template braces ({{ or }})")
     values = {
         "{{number}}": f"{number:03d}",
         "{{title}}": title,
