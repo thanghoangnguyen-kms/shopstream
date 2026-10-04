@@ -334,3 +334,206 @@ def test_a_level_3_subsection_stays_in_its_item() -> None:
     assert "### Versions" in section
     assert "### Commands" in section
     assert "## Item 4:" not in section
+
+
+RESULTS_HEADING = re.compile(r"^### Results[ \t]*$", re.MULTILINE)
+VERDICT_WORD = re.compile(r"^Verdict: (go|fallback)\b", re.MULTILINE)
+ALLOWED_VERDICTS = ("go", "fallback")
+EVIDENCE_POINTER = "`docs/evidence/w2-spike.md` Item {number}"
+
+
+def verdicts(evidence_text: str) -> dict[int, str]:
+    """Item N to the word after `Verdict: ` on its first verdict line (go or fallback)."""
+    found: dict[int, str] = {}
+    for number, section in item_sections(evidence_text).items():
+        match = VERDICT_WORD.search(mask_fences(section))
+        if match is not None:
+            found[number] = match.group(1)
+    return found
+
+
+def split_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def results_rows(adr_text: str) -> list[list[str]]:
+    """The cells of each data row of the first Markdown table after `### Results`.
+
+    The header and the separator are skipped. Returns [] when the heading or the table is missing.
+    """
+    heading = RESULTS_HEADING.search(adr_text)
+    if heading is None:
+        return []
+    table: list[str] = []
+    for line in adr_text[heading.end() :].split("\n"):
+        if line.startswith("|"):
+            table.append(line)
+        elif table:
+            break
+    return [split_cells(line) for line in table[2:]]
+
+
+def row_violations(cells: list[str], evidence_verdicts: dict[int, str]) -> list[str]:
+    if not cells[0].isdigit():
+        return []
+    number = int(cells[0])
+    if len(cells) != 4:
+        return [f"Results row {number}: {len(cells)} cells (expected 4)"]
+    _, measured, verdict_cell, pointer = cells
+    verdict = verdict_cell.replace("`", "").strip()
+    found: list[str] = []
+    if measured == "" or measured.lower() == "not run":
+        found.append(f"Results row {number}: measured result is empty or Not run")
+    if verdict not in ALLOWED_VERDICTS:
+        found.append(f"Results row {number}: verdict '{verdict}' is not go or fallback")
+    elif number in evidence_verdicts and verdict != evidence_verdicts[number]:
+        found.append(
+            f"Results row {number}: verdict {verdict} but the evidence says {evidence_verdicts[number]}"
+        )
+    if pointer != EVIDENCE_POINTER.format(number=number):
+        found.append(f"Results row {number}: evidence pointer must name Item {number}")
+    return found
+
+
+def results_violations(adr_text: str, evidence_text: str) -> list[str]:
+    """Every way ADR-001's Results table falls short of 15 rows that mirror the evidence."""
+    rows = results_rows(adr_text)
+    if not rows:
+        return ["Results: no table"]
+    found: list[str] = []
+    if len(rows) != ITEM_COUNT:
+        found.append(f"Results: {len(rows)} rows (expected {ITEM_COUNT})")
+    if [row[0] for row in rows] != [str(n) for n in range(1, len(rows) + 1)]:
+        found.append("Results rows out of order")
+    evidence_verdicts = verdicts(evidence_text)
+    for row in rows:
+        found.extend(row_violations(row, evidence_verdicts))
+    return found
+
+
+def valid_adr_results(evidence_text: str) -> str:
+    """A synthetic ADR fragment whose `### Results` rows mirror the evidence verdicts."""
+    mirrored = verdicts(evidence_text)
+    lines = [
+        "## More Information",
+        "",
+        "### Results",
+        "",
+        "| #   | Measured result | Verdict | Evidence |",
+        "| --- | --------------- | ------- | -------- |",
+    ]
+    lines.extend(
+        f"| {n} | Synthetic result {n} | {mirrored[n]} | {EVIDENCE_POINTER.format(number=n)} |"
+        for n in range(1, ITEM_COUNT + 1)
+    )
+    return "\n".join([*lines, "", "### Evidence rules", ""])
+
+
+def edit_cell(text: str, row: int, column: int, value: str) -> str:
+    """Replace one cell of Results row `row`, keeping the other lines as they are."""
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line.startswith("|") and split_cells(line)[0] == str(row):
+            cells = split_cells(line)
+            cells[column] = value
+            lines[index] = "| " + " | ".join(cells) + " |"
+            break
+    return "\n".join(lines)
+
+
+def row_line(text: str, row: int) -> str:
+    return next(line for line in text.split("\n") if line.startswith(f"| {row} "))
+
+
+def swap_rows(text: str, first: int, second: int) -> str:
+    a, b = row_line(text, first), row_line(text, second)
+    return (
+        text.replace(a, "@@A@@", 1)
+        .replace(b, "@@B@@", 1)
+        .replace("@@A@@", b, 1)
+        .replace("@@B@@", a, 1)
+    )
+
+
+RESULTS_MUTATIONS: list[tuple[str, Mutation, str]] = [
+    (
+        "row-4-not-run",
+        lambda t: edit_cell(t, 4, 1, "Not run"),
+        "Results row 4: measured result",
+    ),
+    (
+        "row-4-not-run-lowercase",
+        lambda t: edit_cell(t, 4, 1, "not run"),
+        "Results row 4: measured result",
+    ),
+    (
+        "row-6-empty-result",
+        lambda t: edit_cell(t, 6, 1, ""),
+        "Results row 6: measured result",
+    ),
+    (
+        "row-9-open",
+        lambda t: edit_cell(t, 9, 2, "Open"),
+        "Results row 9: verdict 'Open' is not go or fallback",
+    ),
+    (
+        "row-8-qualified-verdict",
+        lambda t: edit_cell(t, 8, 2, "go (scoped)"),
+        "Results row 8: verdict 'go (scoped)'",
+    ),
+    (
+        "row-2-disagrees-with-the-evidence",
+        lambda t: edit_cell(t, 2, 2, "fallback"),
+        "Results row 2: verdict fallback but the evidence says go",
+    ),
+    (
+        "row-11-pointer-names-item-12",
+        lambda t: edit_cell(t, 11, 3, EVIDENCE_POINTER.format(number=12)),
+        "Results row 11: evidence pointer",
+    ),
+    (
+        "row-15-removed",
+        lambda t: t.replace(row_line(t, 15) + "\n", ""),
+        "Results: 14 rows",
+    ),
+    (
+        "rows-3-and-4-swapped",
+        lambda t: swap_rows(t, 3, 4),
+        "out of order",
+    ),
+    (
+        "no-results-heading",
+        lambda t: t.replace("### Results", "### Outcomes"),
+        "Results: no table",
+    ),
+]
+
+
+def test_adr_results_mirror_the_evidence() -> None:
+    adr_text = ADR.read_text(encoding="utf-8")
+    evidence_text = EVIDENCE.read_text(encoding="utf-8")
+    assert results_violations(adr_text, evidence_text) == []
+
+
+def test_item_8_results_cell_carries_its_scope() -> None:
+    rows = results_rows(ADR.read_text(encoding="utf-8"))
+    row = next(cells for cells in rows if cells[0] == "8")
+    assert "clickstream, Spark and dbt" in row[1]
+    assert "CDC load not measured" in row[1]
+    assert row[2] == "go"
+
+
+def test_a_valid_synthetic_results_table_passes() -> None:
+    evidence_text = valid_evidence()
+    assert results_violations(valid_adr_results(evidence_text), evidence_text) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate", "expected"),
+    RESULTS_MUTATIONS,
+    ids=[name for name, _, _ in RESULTS_MUTATIONS],
+)
+def test_results_check_goes_red_on_mutation(name: str, mutate: Mutation, expected: str) -> None:
+    evidence_text = valid_evidence()
+    violations = results_violations(mutate(valid_adr_results(evidence_text)), evidence_text)
+    assert any(expected in violation for violation in violations), (name, violations)
