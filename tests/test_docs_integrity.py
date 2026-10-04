@@ -54,6 +54,12 @@ FENCED_BLOCK = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1", re.DOTALL)
+# A path token starts after whitespace, a quote, a backtick, an opening bracket, `=` or `<`,
+# so a URL path segment (`github.com/Users/x`) or a mid-word `~/` is not a local path.
+LOCAL_PATH = re.compile(r"(?:^|[\s\"'`(\[=<])((?:/Users/|~/)[^\s)\]>\"'`]*)", re.MULTILINE)
+# A double quote inside the brackets means JSON (`[[null, "250.0"]]`), not a wikilink.
+WIKILINK = re.compile(r"\[\[[^\[\]\n\"]+\]\]")
 MD_LINK = re.compile(r"\]\(([^)\s]+?\.mdx?)(?:#[^)]*)?\)")
 ROOT_MARKDOWN = ("README.md", "AGENTS.md")
 
@@ -108,6 +114,24 @@ def body(path: Path) -> str:
     """The document text without its frontmatter and fenced code blocks."""
     text = FRONTMATTER.sub("", path.read_text(encoding="utf-8"), count=1)
     return FENCED_BLOCK.sub("", text)
+
+
+def prose(path: Path) -> str:
+    """The document text without frontmatter, fenced blocks and inline code spans."""
+    return CODE_SPAN.sub("", body(path))
+
+
+def docs_text_files(root: Path) -> list[Path]:
+    """Every Markdown and YAML file under docs/."""
+    docs = root / "docs"
+    yaml_files = (
+        path
+        for path in docs.rglob("*")
+        if path.suffix in {".yaml", ".yml"}
+        and path.is_file()
+        and not SKIP_DIRS.intersection(path.relative_to(docs).parts)
+    )
+    return sorted([*markdown_files(docs), *yaml_files])
 
 
 def spec_and_adr_files(root: Path) -> list[Path]:
@@ -207,6 +231,14 @@ def check_relative_links(root: Path) -> list[str]:
     return violations
 
 
+def check_local_paths(root: Path) -> list[str]:
+    return []
+
+
+def check_wikilinks(root: Path) -> list[str]:
+    return []
+
+
 def check_spec_filenames(root: Path) -> list[str]:
     violations: list[str] = []
     for path in markdown_files(root / "docs" / "specs"):
@@ -235,6 +267,8 @@ CHECKS: dict[str, Check] = {
     "residue-headings": check_residue_headings,
     "relative-links": check_relative_links,
     "spec-filenames": check_spec_filenames,
+    "local-paths": check_local_paths,
+    "wikilinks": check_wikilinks,
 }
 
 
@@ -280,6 +314,15 @@ informs: [../../adr/adr-000-record-decisions.md]
    ```bash
    echo "[not a link either](missing-too.md)"
    ```
+
+A captured result is JSON, not a wikilink:
+
+```text
+{"rows": [[null, "250.0"]]}
+```
+
+Inline code such as `[[x]]` is not a wikilink either. Public forms are not local paths:
+https://github.com/Users/x, <home>/x, <repo>/x and src/Users/x.
 """
 
 
@@ -386,6 +429,27 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
         lambda r: (r / "README.md").write_text("See [gone](docs/gone.md).\n", encoding="utf-8"),
         "docs/gone.md does not exist",
     ),
+    (
+        "local-paths",
+        lambda r: append(r / ADR, "\nSee /Users/alice/notes.md.\n"),
+        "absolute local path",
+    ),
+    (
+        "local-paths",
+        lambda r: append(r / REF, "\nNotes live in ~/notes.\n"),
+        "absolute local path",
+    ),
+    (
+        "local-paths",
+        lambda r: append(r / ADR, "\n```text\n/Users/alice\n```\n"),
+        "absolute local path",
+    ),
+    (
+        "local-paths",
+        lambda r: append(r / SCHEMA_PATH, "# see ~/x\n"),
+        "absolute local path",
+    ),
+    ("wikilinks", lambda r: append(r / ADR, "\nSee [[Week 2 brief]].\n"), "wikilink"),
 ]
 
 
