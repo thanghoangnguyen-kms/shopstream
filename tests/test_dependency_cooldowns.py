@@ -1,6 +1,8 @@
 """Pins the dependency cooldowns that must land before the Renovate app is installed.
 
-Renovate holds every update for 3 days (`minimumReleaseAge`), but GHCR and Quay return no
+uv excludes releases newer than 3 days (`[tool.uv] exclude-newer`), recorded in uv.lock as a
+span so `uv lock --check` stays stable from day to day, and every pinned dependency-group entry
+must still be locked at its pin. Renovate holds every update for 3 days (`minimumReleaseAge`), but GHCR and Quay return no
 release timestamps, so without a `timestamp-optional` rule their updates would be held forever.
 These tests go red if that rule is missing, carries another value or datasource, is widened past
 GHCR and Quay, stops matching a GHCR or Quay image tracked in `infra/`, or if the top-level
@@ -14,6 +16,7 @@ import fnmatch
 import json
 import re
 import subprocess
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,9 @@ RENOVATE = REPO / "renovate.json"
 COOLDOWN_PATTERNS = ("ghcr.io/**", "quay.io/**")
 BEHAVIOUR = "timestamp-optional"
 IMAGE = re.compile(r"(?:ghcr|quay)\.io/[a-z0-9._/-]+")
+PYPROJECT = REPO / "pyproject.toml"
+LOCK = REPO / "uv.lock"
+PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^;\s]+)$")
 
 
 def tracked_infra_images() -> list[str]:
@@ -172,3 +178,55 @@ def test_cooldown_check_goes_red_on_mutation(
     mutate(config)
     problems = cooldown_violations(config, SAMPLE_IMAGES)
     assert any(expected in problem for problem in problems), (label, problems)
+
+
+def normalize(name: str) -> str:
+    """PEP 503 name normalization."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def group_pins(pyproject: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every dependency-group entry as (normalized name, version); a non-pin raises."""
+    pins: list[tuple[str, str]] = []
+    for group, entries in pyproject.get("dependency-groups", {}).items():
+        for entry in entries:
+            match = PIN.match(entry)
+            assert match, f"group {group} entry {entry!r} is not an exact == pin"
+            pins.append((normalize(match.group(1)), match.group(2)))
+    return pins
+
+
+def locked_versions(lock: dict[str, Any]) -> set[tuple[str, str]]:
+    return {
+        (normalize(package["name"]), package["version"])
+        for package in lock.get("package", [])
+        if "version" in package
+    }
+
+
+def unlocked_pins(pins: list[tuple[str, str]], locked: set[tuple[str, str]]) -> list[str]:
+    return [f"{name}=={version}" for name, version in pins if (name, version) not in locked]
+
+
+def test_uv_excludes_releases_newer_than_three_days() -> None:
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    assert pyproject["tool"]["uv"].get("exclude-newer") == "3 days"
+
+
+def test_the_lock_records_the_three_day_span() -> None:
+    lock = tomllib.loads(LOCK.read_text(encoding="utf-8"))
+    assert lock.get("options", {}).get("exclude-newer-span") == "P3D"
+
+
+def test_every_pinned_group_dependency_is_locked_at_its_pin() -> None:
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    lock = tomllib.loads(LOCK.read_text(encoding="utf-8"))
+    pins = group_pins(pyproject)
+    assert {"boto3", "duckdb", "pyspark", "pyiceberg", "polars"} <= {name for name, _ in pins}
+    assert unlocked_pins(pins, locked_versions(lock)) == []
+
+
+def test_the_pins_guard_goes_red_on_a_mutated_pin() -> None:
+    lock = tomllib.loads(LOCK.read_text(encoding="utf-8"))
+    pins = [*group_pins(tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))), ("duckdb", "9.9.9")]
+    assert unlocked_pins(pins, locked_versions(lock)) == ["duckdb==9.9.9"]
