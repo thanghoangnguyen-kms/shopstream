@@ -1,8 +1,9 @@
 # Shopstream — Canonical Frontmatter Schema
 # Version: 1.0 | Status: Active | Owner: platform
 # SSOT for frontmatter in docs/specs/ and docs/adr/. tests/test_docs_integrity.py reads
-# type_enum, status_lifecycle and owner_enum from this file, so a value added here is
-# legal everywhere at once. Adding a value is an "ask first" change (docs/CONTRIBUTING.md).
+# required_fields, type_enum, status_lifecycle (including each transitions_to), owner_enum
+# and typed_relationship_keys from this file, so a value added here is legal everywhere at
+# once. Adding a value is an "ask first" change (docs/CONTRIBUTING.md).
 
 required_fields:
   - title # Human-readable document title
@@ -32,7 +33,7 @@ status_lifecycle:
     transitions_to: [Accepted, Rejected, Draft]
   Accepted:
     description: "Binding — implementation must comply"
-    transitions_to: [Deprecated, Superseded]
+    transitions_to: [Active, Deprecated, Superseded]
   Active:
     description: "In use — applies to ref, guide and glossary docs"
     transitions_to: [Deprecated, Superseded]

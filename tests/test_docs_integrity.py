@@ -35,16 +35,6 @@ SKIP_DIRS = frozenset(
         ".claude",
     }
 )
-REQUIRED_FIELDS = ("title", "type", "status", "owner")
-RELATIONSHIP_KEYS = (
-    "implements",
-    "decided-by",
-    "supersedes",
-    "informs",
-    "depends-on",
-    "amends",
-    "amended-by",
-)
 # Sections written during authoring that carry no durable information. Git owns the
 # history; the typed frontmatter keys own the relationship graph.
 RESIDUE_HEADINGS = ("critique score", "change log", "changelog", "relationship updates")
@@ -82,6 +72,8 @@ class Schema:
     types: frozenset[str]
     statuses: frozenset[str]
     owners: frozenset[str]
+    required_fields: tuple[str, ...]
+    relationship_keys: tuple[str, ...]
 
 
 def load_schema(root: Path) -> Schema:
@@ -90,6 +82,8 @@ def load_schema(root: Path) -> Schema:
         types=frozenset(raw["type_enum"]),
         statuses=frozenset(raw["status_lifecycle"]),
         owners=frozenset(raw["owner_enum"]),
+        required_fields=tuple(raw["required_fields"]),
+        relationship_keys=tuple(raw["typed_relationship_keys"]),
     )
 
 
@@ -165,6 +159,7 @@ def check_adr_names(root: Path) -> list[str]:
 
 
 def check_required_frontmatter(root: Path) -> list[str]:
+    required = load_schema(root).required_fields
     violations: list[str] = []
     for path in spec_and_adr_files(root):
         data, error = frontmatter(path)
@@ -175,7 +170,7 @@ def check_required_frontmatter(root: Path) -> list[str]:
         else:
             violations.extend(
                 f"{rel(root, path)}: missing {key}"
-                for key in REQUIRED_FIELDS
+                for key in required
                 if data.get(key) in (None, "")
             )
     return violations
@@ -197,10 +192,11 @@ def check_enum_values(root: Path) -> list[str]:
 
 
 def check_relationships_resolve(root: Path) -> list[str]:
+    relationship_keys = load_schema(root).relationship_keys
     violations: list[str] = []
     for path in markdown_files(root / "docs"):
         data, _ = frontmatter(path)
-        for key in RELATIONSHIP_KEYS:
+        for key in relationship_keys:
             if not data or key not in data:
                 continue
             value = data[key]
@@ -290,7 +286,13 @@ def check_wikilinks(root: Path) -> list[str]:
 
 
 def check_status_transitions(root: Path) -> list[str]:
-    return []
+    lifecycle = yaml.safe_load((root / SCHEMA_PATH).read_text(encoding="utf-8"))["status_lifecycle"]
+    return [
+        f"{SCHEMA_PATH.as_posix()}: {status} -> {target} is not a defined status"
+        for status, details in lifecycle.items()
+        for target in details.get("transitions_to", [])
+        if target not in lifecycle
+    ]
 
 
 def check_spec_filenames(root: Path) -> list[str]:
