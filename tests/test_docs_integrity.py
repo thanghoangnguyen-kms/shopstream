@@ -289,6 +289,10 @@ def check_wikilinks(root: Path) -> list[str]:
     ]
 
 
+def check_status_transitions(root: Path) -> list[str]:
+    return []
+
+
 def check_spec_filenames(root: Path) -> list[str]:
     violations: list[str] = []
     for path in markdown_files(root / "docs" / "specs"):
@@ -319,6 +323,7 @@ CHECKS: dict[str, Check] = {
     "spec-filenames": check_spec_filenames,
     "local-paths": check_local_paths,
     "wikilinks": check_wikilinks,
+    "status-transitions": check_status_transitions,
 }
 
 
@@ -423,6 +428,16 @@ def adr_frontmatter_at_end_of_file(root: Path) -> None:
 def adr_with_trailing_space_after_fence(root: Path) -> None:
     text = adr_without_owner(root).replace("\n---\n", "\n---   \n", 1)
     (root / ADR).write_text(text, encoding="utf-8")
+
+
+def schema_and_reference_with_blocks_key(root: Path) -> None:
+    """Add a typed relationship key to the schema copy and use it with a dangling target."""
+    replace(
+        root / SCHEMA_PATH,
+        "\noptional_fields:",
+        '  blocks:\n    description: "This doc blocks the listed doc(s)"\n\noptional_fields:',
+    )
+    replace(root / REF, 'owner: "analytics-eng"\n', 'owner: "analytics-eng"\nblocks: [gone.md]\n')
 
 
 def test_valid_tree_passes_every_check(tmp_path: Path) -> None:
@@ -580,7 +595,34 @@ MUTATIONS: list[tuple[str, Mutation, str]] = [
     ("required-frontmatter", adr_with_bom, "missing owner"),
     ("required-frontmatter", adr_frontmatter_at_end_of_file, "missing owner"),
     ("required-frontmatter", adr_with_trailing_space_after_fence, "missing owner"),
+    (
+        "required-frontmatter",
+        lambda r: replace(
+            r / SCHEMA_PATH,
+            "  - owner # One of owner_enum\n",
+            "  - owner # One of owner_enum\n  - decision\n",
+        ),
+        "missing decision",
+    ),
+    (
+        "relationships",
+        schema_and_reference_with_blocks_key,
+        "blocks -> gone.md does not exist",
+    ),
+    (
+        "status-transitions",
+        lambda r: replace(
+            r / SCHEMA_PATH, "transitions_to: [Proposed]", "transitions_to: [Proposd]"
+        ),
+        "Draft -> Proposd is not a defined status",
+    ),
 ]
+
+
+def test_accepted_can_become_active() -> None:
+    """An in-use REF, GUIDE or GLOSSARY goes Accepted to Active (owner decision, 2026-09-28)."""
+    raw = yaml.safe_load((REPO / SCHEMA_PATH).read_text(encoding="utf-8"))
+    assert "Active" in raw["status_lifecycle"]["Accepted"]["transitions_to"]
 
 
 def test_frontmatter_pattern_accepts_crlf_line_endings() -> None:
