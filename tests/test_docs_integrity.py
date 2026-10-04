@@ -8,12 +8,14 @@ proves nothing.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import pytest
 import yaml
@@ -48,7 +50,9 @@ RELATIONSHIP_KEYS = (
 RESIDUE_HEADINGS = ("critique score", "change log", "changelog", "relationship updates")
 ADR_NAME = re.compile(r"adr-(\d{3})-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 SPEC_NAME = re.compile(r"(prd|trd|ref|guide|glossary)-[a-z0-9]+(?:-[a-z0-9]+)*\.md")
-FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+# Tolerates a BOM, CRLF line endings, trailing spaces after a fence and a closing fence at the
+# end of the file.
+FRONTMATTER = re.compile(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 FENCED_BLOCK = re.compile(
     r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?P=fence)[`~]*[ \t]*$",
     re.DOTALL | re.MULTILINE,
@@ -60,7 +64,14 @@ CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1", re.DOTALL)
 LOCAL_PATH = re.compile(r"(?:^|[\s\"'`(\[=<])((?:/Users/|~/)[^\s)\]>\"'`]*)", re.MULTILINE)
 # A double quote inside the brackets means JSON (`[[null, "250.0"]]`), not a wikilink.
 WIKILINK = re.compile(r"\[\[[^\[\]\n\"]+\]\]")
-MD_LINK = re.compile(r"\]\(([^)\s]+?\.mdx?)(?:#[^)]*)?\)")
+# An inline link or image target: optional angle brackets, one level of parentheses in the
+# path, and an optional title.
+INLINE_LINK = re.compile(
+    r"\]\(\s*(<[^>\n]*>|(?:[^\s()]|\([^\s()]*\))*)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)"
+)
+# A reference-style definition, `[label]: target`; `[^note]:` footnotes are not links.
+REFERENCE_DEFINITION = re.compile(r"^ {0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(<[^>\n]+>|\S+)", re.MULTILINE)
+URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 ROOT_MARKDOWN = ("README.md", "AGENTS.md")
 
 Check = Callable[[Path], list[str]]
@@ -218,16 +229,46 @@ def check_residue_headings(root: Path) -> list[str]:
     return violations
 
 
+def link_targets(text: str) -> list[str]:
+    """Inline and reference-definition link targets in `text`, angle brackets removed."""
+    raw = [m.group(1) for m in INLINE_LINK.finditer(text)]
+    raw += [m.group(1) for m in REFERENCE_DEFINITION.finditer(text)]
+    return [target.strip().removeprefix("<").removesuffix(">") for target in raw]
+
+
+def exists_exact(path: Path) -> bool:
+    """True when every component of `path` exists with exactly that name (case included)."""
+    resolved = Path(os.path.normpath(path))
+    current = Path(resolved.anchor)
+    for part in resolved.parts[len(current.parts) :]:
+        try:
+            names = os.listdir(current)
+        except PermissionError:
+            names = [part]  # cannot list this directory; trust the name
+        except OSError:
+            return False
+        if part not in names:
+            return False
+        current /= part
+    return True
+
+
 def check_relative_links(root: Path) -> list[str]:
     violations: list[str] = []
     root_files = [root / name for name in ROOT_MARKDOWN if (root / name).is_file()]
     for path in markdown_files(root / "docs") + root_files:
-        for match in MD_LINK.finditer(body(path)):
-            href = match.group(1)
-            if href.startswith(("http://", "https://", "mailto:")):
+        for target in link_targets(prose(path)):
+            if not target or target.startswith(("#", "//")) or URL_SCHEME.match(target):
                 continue
-            if not (path.parent / href).exists():
-                violations.append(f"{rel(root, path)}: link -> {href} does not exist")
+            target = re.split(r"[?#]", target, maxsplit=1)[0]
+            if not target:
+                continue
+            decoded = unquote(target)
+            resolved = (
+                root / decoded.lstrip("/") if decoded.startswith("/") else path.parent / decoded
+            )
+            if not exists_exact(resolved):
+                violations.append(f"{rel(root, path)}: link -> {target} does not exist")
     return violations
 
 
