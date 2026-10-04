@@ -28,5 +28,13 @@
       "datasourceTemplate": "pypi",
       "depNameTemplate": "uv"
     }
+  ],
+  "packageRules": [
+    {
+      "description": "GHCR and Quay return no release timestamps, so Renovate 42 and later would hold their updates forever under minimumReleaseAge; treat a missing timestamp as stable for these two registries only",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["ghcr.io/**", "quay.io/**"],
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
+    }
   ]
 }
