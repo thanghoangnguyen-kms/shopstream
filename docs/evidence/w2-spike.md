@@ -40,7 +40,7 @@ $ grep -n "^MIN_VM_BYTES" scripts/stack.py
 
 ### Clean-clone just up
 
-`uv run just up` from the fresh clone. The Compose `Creating`, `Created`, `Starting`, `Waiting` and `Running` state lines are dropped, so the `Started`, `Healthy` and `Exited` lines remain. The transcript ends with the exit code.
+`uv run just up` from the fresh clone. The Compose `Creating`, `Created`, `Starting`, `Waiting` and `Running` state lines are dropped, so the `Started`, `Healthy` and `Exited` lines remain. The transcript ends with the exit code. It predates a change to the core Frankfurter's start command, which now creates its database schema before the web server starts; the clean-clone run on the final configuration is under Clean-clone combined just up below.
 
 ```text
 uv run python scripts/stack.py up
@@ -195,6 +195,233 @@ bucket warehouse: exists
 catalog bootstrap: exists
 exit=0
 ```
+
+### Clean-clone combined just up
+
+Recorded 2026-10-04, from a fresh `git clone` of the phase branch at commit b9713f2, with no named volumes, no `infra/.env` and no `infra/.generated/`. It ran under its own Compose project name (`shopstream-uat`), so no existing stack's volumes were touched, on the Connect and Airflow images already built from the same Dockerfiles. Every capture was redacted in the clone after its `infra/.env` existed. `COMPOSE_PROFILES=streaming,orchestration uv run just up`, trimmed the same way as above, with the Compose `Network` and `Volume` state lines dropped too:
+
+```text
+uv run python scripts/stack.py up
+VM memory ok: MemTotal 12515225600 B (11.66 GiB), threshold 12348030976 B (11.50 GiB)
+env file: added 16 keys: POSTGRES_PASSWORD, LAKEKEEPER_DB_PASSWORD, AIRFLOW_DB_PASSWORD, SHOPSTREAM_DB_PASSWORD, LAKEKEEPER_PG_ENCRYPTION_KEY, SEAWEEDFS_ADMIN_KEY, SEAWEEDFS_ADMIN_SECRET, LAKEKEEPER_S3_KEY, LAKEKEEPER_S3_SECRET, PROBE_OTHER_KEY, PROBE_OTHER_SECRET, STS_SIGNING_KEY, CANARY_TOKEN, CDC_DB_PASSWORD, AIRFLOW_FERNET_KEY, AIRFLOW_JWT_SECRET
+identity file: rendered
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration up --wait --wait-timeout 300
+ Container shopstream-uat-kafka-3-1 Started
+ Container shopstream-uat-kafka-2-1 Started
+ Container shopstream-uat-postgres-1 Started
+ Container shopstream-uat-seaweedfs-1 Started
+ Container shopstream-uat-kafka-1-1 Started
+ Container shopstream-uat-frankfurter-init-1 Started
+ Container shopstream-uat-frankfurter-init-1 Exited
+ Container shopstream-uat-frankfurter-1 Started
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-cdc-init-1 Started
+ Container shopstream-uat-lakekeeper-migrate-1 Started
+ Container shopstream-uat-airflow-init-1 Started
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Started
+ Container shopstream-uat-kafka-1-1 Healthy
+ Container shopstream-uat-kafka-3-1 Healthy
+ Container shopstream-uat-kafka-2-1 Healthy
+ Container shopstream-uat-kafka-init-1 Started
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-scheduler-1 Started
+ Container shopstream-uat-airflow-apiserver-1 Started
+ Container shopstream-uat-airflow-triggerer-1 Started
+ Container shopstream-uat-airflow-dag-processor-1 Started
+ Container shopstream-uat-kafka-init-1 Exited
+ Container shopstream-uat-karapace-1 Started
+ Container shopstream-uat-kafka-init-1 Exited
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-cdc-init-1 Exited
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-karapace-1 Healthy
+ Container shopstream-uat-connect-1 Started
+ Container shopstream-uat-kafka-2-1 Healthy
+ Container shopstream-uat-frankfurter-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-frankfurter-init-1 Exited
+ Container shopstream-uat-kafka-init-1 Exited
+ Container shopstream-uat-karapace-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-airflow-dag-processor-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-cdc-init-1 Exited
+ Container shopstream-uat-airflow-scheduler-1 Healthy
+ Container shopstream-uat-airflow-triggerer-1 Healthy
+ Container shopstream-uat-airflow-apiserver-1 Healthy
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-kafka-3-1 Healthy
+ Container shopstream-uat-kafka-1-1 Healthy
+ Container shopstream-uat-connect-1 Healthy
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration --profile bootstrap run --rm warehouse
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Started
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-bootstrap-1 Started
+ Container shopstream-uat-bootstrap-1 Exited
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+warehouse spike: created
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration --profile bootstrap logs --no-log-prefix bootstrap
+bucket warehouse: created
+catalog bootstrap: created
+exit=0
+```
+
+The state of every container after that run, from `docker inspect`:
+
+```text
+airflow-apiserver: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+airflow-dag-processor: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+airflow-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+airflow-scheduler: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+airflow-triggerer: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+bootstrap: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+cdc-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+connect: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+frankfurter: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+frankfurter-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+kafka-1: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+kafka-2: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+kafka-3: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+kafka-init: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+karapace: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+lakekeeper: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+lakekeeper-migrate: OOMKilled=false RestartCount=0 Status=exited ExitCode=0
+postgres: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+seaweedfs: OOMKilled=false RestartCount=0 Status=running ExitCode=0
+```
+
+A 1 s `docker stats` sampler ran beside the cold start and caught 40 frames over 75 s, 31 of them with a container in them. The one-shots it caught peaked at 114.3 MiB for kafka-init against its 160 MiB limit and 90.5 MiB for airflow-init against 256 MiB. The other one-shots (frankfurter-init at 32 MiB, lakekeeper-migrate at 128 MiB, cdc-init at 64 MiB and bootstrap at 128 MiB) finished between two frames. The core Frankfurter peaked at 57.3 MiB against its 192 MiB limit. The Docker event capture for the run holds no `oom` event.
+
+The core Frankfurter comes up healthy on its empty volume and serves no rates: `/` answers 200 and `/v1/latest` answers 404. It runs web-only and never fetches, so a clean clone has an empty rate table until a seed runs, as item 10's seed does on its own volume.
+
+### Repeat runs on the clean clone
+
+On the same clone and project, a second `uv run just up` of core and then `COMPOSE_PROFILES=streaming,orchestration uv run just up` on the now-warm volumes, trimmed the same way, with the bootstrap container's log cut to its last pair:
+
+```text
+uv run python scripts/stack.py up
+VM memory ok: MemTotal 12515225600 B (11.66 GiB), threshold 12348030976 B (11.50 GiB)
+env file: up to date
+identity file: rendered
++ docker compose -f infra/compose.yaml --profile core up --wait --wait-timeout 300
+ Container shopstream-uat-frankfurter-init-1 Started
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-frankfurter-init-1 Exited
+ Container shopstream-uat-lakekeeper-migrate-1 Started
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-frankfurter-init-1 Exited
+ Container shopstream-uat-frankfurter-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
++ docker compose -f infra/compose.yaml --profile core --profile bootstrap run --rm warehouse
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Started
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-bootstrap-1 Started
+ Container shopstream-uat-bootstrap-1 Exited
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+warehouse spike: exists
++ docker compose -f infra/compose.yaml --profile core --profile bootstrap logs --no-log-prefix bootstrap
+bucket warehouse: exists
+catalog bootstrap: exists
+exit=0
+```
+
+```text
+uv run python scripts/stack.py up
+VM memory ok: MemTotal 12515225600 B (11.66 GiB), threshold 12348030976 B (11.50 GiB)
+env file: up to date
+identity file: rendered
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration up --wait --wait-timeout 300
+ Container shopstream-uat-frankfurter-init-1 Started
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-kafka-1-1 Healthy
+ Container shopstream-uat-kafka-3-1 Healthy
+ Container shopstream-uat-kafka-2-1 Healthy
+ Container shopstream-uat-frankfurter-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Started
+ Container shopstream-uat-kafka-init-1 Started
+ Container shopstream-uat-lakekeeper-migrate-1 Started
+ Container shopstream-uat-cdc-init-1 Started
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-kafka-init-1 Exited
+ Container shopstream-uat-kafka-init-1 Exited
+ Container shopstream-uat-karapace-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-cdc-init-1 Exited
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-frankfurter-1 Healthy
+ Container shopstream-uat-airflow-dag-processor-1 Healthy
+ Container shopstream-uat-airflow-triggerer-1 Healthy
+ Container shopstream-uat-airflow-scheduler-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-frankfurter-init-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-kafka-1-1 Healthy
+ Container shopstream-uat-cdc-init-1 Exited
+ Container shopstream-uat-airflow-apiserver-1 Healthy
+ Container shopstream-uat-kafka-init-1 Exited
+ Container shopstream-uat-kafka-2-1 Healthy
+ Container shopstream-uat-airflow-init-1 Exited
+ Container shopstream-uat-karapace-1 Healthy
+ Container shopstream-uat-connect-1 Healthy
+ Container shopstream-uat-kafka-3-1 Healthy
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration --profile bootstrap run --rm warehouse
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-migrate-1 Started
+ Container shopstream-uat-lakekeeper-migrate-1 Exited
+ Container shopstream-uat-postgres-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-bootstrap-1 Started
+ Container shopstream-uat-seaweedfs-1 Healthy
+ Container shopstream-uat-lakekeeper-1 Healthy
+ Container shopstream-uat-bootstrap-1 Exited
+warehouse spike: exists
++ docker compose -f infra/compose.yaml --profile core --profile streaming --profile orchestration --profile bootstrap logs --no-log-prefix bootstrap
+bucket warehouse: exists
+catalog bootstrap: exists
+exit=0
+```
+
+After both runs every container still showed OOMKilled false and RestartCount 0.
 
 ### Services
 
