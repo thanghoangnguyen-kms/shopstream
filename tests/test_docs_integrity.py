@@ -232,11 +232,20 @@ def check_relative_links(root: Path) -> list[str]:
 
 
 def check_local_paths(root: Path) -> list[str]:
-    return []
+    """A pasted leak usually sits in output, so scan the whole text, fences included."""
+    return [
+        f"{rel(root, path)}: absolute local path {match.group(1)!r}"
+        for path in docs_text_files(root)
+        for match in LOCAL_PATH.finditer(path.read_text(encoding="utf-8"))
+    ]
 
 
 def check_wikilinks(root: Path) -> list[str]:
-    return []
+    return [
+        f"{rel(root, path)}: wikilink {match.group(0)!r}"
+        for path in markdown_files(root / "docs")
+        for match in WIKILINK.finditer(prose(path))
+    ]
 
 
 def check_spec_filenames(root: Path) -> list[str]:
