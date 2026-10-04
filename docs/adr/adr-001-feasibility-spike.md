@@ -5,7 +5,7 @@ status: Proposed
 owner: platform
 decision: "Build on the pinned target stack, with a fallback fixed in advance for each of 15 risky assumptions; the Week 2 spike's evidence settles each item as go or fallback before this ADR is Accepted"
 created: 2026-09-29
-updated: 2026-09-30
+updated: 2026-10-04
 informs:
   - ../specs/platform/ref-architecture.md
 ---
@@ -220,21 +220,21 @@ Every item starts as "not run". Each verdict is `go` or `fallback`, with a point
 
 | #   | Measured result | Verdict | Evidence |
 | --- | --------------- | ------- | -------- |
-| 1   | Not run | Open | `docs/evidence/w2-spike.md` Item 1 |
-| 2   | Not run | Open | `docs/evidence/w2-spike.md` Item 2 |
-| 3   | Not run | Open | `docs/evidence/w2-spike.md` Item 3 |
-| 4   | Not run | Open | `docs/evidence/w2-spike.md` Item 4 |
-| 5   | Not run | Open | `docs/evidence/w2-spike.md` Item 5 |
-| 6   | Not run | Open | `docs/evidence/w2-spike.md` Item 6 |
-| 7   | Not run | Open | `docs/evidence/w2-spike.md` Item 7 |
-| 8   | Not run | Open | `docs/evidence/w2-spike.md` Item 8 |
-| 9   | Not run | Open | `docs/evidence/w2-spike.md` Item 9 |
-| 10  | Not run | Open | `docs/evidence/w2-spike.md` Item 10 |
-| 11  | Not run | Open | `docs/evidence/w2-spike.md` Item 11 |
-| 12  | Not run | Open | `docs/evidence/w2-spike.md` Item 12 |
-| 13  | Not run | Open | `docs/evidence/w2-spike.md` Item 13 |
-| 14  | Not run | Open | `docs/evidence/w2-spike.md` Item 14 |
-| 15  | Not run | Open | `docs/evidence/w2-spike.md` Item 15 |
+| 1   | Vended credentials are scoped to the table's own location on Lakekeeper 0.13.6 and SeaweedFS 4.47, and only `lakekeeper` can assume the vended role; Figure 1 branch "All engines: vended credentials" | go | `docs/evidence/w2-spike.md` Item 1 |
+| 2   | Spark 4.1.3 wrote four v3 tables with deletion vectors, and DuckDB 1.5.5 matched Spark's snapshot ids, row counts and digests on all four; PyIceberg 0.12.0 and Polars 1.44.2 cannot load a VARIANT table, so they read the payload as a JSON string column and matched on the two JSON-string tables; no reader needs v2 | fallback | `docs/evidence/w2-spike.md` Item 2 |
+| 3   | dbt 2.0.6 built format-version 3 and merged, but its bundled DuckDB 1.5.4 writes deletion vectors that DuckDB 1.5.5 rejects; on the owner's call, dbt-core 1.12.5 with dbt-duckdb 1.11.0 on DuckDB 1.5.5 builds `inc_v3` at format-version 3, and Spark and PyIceberg read the merged rows | fallback | `docs/evidence/w2-spike.md` Item 3 |
+| 4   | MetricFlow 0.213.0 (mf 0.15.0) in its own uv project returned the same rows as hand-written SQL over gold, grouped by day and in total, on the item 3 fallback runtime; both venvs' `dbt` CLIs report dbt-core 1.12.5, and the dbt 2.0 half was not exercised | go | `docs/evidence/w2-spike.md` Item 4 |
+| 5   | Across three Connect worker kills, bronze's 14,559 offsets equal the `read_committed` set with no duplicate, and its 14,389 distinct changes equal the `test_decoding` count; the sink's `audit` branch gives bronze write-audit-publish, and both rollback paths replayed with no gap or duplicate | go | `docs/evidence/w2-spike.md` Item 5 |
+| 6   | Two messages on `fx.refresh` started two distinct Airflow 3.3.2 DAG runs, 1.5 s and 0.9 s after the messages, against the 60 s limit | go | `docs/evidence/w2-spike.md` Item 6 |
+| 7   | DuckDB 1.5.5 cannot read an Iceberg view that Lakekeeper lists, so gold switches by table rename; over 20 switches each way a 100 ms DuckDB poller with the single retry accepted no missing object and no mixed result, and PublishInProgress was 0 | fallback | `docs/evidence/w2-spike.md` Item 7 |
+| 8   | Scope: the clickstream, Spark and dbt combination; CDC load not measured. Peak summed sample 6.74 GiB against 10 GiB, `mem_limit` sum 10.12 GiB against 10.66 GiB, and no OOM kill or restart, on the 12 GiB Colima VM | go | `docs/evidence/w2-spike.md` Item 8 |
+| 9   | On the item 3 fallback runtime, dbt build and docs lite ran in CI's required test job with no dbt login and no secret; the sqlfluff hook lints the dbt SQL, as dbt-core has no lint command | go | `docs/evidence/w2-spike.md` Item 9 |
+| 10  | Frankfurter 2.5.1, seeded online once with ECB only, served dlt with the network cut: 270,096 rows from 1999-01-04 to 2026-10-02, 0 weekend rows, and the 134 weekdays without rows are the 134 TARGET closing days | go | `docs/evidence/w2-spike.md` Item 10 |
+| 11  | Per key, `source.lsn` matched commit order for 21,658 changes over 8,958 keys (0 violations) with three writers and one `ALTER TABLE`; snapshot rows came once per key first, and every delete paired with its update | go | `docs/evidence/w2-spike.md` Item 11 |
+| 12  | 7,002,800 events in 6 commits at 60 s, 19,199.4 events/s committed against the 14,000 floor; 50M events project to 7.02 GiB, 17.5 percent of the 40 GiB disk against 75 percent | go | `docs/evidence/w2-spike.md` Item 12 |
+| 13  | 11 of 11 Knob paths rows detected: the CDC rows and the CDC half of the canary in item 11's main run, the clickstream rows and the clickstream canary in item 12's run, and the FX row in item 10's check | go | `docs/evidence/w2-spike.md` Item 13 |
+| 14  | A digest-pinned `python:3.13.15-slim-trixie` image with Debian's JRE 21 and PySpark 4.1.3 ran item 2's job, and the driver and a Python UDF report Python 3.13.15 | go | `docs/evidence/w2-spike.md` Item 14 |
+| 15  | Maven Central has no `iceberg-spark-runtime-4.2_2.13` in Iceberg 1.11.0 or 1.12.0, so Shopstream stays on PySpark 4.1.3; G4 is unchanged | fallback | `docs/evidence/w2-spike.md` Item 15 |
 
 ### Evidence rules
 
