@@ -55,6 +55,11 @@ def recipe_command(name: str) -> list[str]:
 
 def config_value(tokens: list[str]) -> str | None:
     """The config file a gitleaks command line names, or None."""
+    for index, arg in enumerate(tokens):
+        if arg == "--config":
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if arg.startswith("--config="):
+            return arg.removeprefix("--config=") or None
     return None
 
 
