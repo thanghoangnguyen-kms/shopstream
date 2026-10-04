@@ -1458,7 +1458,7 @@ A tested rule (`item8_verdict` in `scripts/ram_budget.py`) decides, over `just m
 - Profiles: `core`, `streaming` and `orchestration`, started by `just up`, plus two `spike` containers that never belong to the platform: `spark-job` and the load generator `cdc-run`. The thirteen long-running services were healthy before the window and still healthy after it, with an unbroken uptime, so none restarted.
 - The clickstream sink ran under item 12's load (7,003,500 events at about 20,000 events/s through three brokers at replication factor 3, a 60 s commit interval). The Postgres CDC source and its Iceberg sink were registered and idle (no CDC workload ran in the window): after the run all three connectors reported RUNNING with one RUNNING task each.
 - Item 2's MERGE job looped on item 14's image: 9 runs, all exit 0, of 46.0, 51.3, 20.1, 26.8, 27.3, 29.1, 32.0, 37.6, 27.7 s.
-- One `dbt_build_lk` DAG run (item 3's `dbt build --target lk --select +inc_v3`, four of four steps) ran inside the scheduler on LocalExecutor from 16:22:41 to 16:23:18 UTC, 37.2 s, state success, with DuckDB's `memory_limit` set to 512MiB in the `lk` profile (a `dbt show` in the scheduler prints 512.0 MiB, so the setting is applied).
+- One `dbt_build_lk` DAG run (item 3's `dbt build --target lk --select +inc_v3`, four of four steps) ran inside the scheduler on LocalExecutor from 16:22:41 to 16:23:18 UTC, 37.2 s, state success, with DuckDB's `memory_limit` set to 512MiB in the `lk` profile (a `dbt show` in the scheduler prints 512.0 MiB, so the setting is applied). The cap was lowered to 224MiB after this window; the re-run at that cap is under DuckDB cap re-run below.
 - The core `frankfurter` ran web-only (the owner's choice, serving only the ECB-seeded volume), peak 91.0 MiB.
 - The load generator's own container is counted in the peak summed sample. `cdc-run` peaked at 219.8 MiB (the generator and the drain check both run in it), so a reader who wants the platform alone subtracts about 0.21 GiB.
 
@@ -1572,6 +1572,55 @@ All times are UTC on 2026-10-03.
 ### VM check
 
 `colima ssh -- sudo dmesg`, filtered in memory for out-of-memory killer lines (only the count was kept), found 0 such lines after the run.
+
+### DuckDB cap re-run
+
+Recorded 2026-10-04.
+
+The window above ran DuckDB at the earlier 512MiB cap. The cap is now 224MiB, chosen so that the scheduler's measured terms plus the cap fit its 928 MiB limit. No compose limit changed, so the tables above stand. This re-run checks that fit with a per-process reading instead of an estimate.
+
+What ran: the stack was brought up on its existing volumes with no load, a `dbt show` in the scheduler printed 224.0 MiB (the cap is applied), and one `dbt_build_lk` run followed: state success, 07:16:55 to 07:16:59 UTC, 3.9 s.
+
+Scheduler result: OOMKilled false, RestartCount 0, status running. Its `docker stats` peak from `just mem-report` was 620.9 MiB against the 928 MiB limit. That sampler ran about every 2 s in practice (111 frames over 223 s), and `docker stats` counts page cache.
+
+Method:
+
+- A reader in the Docker VM, outside the scheduler's cgroup, read the cgroup's memory figures and each process's proportional set size (PSS) once a second, so shared pages count once.
+- The idle baseline is the 85 frames before the first harness process; the run's window is 7 frames, from 2 s before the run's start to 2 s after its end.
+- The harness's own `dags trigger` and `dbt show` processes are left out, because a scheduled run does not have them.
+- The healthcheck (`airflow jobs check`, run every 30 s by Docker) is added at its largest single process, 16 were seen.
+- The whole cap is added on top, so DuckDB's own use counts twice (once inside the run's processes, once as the cap) and the sum is conservative.
+
+| Term | MiB |
+| --- | ---: |
+| scheduler idle (PSS) | 315.0 |
+| scheduler during the run (PSS) | 503.8 |
+| of which the run's processes | 188.8 |
+| of which the dbt process with DuckDB | 135.3 |
+| largest healthcheck process | 117.9 |
+| DuckDB memory_limit | 224.0 |
+| worst case (run + healthcheck + cap) | 845.7 |
+| scheduler mem_limit | 928 |
+| cgroup anon, idle | 395.9 |
+| cgroup anon, during the run | 455.4 |
+| cgroup memory.current, largest during the run | 672.0 |
+| memory.peak since the container started | 763.9 |
+
+The worst case, 845.7 MiB, fits under the scheduler's 928 MiB limit with 82.3 MiB to spare. The cgroup's own figures agree: anon stayed under 456 MiB, and `memory.peak`, which includes page cache and the container's start-up, was 763.9 MiB.
+
+```text
+| memory_limit |
+| ------------ |
+| 224.0 MiB    |
+{"id": 9, "run_id": "manual__2026-10-04T07:16:55.386610+00:00", "state": "success", "start_date": "2026-10-04T07:16:55.532471+00:00", "end_date": "2026-10-04T07:16:59.404262+00:00"}
+false 0 running
+{ "idle": 315.0, "busy": 503.8, "dag_increment": 188.8, "dbt": 135.3,
+  "healthcheck": 117.9, "anon_idle": 395.9, "anon_busy": 455.4,
+  "current_busy": 672.0, "peak_lifetime": 763.9, "cap": 224.0,
+  "limit": 928.0, "worst": 845.7, "covered": true, "fitting_cap": 288 }
+```
+
+The limits of this result: item 3's build is a handful of rows and ran for under 4 s, so the 1 s reader saw the dbt process in one frame, and a heavier dbt build needs the scheduler re-measured (as Consequences already says).
 
 ### FALL-03
 
