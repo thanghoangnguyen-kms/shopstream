@@ -12,9 +12,13 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 SKILL = REPO / ".claude/skills/shop-spec"
+CONTRIBUTING = REPO / "docs/CONTRIBUTING.md"
+SCHEMA = REPO / "docs/tooling/frontmatter-schema.yaml"
+PRE_COMMIT = REPO / ".pre-commit-config.yaml"
 # Written with escapes so this file holds no dash of its own.
 DASH = re.compile(r"[\u2013\u2014]")
 DASH_FREE: tuple[Path, ...] = (
@@ -22,9 +26,19 @@ DASH_FREE: tuple[Path, ...] = (
     SKILL / "references/conventions.md",
     SKILL / "references/critique-protocol.md",
     SKILL / "references/templates.md",
+    CONTRIBUTING,
+    SCHEMA,
 )
 
 FROZEN_RULE = "Context, Decision Outcome or Consequences after `status: Accepted`"
+PIN_PHRASES = (
+    "Four pins live outside uv.lock",
+    "gitleaks",
+    "GitHub Actions SHAs",
+    "pre-commit-hooks rev",
+    "uv itself",
+    "prek runs its own built-in code",
+)
 
 
 def read(path: Path) -> str:
@@ -43,6 +57,21 @@ def line_starting(text: str, prefix: str) -> str:
         if line.startswith(prefix):
             return line
     raise AssertionError(f"no line starts with {prefix!r}")
+
+
+def leading_comment(text: str) -> str:
+    """The run of `#` lines at the top of a file, up to the first line that isn't one."""
+    comment: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            break
+        comment.append(line)
+    return "\n".join(comment)
+
+
+def missing_pin_phrases(comment: str) -> list[str]:
+    """The pin phrases the comment omits; matching is case-sensitive."""
+    return [phrase for phrase in PIN_PHRASES if phrase not in comment]
 
 
 @pytest.mark.parametrize("path", DASH_FREE, ids=lambda path: path.relative_to(REPO).as_posix())
@@ -70,6 +99,8 @@ def test_guide_sections_apply_to_procedural_guides_and_runbooks() -> None:
     templates = read(SKILL / "references/templates.md")
     assert "procedural guides and runbooks" in line_starting(skill, "- **GUIDE**")
     assert "procedural guides and runbooks" in line_starting(templates, "### GUIDE Scaffold")
+    guide = between(read(CONTRIBUTING), "### GUIDE", "\n### ")
+    assert "Procedural guides and runbooks" in guide
 
 
 def test_accepted_adrs_freeze_only_three_sections() -> None:
@@ -77,3 +108,37 @@ def test_accepted_adrs_freeze_only_three_sections() -> None:
         text = read(path)
         assert FROZEN_RULE in text, path.name
         assert "immutable" not in text.lower(), path.name
+    contributing = read(CONTRIBUTING)
+    adr = between(contributing, "### ADR (MADR 4.0 body)", "\n### ")
+    assert "only Context, Decision Outcome and Consequences are frozen" in adr
+    assert FROZEN_RULE in between(contributing, "## Boundaries", "\n## ")
+    schema = read(SCHEMA)
+    adr_type: str = yaml.safe_load(schema)["type_enum"]["adr"]
+    assert "Context, Decision Outcome and Consequences" in adr_type
+    for text in (contributing, schema):
+        assert "immutable" not in text.lower()
+
+
+def test_pre_commit_comment_names_the_four_pins() -> None:
+    comment = leading_comment(read(PRE_COMMIT))
+    assert missing_pin_phrases(comment) == []
+
+
+GOOD_COMMENT = "\n".join(f"# {phrase}" for phrase in PIN_PHRASES)
+
+
+@pytest.mark.parametrize(
+    ("text", "missing"),
+    [
+        (GOOD_COMMENT, []),
+        (GOOD_COMMENT.replace("uv itself", "uv"), ["uv itself"]),
+        (
+            GOOD_COMMENT.replace("GitHub Actions SHAs", "github actions shas"),
+            ["GitHub Actions SHAs"],
+        ),
+        ("default_install_hook_types: [pre-commit]\n" + GOOD_COMMENT, list(PIN_PHRASES)),
+    ],
+    ids=["complete", "omits-uv", "wrong-case", "below-the-comment-block"],
+)
+def test_pin_helper_reports_what_the_comment_omits(text: str, missing: list[str]) -> None:
+    assert missing_pin_phrases(leading_comment(text)) == missing
