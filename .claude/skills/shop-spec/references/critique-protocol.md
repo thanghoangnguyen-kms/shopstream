@@ -1,4 +1,4 @@
-# Shopstream Spec — Critique Protocol
+# Shopstream Spec: Critique Protocol
 
 ## When to Invoke
 
@@ -21,7 +21,7 @@ Each critic returns scores for all five dimensions plus its flags. Critics never
 
 ## 5-Dimension Rubric
 
-Score each dimension 1–3 (5 × 3 = 15).
+Score each dimension 1 to 3 (5 × 3 = 15).
 
 | #     | Dimension             | 1: Failing                                             | 2: Adequate                                           | 3: Strong |
 | ----- | --------------------- | ------------------------------------------------------ | ----------------------------------------------------- | --------- |
@@ -42,8 +42,8 @@ The aggregate uses, for each dimension, the **lowest** score any critic gave.
 **Domain:** grain, keys, CDC semantics, SCD2, late-arriving data, reconciliation.
 
 1. Is the grain of every table declared, and do the joins preserve it (no fan-out, no silent dedup)?
-2. Are CDC changes applied in source order (LSN or source timestamp, never ingestion time), deletes included?
-3. Is SCD2 validity taken from source timestamps, and is non-overlap tested?
+2. Are CDC changes applied in source order (LSN per key; never a timestamp), deletes included?
+3. Is SCD2 validity from the simulated `updated_at` (the business clock), and is non-overlap tested?
 4. Are late-arriving dimensions handled with inferred members that are corrected later?
 5. Is there a reconciliation against the source with a stated tolerance, and does the doc say what happens when it fails?
 

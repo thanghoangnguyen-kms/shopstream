@@ -11,8 +11,8 @@ Reference material: [references/templates.md](references/templates.md) · [refer
 
 | Role        | Phase | Responsibility                                                              |
 | ----------- | ----- | --------------------------------------------------------------------------- |
-| interviewer | 0–1   | Scan `docs/adr/` and `docs/specs/`; elicit type, domain, slug, owner, links |
-| planner     | 2–3   | Generate frontmatter and the section skeleton                               |
+| interviewer | 0, 1  | Scan `docs/adr/` and `docs/specs/`; elicit type, domain, slug, owner, links |
+| planner     | 2, 3  | Generate frontmatter and the section skeleton                               |
 | writer      | 4     | Produce the full document                                                   |
 | auditor     | 5     | Run the Platform-gotcha audit and the docs lint                             |
 | critic      | 6     | Run the three Shopstream critics; score the 5-dimension rubric              |
@@ -20,13 +20,14 @@ Reference material: [references/templates.md](references/templates.md) · [refer
 
 ## Phases
 
-### Phase 0 — context_scan
+### Phase 0: context_scan
 
 - Derive the next ADR number from `docs/adr/` filenames (`ls docs/adr | sort | tail -1`), or let `just adr-new` assign it. Never use a remembered number.
 - Glob `docs/specs/` and `docs/adr/` to confirm the proposed slug is free.
 - Read `AGENTS.md` §6 (Platform gotchas) and `docs/specs/platform/ref-architecture.md` before writing any architecture claim.
+- If the request comes with an input document from outside `docs/` (a planning brief, a note, a ticket), treat it as input only: take the facts it states, and never copy its paths, links, wikilinks or references into the doc. Re-derive every reference from the repo.
 
-### Phase 1 — doc_type_interview
+### Phase 1: doc_type_interview
 
 Ask what is being documented, and map it to a type:
 
@@ -43,7 +44,7 @@ Domains: `platform`, `ingestion`, `transform`, `streaming`, `orchestration`, `ai
 
 Also collect the owner (`platform` | `analytics-eng` | `governance`) and the paths for the typed relationship keys.
 
-### Phase 2 — frontmatter_generation
+### Phase 2: frontmatter_generation
 
 Use the templates in [references/templates.md](references/templates.md):
 
@@ -53,11 +54,11 @@ Use the templates in [references/templates.md](references/templates.md):
 - `created:` / `updated:` set to today's date (ISO 8601)
 - Typed relationships (`implements`, `decided-by`, `depends-on`, `informs`, `supersedes`, `amends`, `amended-by`) take relative paths
 
-### Phase 3 — writing_plan
+### Phase 3: writing_plan
 
 Present the required sections for the chosen type (from `docs/CONTRIBUTING.md`). Ask for content inputs per section before writing.
 
-### Phase 4 — writing
+### Phase 4: writing
 
 Produce the complete document from the scaffold in [references/templates.md](references/templates.md):
 
@@ -65,7 +66,7 @@ Produce the complete document from the scaffold in [references/templates.md](ref
 - **TRD:** `§1 Objective` → `§2 Architecture` (Data Flow / Control Flow / Failure and Replay Flow) → `§3 Data Model / Contract` (Topic and Schema / Table / Job / Config) → `§4 Risk Assessment` → `§5 Testing Strategy` → `§6 Operational Boundaries`
 - **ADR:** `just adr-new "<title>" [owner]`, then fill the MADR 4.0 body: Context and Problem Statement → Decision Drivers → Considered Options → Decision Outcome (Consequences, Confirmation) → Pros and Cons of the Options → More Information
 - **REF:** Overview (SSOT declaration) → Core definitions → Precedence Rules
-- **GUIDE:** Overview + Prerequisites → Procedure → Troubleshooting → Operational Boundaries
+- **GUIDE** (procedural guides and runbooks): Overview + Prerequisites → Procedure → Troubleshooting → Operational Boundaries. A guide that sets conventions rather than steps chooses its own sections.
 - **GLOSSARY:** one Term / Definition / Defined by table
 
 EARS format, for PRD Acceptance Criteria:
@@ -78,7 +79,7 @@ THE SYSTEM SHALL [always-on requirement]
 
 Git is the history. Never add a change log, critique score or relationship-updates section to a document; the docs lint fails the build on those headings.
 
-### Phase 5 — gotcha_audit
+### Phase 5: gotcha_audit
 
 Run [references/conventions.md](references/conventions.md) §Platform-gotcha audit against the produced doc. Flag each contradiction as `G<N>: <claim> → <correct statement>` and fix it. Then run:
 
@@ -88,7 +89,7 @@ uv run pytest tests/test_docs_integrity.py -q
 
 The document isn't done until that passes.
 
-### Phase 6 — critique
+### Phase 6: critique
 
 - Trigger: **mandatory** for Proposed → Accepted; opt-in for Draft → Proposed.
 - Protocol: [references/critique-protocol.md](references/critique-protocol.md).
@@ -97,13 +98,13 @@ The document isn't done until that passes.
 - Gate: ≥ 13 / 15 to advance to Proposed · ≥ 13 / 15 to advance to Accepted.
 - Output: the score table and the unresolved flags go in the **PR description** (or the chat), never in the document. The writer resolves each flag, or logs it with an owner role and a target week: in Open Questions for a PRD, in the PR description for every other type.
 
-### Phase 7 — spec_compression_and_relationship_sweep
+### Phase 7: spec_compression_and_relationship_sweep
 
 Trigger: always, after Phase 4 (or after Phase 6 when a critique ran), before the final commit.
 
-**Step 7a — Compression.** Run the checklist in [references/templates.md](references/templates.md) §Phase 7 and fix each violation inline.
+**Step 7a: Compression.** Run the checklist in [references/templates.md](references/templates.md) §Phase 7 and fix each violation inline.
 
-**Step 7b — Relationship sweep.** Follow [references/conventions.md](references/conventions.md) §Relationship Sweep Protocol:
+**Step 7b: Relationship sweep.** Follow [references/conventions.md](references/conventions.md) §Relationship Sweep Protocol:
 
 1. Grep `docs/` for the new doc's primary components, tables, topics and ADRs.
 2. Classify each impacted doc's relationship.
@@ -112,7 +113,7 @@ Trigger: always, after Phase 4 (or after Phase 6 when a critique ran), before th
 ## Constraints
 
 - New docs always start at `status: Draft`; never at `Accepted` or `Active`.
-- ADR bodies are immutable after `status: Accepted`; supersede them with a new ADR.
+- Never edit an ADR's Context, Decision Outcome or Consequences after `status: Accepted`; supersede it with a new ADR. Other sections, such as More Information, can still be updated.
 - Every deliverable has exactly one owner role (see [references/conventions.md](references/conventions.md) §Owner Boundaries).
 - Don't invent `type`, `status` or `owner` values; the schema in `docs/tooling/frontmatter-schema.yaml` is the only source.
 

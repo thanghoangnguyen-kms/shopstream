@@ -1,4 +1,4 @@
-# Shopstream Spec — Document Templates
+# Shopstream Spec: Document Templates
 
 Scaffolds for `/shop-spec` Phase 2 (frontmatter) and Phase 4 (sections). The ADR body lives in one place, `docs/tooling/adr-template.md` (MADR 4.0), which `just adr-new` renders.
 
@@ -24,7 +24,7 @@ decided-by:
 
 ```yaml
 ---
-title: "<Pipeline or job> — Design"
+title: "<Pipeline or job>: Design"
 type: trd
 status: Draft
 owner: platform
@@ -234,7 +234,7 @@ sequenceDiagram
 ### TRD Scaffold (a pipeline or job)
 
 ````markdown
-# <Pipeline or job> — Design
+# <Pipeline or job>: Design
 
 ## §1 Objective
 
@@ -287,9 +287,9 @@ Grain: <one row per …>. Keys: <natural key> → <surrogate key>.
 
 ### Config Registry _(omit if the component has no configuration)_
 
-| Key     | Where it's set                           | Default        | Secret? | Description        |
-| ------- | ---------------------------------------- | -------------- | ------- | ------------------ |
-| `<KEY>` | Compose env / dbt var / Airflow variable | <default or —> | no      | <what it controls> |
+| Key     | Where it's set                           | Default           | Secret? | Description        |
+| ------- | ---------------------------------------- | ----------------- | ------- | ------------------ |
+| `<KEY>` | Compose env / dbt var / Airflow variable | <default or none> | no      | <what it controls> |
 
 ## §4 Risk Assessment
 
@@ -335,7 +335,7 @@ Observability assertion (EARS): WHEN <condition> THE SYSTEM SHALL emit <metric, 
 
 The system-wide reference architecture has its own nine-section spine: `docs/specs/platform/ref-architecture.md`.
 
-### GUIDE Scaffold (runbooks included)
+### GUIDE Scaffold (procedural guides and runbooks)
 
 ````markdown
 # <Task> Guide
@@ -414,7 +414,7 @@ Run these before advancing `status` beyond `Draft`.
 
 ---
 
-## Phase 7 — Compression Checklist
+## Phase 7: Compression Checklist
 
 Run this after writing. Fix each violation inline before committing.
 
