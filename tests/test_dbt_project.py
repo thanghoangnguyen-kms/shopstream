@@ -92,7 +92,7 @@ def test_the_profile_has_targets_lk_and_ci_and_lk_attaches_the_catalog_it_names(
     assert attach["type"] == "iceberg"
     assert lk["database"] == attach["alias"]
     assert lk["database"] == load_yaml("dbt_project.yml")["vars"]["catalog"]
-    assert lk["settings"]["memory_limit"] == "512MiB"
+    assert lk["settings"]["memory_limit"] == "224MiB"
     ci = profile["outputs"]["ci"]
     assert ci["path"] == ":memory:"
     assert "settings" not in ci
