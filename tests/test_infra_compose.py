@@ -568,6 +568,16 @@ def test_frankfurter_is_sized_for_its_memory_limit() -> None:
     assert memory_bytes(frankfurter["memswap_limit"]) == 192 * MIB
 
 
+def test_the_core_frankfurter_creates_its_schema_before_puma() -> None:
+    # The image's default command ran db:setup before foreman, and that is the only step that
+    # creates the SQLite schema on an empty volume: puma's preload reads the rates table.
+    entrypoint = SERVICES["frankfurter"]["entrypoint"]
+    assert len(entrypoint) == 3
+    assert entrypoint[:2] == ["sh", "-c"]
+    steps = [step.strip() for step in entrypoint[2].split("&&")]
+    assert steps == ["bundle exec rake db:setup", "exec bundle exec puma -C config/puma.rb"]
+
+
 def test_the_frankfurter_volume_is_chowned_before_the_service_starts() -> None:
     init = SERVICES["frankfurter-init"]
     assert init["user"] == "0:0"
@@ -615,6 +625,9 @@ def test_the_offline_frankfurter_is_web_only_and_has_a_healthcheck() -> None:
     assert "puma" in entrypoint
     assert "foreman" not in entrypoint
     assert "depends_on" not in offline
+    # Item 10's single-writer rule: frankfurter-seed is the only service that writes the fx volume,
+    # so the offline service never runs rake (db:setup rewrites the providers table).
+    assert "rake" not in entrypoint
 
 
 def test_the_seed_is_an_online_one_shot_on_the_default_network() -> None:
