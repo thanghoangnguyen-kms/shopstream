@@ -4,8 +4,8 @@ Item 8 measures the RAM budget with a dbt build running in Airflow while the cli
 item 2's MERGE job run. Under LocalExecutor the task runs in the scheduler's cgroup, so the
 scheduler's `mem_limit` holds the dbt process. The project mount (/opt/analytics/dbt) is read-only,
 so the task copies the tracked project files to /tmp/dbt-work first: dbt writes target/ and logs/
-there, and DuckDB's Iceberg writer makes data/. DuckDB's memory_limit (512MiB) comes from
-profiles.yml. This file holds no secret and no address beyond the catalog endpoint that profile
+there, and DuckDB's Iceberg writer makes data/. DuckDB's memory_limit comes from the lk
+output in profiles.yml. This file holds no secret and no address beyond the catalog endpoint that profile
 already names; Lakekeeper vends the storage credentials. The dbt CLI is /opt/dbt/bin/dbt, never
 the PATH.
 """

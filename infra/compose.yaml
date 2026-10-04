@@ -735,9 +735,13 @@ services:
       retries: 5
       start_period: 60s
 
-  # LocalExecutor runs the dbt_build_lk task in this container (item 8), so the calibration run's
-  # peak covers the scheduler's idle ~430 MiB plus dbt and DuckDB's 512MiB memory_limit. It alone
-  # mounts the dbt project, read-only; the task copies it to /tmp.
+  # LocalExecutor runs the dbt_build_lk task in this container (item 8), so this cgroup holds the
+  # scheduler, its 30 s `airflow jobs check` healthcheck and the dbt process with DuckDB inside it.
+  # Phase 5 measured by docker stats, page cache included: idle 350 to 583 MiB depending on uptime,
+  # 34 to 115 MiB more while a healthcheck runs, and about 170 to 325 MiB more during item 3's
+  # 5-row build. DuckDB's memory_limit (224MiB in analytics/dbt/profiles.yml) caps its buffer
+  # manager only. These are measurements, not a bound: a larger dbt build needs this limit
+  # re-measured. It alone mounts the dbt project, read-only; the task copies it to /tmp.
   airflow-scheduler:
     <<: *defaults
     build:
