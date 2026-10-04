@@ -2140,6 +2140,16 @@ Verdict: go. All eleven of the eleven Knob paths rows were detected: the five CD
 
 A tested rule (`item13_verdict` in `scripts/throughput_check.py`) decides, over the eleven rows of ADR-001's Knob paths table in order (a test compares its rows with the ADR's). Each row has its own check, and a knob counts as detected only when its detected count is above 0 and equals the generator's expected count where one exists. A missing input (no bronze table, no dead-letter count, no item 11 or item 10 capture) is inconclusive, never go or fallback, and any undetected knob is a fallback that names it.
 
+### Versions
+
+This item adds no pin of its own; each row's pins are the ones of the run it came from.
+
+- The CDC rows and the CDC half of the canary, from item 11's main run: Debezium 3.6.3.Final, the Iceberg sink 1.11.0, Karapace 6.2.3; PostgreSQL 17.11; pyiceberg 0.12.0, psycopg 3.3.6, confluent-kafka 2.15.1.
+- The clickstream rows and the clickstream canary, from item 12's run: Kafka 4.3.1 with three combined nodes; Karapace 6.2.3 with confluent-kafka 2.15.1 and fastavro 1.12.2 in the generator; Connect 4.3.0 with the Iceberg sink 1.11.0; Lakekeeper 0.13.6; SeaweedFS 4.47; DuckDB 1.5.5 reads bronze; Colima 0.10.3, Docker 29.6.2 and Compose 5.3.1 on a 12 GiB, 4 CPU VM.
+- The FX row, from item 10's check: the Frankfurter 2.5.1 image (its digest is under Item 10) and the loader with dlt 1.30.0, DuckDB 1.5.5 and Python 3.13.15.
+
+The tested rule itself is `item13_verdict` in `scripts/throughput_check.py`, run in the spike image.
+
 ### Commands
 
 ```text
