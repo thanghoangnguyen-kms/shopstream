@@ -5,7 +5,7 @@ status: Proposed
 owner: platform
 decision: "Build on the pinned target stack, with a fallback fixed in advance for each of 15 risky assumptions; the Week 2 spike's evidence settles each item as go or fallback before this ADR is Accepted"
 created: 2026-09-29
-updated: 2026-10-04
+updated: 2026-10-05
 informs:
   - ../specs/platform/ref-architecture.md
 ---
@@ -51,7 +51,7 @@ Each row fixes the choice when the item's [go criterion](#go-criteria) passes an
 | 8   | Does `core + streaming + orchestration` fit the RAM budget? | 3 KRaft brokers, replication factor 3 | 1 broker, and game day #1 becomes an outage-and-retry test. If 1 broker still doesn't fit, Spark leaves that combination and runs only with orchestration stopped | platform |
 | 9   | Which dbt 2.0 features work with no dbt account login? | No login and no CI secret; login-gated features (SQL comprehension, type checking, column-level lineage) stay local | A free-account token becomes a GitHub Actions secret, scoped to the one job that needs it, in a workflow that never runs on `pull_request_target` | analytics-eng |
 | 10  | Does a self-hosted Frankfurter serve the dlt FX pipeline offline? | v2 API with `providers=ECB` | v1 API, which serves ECB rates only | platform |
-| 11  | Which field orders CDC changes, and which drives SCD2 validity? | Per-key order by `source.lsn`; validity from the simulated `updated_at` ([Delete validity](#delete-validity)). The Week 3 time-model ADR makes it final | Order by `source.sequence` (commit LSN, then change LSN), parsed as two numbers rather than compared as text; an `updated_at` tie or inversion is a generator defect that Week 3 fixes, never a case the dbt macro works around | platform |
+| 11  | Which field orders CDC changes, and which drives SCD2 validity? | Per-key order by `source.lsn`; validity from the simulated `updated_at` ([Delete validity](#delete-validity)). [ADR-004](adr-004-time-model.md) makes it final | Order by `source.sequence` (commit LSN, then change LSN), parsed as two numbers rather than compared as text; an `updated_at` tie or inversion is a generator defect that Week 3 fixes, never a case the dbt macro works around | platform |
 | 12  | Can Kafka carry the Week 14 clickstream volume into bronze? | Kafka carries the Week 14 volume | Spark bulk-loads it into its own bronze table (reference architecture §6), with an `event_id` range disjoint from the live stream's; Kafka carries a smaller live stream | platform |
 | 13  | Does each messiness knob reach bronze by its path? | The [Knob paths](#knob-paths) table stands | A knob that can't reach bronze moves to a path that can, recorded here | platform |
 | 14  | Can Spark run with the repo's Python 3.13? | `python:3.13-slim` plus a Java 21 JRE and PySpark from `uv.lock`, Spark in local mode | The official Spark image with Python 3.13 added and `PYSPARK_PYTHON` pointing to it (G12) | platform |
@@ -145,7 +145,7 @@ If item 5 loses a change or leaves an offset gap, a Spark Structured Streaming j
 
 ### Delete validity
 
-With the default replica identity, a delete's `before` image holds only the primary key, and `source.ts_ms` is wall-clock time, not the simulated clock. So the generator sets `updated_at` to the simulated delete time in the same transaction as the delete, and the captured tables use `REPLICA IDENTITY FULL`, so the delete's `before` image carries that time. The Week 3 time-model ADR confirms it. A full `before` image copies every column, PII included, into Kafka and bronze on every update and delete, so INV-08's metrics mode `none` covers the nested `before.*` and `after.*` PII fields in bronze.
+With the default replica identity, a delete's `before` image holds only the primary key, and `source.ts_ms` is wall-clock time, not the simulated clock. So the generator sets `updated_at` to the simulated delete time in the same transaction as the delete, and the captured tables use `REPLICA IDENTITY FULL`, so the delete's `before` image carries that time. [ADR-004](adr-004-time-model.md) confirms both, and its derivations take a delete's time from the pair's `op=u` row. A full `before` image copies every column, PII included, into Kafka and bronze on every update and delete, so INV-08's metrics mode `none` covers the nested `before.*` and `after.*` PII fields in bronze.
 
 ### Gold publish
 
@@ -268,6 +268,6 @@ The Compose file pins each image by digest (INV-02); this table pins versions an
 
 ### Related decisions
 
-- The Week 3 time-model ADR makes item 11's ordering and validity fields final. `platform` hands the observations to `analytics-eng`, which owns SCD2.
+- [ADR-004](adr-004-time-model.md) makes item 11's ordering and validity fields final. `platform` hands the observations to `analytics-eng`, which owns SCD2.
 - ADR-002 (retention) names the snapshot-expiry and orphan-removal owner that INV-07 waits for, and sets the Kafka retention that bounds a bronze rollback. ADR-003 (erasure) builds on the credential mode item 1 picks.
 - The Week 5 bootstrap turns on OIDC and OpenFGA, reruns item 1's probe with authentication on, and adds the storage-layer checks to `just test-authz`.
