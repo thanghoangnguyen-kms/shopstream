@@ -9,6 +9,7 @@ dependencies = ["shopstream-generator"]
 
 [dependency-groups]
 dev = [
+  "hypothesis==6.168.1",
   "mypy==2.3.1",
   "prek==0.5.3",
   "pytest==9.1.1",

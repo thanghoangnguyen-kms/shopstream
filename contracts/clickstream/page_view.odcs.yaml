@@ -1,0 +1,77 @@
+apiVersion: v3.2.0
+kind: DataContract
+id: shopstream-clickstream-page-view
+name: Clickstream page view
+version: 1.0.0
+status: active
+domain: clickstream
+team:
+  name: governance
+description:
+  purpose: One event per storefront page view, as emitted to the clickstream topic.
+  limitations: Duplicates, out-of-order and late events are expected; malformed events go to the dead-letter topic.
+servers:
+  - server: local
+    type: kafka
+    host: kafka:9092
+    topic: clickstream
+    format: json
+    encoding: UTF-8
+    environment: dev
+schema:
+  - name: page_view
+    physicalName: clickstream
+    logicalType: object
+    description: A page view event.
+    properties:
+      - name: event_id
+        logicalType: string
+        logicalTypeOptions:
+          format: uuid
+        required: true
+        primaryKey: true
+        primaryKeyPosition: 1
+        description: Unique per event; a re-emitted duplicate keeps it.
+        quality:
+          - type: library
+            metric: duplicateValues
+            mustBeLessThan: 5
+            unit: percent
+            description: Duplicates stay under 5 percent of events.
+      - name: event_ts
+        logicalType: timestamp
+        required: true
+        description: Simulated UTC event time, set once, with microseconds.
+      - name: visitor_id
+        logicalType: string
+        required: true
+        classification: restricted
+        tags: [pii]
+        description: Pseudonymous visitor id; erased with its subject.
+      - name: customer_id
+        logicalType: integer
+        required: false
+        classification: restricted
+        tags: [pii]
+        description: Null when the visitor is anonymous.
+      - name: page_type
+        logicalType: string
+        required: true
+        enum:
+          - value: home
+          - value: category
+          - value: search
+          - value: product
+          - value: cart
+          - value: checkout
+        description: The kind of page viewed.
+      - name: product_id
+        logicalType: integer
+        required: false
+        description: Set only when page_type is product.
+      - name: referrer
+        logicalType: string
+        required: false
+        classification: restricted
+        tags: [pii]
+        description: Free text that can hold personal data.

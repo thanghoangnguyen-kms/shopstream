@@ -64,5 +64,10 @@ dbt-ci:
     DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt build --target ci --project-dir analytics/dbt --profiles-dir analytics/dbt
     DO_NOT_TRACK=1 uv run --frozen --project analytics/dbt dbt docs generate --target ci --static --project-dir analytics/dbt --profiles-dir analytics/dbt
 
+# Lint every ODCS data contract against its declared schema: what CI's test job runs
+contract-lint:
+    uv sync --locked --project contracts
+    for f in contracts/*/*.odcs.yaml; do uv run --frozen --project contracts datacontract lint "$f"; done
+
 # Everything CI runs, in one command: a local pass predicts a CI pass
-check: tools lint test dbt-ci secrets-scan
+check: tools lint test dbt-ci contract-lint secrets-scan

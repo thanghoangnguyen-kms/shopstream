@@ -48,6 +48,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run just test
       - run: uv run just dbt-ci
+      - run: uv run just contract-lint
 
   secrets:
     name: secrets
