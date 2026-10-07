@@ -20,12 +20,22 @@ import heapq
 from collections.abc import Iterator
 from enum import IntEnum
 
-from . import clock
+from . import clock, money
 from .config import ModelConfig
 from .ops import Op, OpKind, Table, Tick
 from .rng import StreamName
-from .state import CUSTOMER, ORDER, PAYMENT, PRODUCT, EngineState, HeapItem, OrderRec, ProductRec
-from .world import customers, orders, payments, products, updates
+from .state import (
+    CUSTOMER,
+    ORDER,
+    PAYMENT,
+    PRODUCT,
+    REVIEW,
+    EngineState,
+    HeapItem,
+    OrderRec,
+    ProductRec,
+)
+from .world import customers, orders, payments, products, reviews, updates
 
 
 class ItemKind(IntEnum):
@@ -156,6 +166,12 @@ class Engine:
             return self._order_step(a, orders.OrderStep(b), ts_us)
         if kind == ItemKind.LINE_DELETE:
             return self._delete_line(a, b, ts_us)
+        if kind == ItemKind.REFUND:
+            return self._refund(a, ts_us)
+        if kind == ItemKind.REVIEW:
+            return self._review(a, ts_us)
+        if kind == ItemKind.MODERATION:
+            return self._moderate(a, ts_us)
         raise ValueError(f"no handler for item kind {kind}")
 
     def _insert_customer(self, ts_us: int) -> Tick:
@@ -250,6 +266,13 @@ class Engine:
         self._hold(rec, paid_due, ItemKind.ORDER_STEP, orders.OrderStep.PAID)
         self._hold(rec, shipped_due, ItemKind.ORDER_STEP, orders.OrderStep.SHIPPED)
         self._hold(rec, delivered_due, ItemKind.ORDER_STEP, orders.OrderStep.DELIVERED)
+        if draws.refund:
+            self._hold(rec, delivered_due + draws.refund_after, ItemKind.REFUND)
+        if draws.review:
+            review_due = delivered_due + draws.review_after
+            self._hold(rec, review_due, ItemKind.REVIEW)
+            if draws.moderation:
+                self._hold(rec, review_due + draws.moderation_after, ItemKind.MODERATION)
 
     def _order_step(self, order_id: int, step: orders.OrderStep, ts_us: int) -> Tick:
         """Move the order to its next status; payment also inserts the capture in the same tick."""
@@ -286,3 +309,54 @@ class Engine:
         )
         self._release(rec)
         return Tick(state.tick_seq + 1, ts_us, ops)
+
+    def _refund(self, order_id: int, ts_us: int) -> Tick | None:
+        """Insert the refund payment: a share of the capture, so never more than it (D-16)."""
+        state = self.state
+        rec = state.world.orders[order_id]
+        capture = rec.capture_cents or 0
+        amount = money.half_up_div(capture * rec.refund_percent, 100)
+        tick: Tick | None = None
+        if amount > 0:
+            payment_id = state.next_ids[PAYMENT]
+            state.next_ids[PAYMENT] = payment_id + 1
+            row = payments.payment_row(payment_id, rec, payments.REFUND, amount, ts_us)
+            op = Op(Table.PAYMENTS, OpKind.INSERT, {"payment_id": payment_id}, row)
+            tick = Tick(state.tick_seq + 1, ts_us, (op,))
+        self._release(rec)
+        return tick
+
+    def _review(self, order_id: int, ts_us: int) -> Tick | None:
+        """Insert the review unless its customer is soft-deleted by now, which is a no-op."""
+        state = self.state
+        rec = state.world.orders[order_id]
+        tick: Tick | None = None
+        if state.world.customers[rec.customer_id].deleted_us is None:
+            review_id = state.next_ids[REVIEW]
+            state.next_ids[REVIEW] = review_id + 1
+            rec.review_id = review_id
+            rec.review_created_us = ts_us
+            product_id = reviews.reviewed_product_id(rec)
+            row = reviews.review_row(review_id, rec, product_id, ts_us, ts_us)
+            op = Op(Table.REVIEWS, OpKind.INSERT, {"review_id": review_id}, row)
+            tick = Tick(state.tick_seq + 1, ts_us, (op,))
+        self._release(rec)
+        return tick
+
+    def _moderate(self, order_id: int, ts_us: int) -> Tick | None:
+        """Delete the review as an update then a delete in one tick; no review is a no-op."""
+        state = self.state
+        rec = state.world.orders[order_id]
+        tick: Tick | None = None
+        if rec.review_id is not None and rec.review_created_us is not None:
+            key = {"review_id": rec.review_id}
+            row = reviews.review_row(
+                rec.review_id, rec, reviews.reviewed_product_id(rec), rec.review_created_us, ts_us
+            )
+            ops = (
+                Op(Table.REVIEWS, OpKind.UPDATE, key, row),
+                Op(Table.REVIEWS, OpKind.DELETE, key, None),
+            )
+            tick = Tick(state.tick_seq + 1, ts_us, ops)
+        self._release(rec)
+        return tick

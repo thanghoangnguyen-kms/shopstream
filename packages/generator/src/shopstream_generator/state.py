@@ -45,7 +45,8 @@ CUSTOMER = "customer"
 PRODUCT = "product"
 ORDER = "order"
 PAYMENT = "payment"
-_ID_COUNTERS = frozenset({CUSTOMER, PRODUCT, ORDER, PAYMENT})
+REVIEW = "review"
+_ID_COUNTERS = frozenset({CUSTOMER, PRODUCT, ORDER, PAYMENT, REVIEW})
 
 FORMAT = 1
 _HEAP_FIELDS = 5

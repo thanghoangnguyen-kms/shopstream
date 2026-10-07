@@ -1,6 +1,6 @@
 """Word lists and the text renderers: every generated string comes from here (D-18).
 
-Names, product text and categories come only from the committed word lists under
+Names, product text, categories and review bodies come only from the committed word lists under
 `data/words/`, picked by integer index, so the engine's state holds indices and never text.
 `WORD_LISTS` is the only way a resource is named: no code lists the folder, and a name outside
 the tuple is refused before any path is built.
@@ -96,5 +96,11 @@ def category(idx: int) -> str:
 
 
 def review_body(opener_idx: int, detail_idx: int, closer_idx: int) -> str:
-    """Stub until the GREEN commit: the three review entries joined by single spaces."""
-    raise NotImplementedError("review_body")
+    """One entry from each review list, joined by single spaces: neutral product feedback only."""
+    return " ".join(
+        (
+            words("review_openers")[opener_idx],
+            words("review_details")[detail_idx],
+            words("review_closers")[closer_idx],
+        )
+    )
