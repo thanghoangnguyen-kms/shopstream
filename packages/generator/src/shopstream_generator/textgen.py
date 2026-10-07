@@ -93,3 +93,8 @@ def product_name(adjective_idx: int, noun_idx: int) -> str:
 def category(idx: int) -> str:
     """One entry of the category list."""
     return words("categories")[idx]
+
+
+def review_body(opener_idx: int, detail_idx: int, closer_idx: int) -> str:
+    """Stub until the GREEN commit: the three review entries joined by single spaces."""
+    raise NotImplementedError("review_body")

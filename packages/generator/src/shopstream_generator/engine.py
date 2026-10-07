@@ -39,6 +39,9 @@ class ItemKind(IntEnum):
     ORDER_ARRIVAL = 6
     ORDER_STEP = 7  # `a` is the order id, `b` the OrderStep
     LINE_DELETE = 8  # `a` is the order id, `b` the index of the line
+    REFUND = 9  # `a` is the order id
+    REVIEW = 10  # `a` is the order id
+    MODERATION = 11  # `a` is the order id
 
 
 class Engine:
