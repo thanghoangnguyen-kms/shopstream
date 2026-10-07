@@ -2,7 +2,7 @@
   "business_ppm": {
     "cancel": 80000,
     "line_delete": 150000,
-    "moderation": 80000,
+    "moderation": 200000,
     "refund": 100000,
     "review": 300000
   },

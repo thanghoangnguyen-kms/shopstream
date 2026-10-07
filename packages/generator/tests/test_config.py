@@ -150,7 +150,7 @@ def test_the_golden_file_loads_to_the_golden_values() -> None:
     assert clock.render(cfg.end_us) == "2025-07-05T00:00:00.000000Z"
     assert cfg.speed == 60
     assert dataclasses.astuple(cfg.volumes) == (30, 40, 10, 2, 60, 24)
-    assert dataclasses.astuple(cfg.business_ppm) == (80_000, 150_000, 100_000, 300_000, 80_000)
+    assert dataclasses.astuple(cfg.business_ppm) == (80_000, 150_000, 100_000, 300_000, 200_000)
     # Every other value is the default's, spelled out in the file so a changed default can't move it.
     stock = default()
     for name in (
