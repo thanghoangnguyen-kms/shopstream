@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 from itertools import pairwise
 
 import pytest
 from shopstream_generator import clock
-from shopstream_generator.config import ModelConfig, Volumes
+from shopstream_generator.config import ModelConfig
 from shopstream_generator.engine import Engine, ItemKind
 from shopstream_generator.ops import Tick
 from shopstream_generator.rng import Stream, StreamName
@@ -15,8 +16,22 @@ START = clock.parse("2025-06-28T00:00:00.000000Z")
 END = clock.parse("2025-07-05T00:00:00.000000Z")
 
 
+CANARY = "test-canary"
+
+
 def config(initial: int = 0, per_day: int = 0, seed: int = 3) -> ModelConfig:
-    return ModelConfig(seed, START, END, Volumes(initial, per_day))
+    """Only customers run; every other process is off, so these tests keep their meaning."""
+    base = ModelConfig.default(canary_token=CANARY)
+    volumes = dataclasses.replace(
+        base.volumes,
+        initial_customers=initial,
+        initial_products=0,
+        customers_per_day=per_day,
+        products_per_day=0,
+        orders_per_day=0,
+        updates_per_day=0,
+    )
+    return dataclasses.replace(base, seed=seed, start_us=START, end_us=END, volumes=volumes)
 
 
 def customer_ids(ticks: list[Tick]) -> list[int]:
