@@ -29,3 +29,8 @@ def half_up_div(numerator: int, denominator: int) -> int:
     if numerator < 0 or denominator <= 0:
         raise ValueError("half_up_div needs numerator >= 0 and denominator > 0")
     return (2 * numerator + denominator) // (2 * denominator)
+
+
+def convert_cents(cents: int, factor: Decimal) -> int:
+    """Stub until the GREEN commit: `cents` times `factor`, rounded half up to a whole cent."""
+    raise NotImplementedError("convert_cents")
