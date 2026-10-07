@@ -12,11 +12,10 @@ from shopstream_generator.engine import Engine, ItemKind
 from shopstream_generator.ops import Tick
 from shopstream_generator.rng import Stream, StreamName
 
+from .strategies import CANARY
+
 START = clock.parse("2025-06-28T00:00:00.000000Z")
 END = clock.parse("2025-07-05T00:00:00.000000Z")
-
-
-CANARY = "test-canary"
 
 
 def config(initial: int = 0, per_day: int = 0, seed: int = 3) -> ModelConfig:

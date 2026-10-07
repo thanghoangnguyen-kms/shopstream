@@ -13,11 +13,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .config import ModelConfig
 from .rng import Stream, StreamName
 
 HeapItem = tuple[int, int, int, int, int]
 
 CUSTOMER = "customer"
+
+
+class StateError(ValueError):
+    """The serialized state is not one this engine can resume."""
 
 
 @dataclass
@@ -58,3 +63,10 @@ class EngineState:
             events=[],
             world=World(),
         )
+
+    def to_json(self) -> dict[str, object]:
+        raise NotImplementedError("RED stub")
+
+    @classmethod
+    def from_json(cls, data: object, config: ModelConfig) -> EngineState:
+        raise NotImplementedError("RED stub")

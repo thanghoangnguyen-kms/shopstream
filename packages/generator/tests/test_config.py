@@ -24,7 +24,8 @@ from shopstream_generator.config import (
     load,
 )
 
-CANARY = "test-canary"
+from .strategies import CANARY
+
 REPO = Path(__file__).resolve().parents[3]
 GOLDEN_CONFIG = REPO / "packages/generator/tests/golden/config.json"
 MICROS_PER_HOUR = clock.US_PER_HOUR

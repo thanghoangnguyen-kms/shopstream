@@ -50,6 +50,10 @@ class Engine:
             engine.push(config.start_us + engine._customer_gap(), ItemKind.CUSTOMER_ARRIVAL)
         return engine
 
+    @classmethod
+    def resume(cls, config: ModelConfig, data: object) -> Engine:
+        raise NotImplementedError("RED stub")
+
     def push(self, due_us: int, kind: ItemKind, a: int = 0, b: int = 0) -> None:
         """Add a CDC item; its monotonic `seq` breaks ties in push order."""
         state = self.state
