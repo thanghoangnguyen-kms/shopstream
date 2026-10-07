@@ -18,7 +18,13 @@ from importlib.resources import files
 
 from .countries import ReferenceDataError
 
-WORD_LISTS = ("first_names", "last_names")
+WORD_LISTS = (
+    "first_names",
+    "last_names",
+    "product_adjectives",
+    "product_nouns",
+    "categories",
+)
 
 
 def parse_word_list(name: str, data: bytes) -> tuple[str, ...]:
@@ -77,8 +83,10 @@ def email(first_idx: int, last_idx: int, customer_id: int, version: int) -> str:
 
 
 def product_name(adjective_idx: int, noun_idx: int) -> str:
-    raise NotImplementedError
+    """`Adjective Noun`, joined by one space."""
+    return f"{words('product_adjectives')[adjective_idx]} {words('product_nouns')[noun_idx]}"
 
 
 def category(idx: int) -> str:
-    raise NotImplementedError
+    """One entry of the category list."""
+    return words("categories")[idx]

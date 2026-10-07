@@ -122,6 +122,10 @@ def test_the_first_customer_follows_the_draw_table() -> None:
     config = golden_config()
     customers = Stream(config.seed, StreamName.CUSTOMERS)
     text = Stream(config.seed, StreamName.TEXT)
+    # The initial products take their name draws from the text stream first.
+    for _ in range(config.volumes.initial_products):
+        text.pick(len(textgen.words("product_adjectives")))
+        text.pick(len(textgen.words("product_nouns")))
     # `Engine.new` draws the first sign-up's gap before any tick runs.
     mean_gap = clock.US_PER_DAY // config.volumes.customers_per_day
     customers.between(1, 2 * mean_gap)
@@ -189,7 +193,10 @@ def test_launches_follow_the_initial_catalogue() -> None:
     config = golden_config()
     inserts = product_inserts(run_ticks(config))
     assert len(inserts) > config.volumes.initial_products
-    assert all(ts > config.start_us + config.volumes.initial_products for ts, _ in inserts[40:])
+    assert all(
+        ts > config.start_us + config.volumes.initial_products
+        for ts, _ in inserts[config.volumes.initial_products :]
+    )
 
 
 def test_every_products_row_has_exactly_the_seven_columns() -> None:

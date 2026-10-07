@@ -24,8 +24,8 @@ from . import clock
 from .config import ModelConfig
 from .ops import Op, OpKind, Table, Tick
 from .rng import StreamName
-from .state import CUSTOMER, EngineState
-from .world import customers
+from .state import CUSTOMER, PRODUCT, EngineState
+from .world import customers, products
 
 
 class ItemKind(IntEnum):
@@ -34,33 +34,47 @@ class ItemKind(IntEnum):
     INITIAL_PRODUCT = 1
     INITIAL_CUSTOMER = 2
     CUSTOMER_ARRIVAL = 3
+    PRODUCT_ARRIVAL = 4
 
 
 class Engine:
     def __init__(self, config: ModelConfig, state: EngineState) -> None:
         self.config = config
         self.state = state
-        # Derived, never serialized: ascending ids of the live customers, rebuilt from the
-        # records here and kept up to date on insert (and, from a later plan, soft delete).
+        # Derived, never serialized: ascending ids of the live customers and products, rebuilt
+        # from the records here and kept up to date on insert (and, from a later plan, soft
+        # delete). The kill/resume property proves the rebuild.
         self.live_customers: list[int] = sorted(
             record.customer_id
             for record in state.world.customers.values()
             if record.deleted_us is None
         )
+        self.live_products: list[int] = sorted(
+            record.product_id
+            for record in state.world.products.values()
+            if record.deleted_us is None
+        )
 
     @classmethod
     def new(cls, config: ModelConfig) -> Engine:
-        """A fresh engine with its initial customers and the first sign-up scheduled (D-14).
+        """A fresh engine: the initial catalogue, the initial customers, then the first arrivals.
 
-        The catalogue comes first: the initial customers follow the initial products, one
-        microsecond apart, and the first tick of the range is at or after its start.
+        The world starts empty at t0 and the catalogue comes first (D-14): the initial products
+        are due 1 microsecond apart from the range start, the initial customers follow them, and
+        the first sign-up and product launch are one drawn gap after the start. A zero rate
+        draws no gap and schedules nothing.
         """
         engine = cls(config, EngineState.new(config))
-        first_customer_us = config.start_us + config.volumes.initial_products
-        for index in range(config.volumes.initial_customers):
+        volumes = config.volumes
+        for index in range(volumes.initial_products):
+            engine.push(config.start_us + index, ItemKind.INITIAL_PRODUCT)
+        first_customer_us = config.start_us + volumes.initial_products
+        for index in range(volumes.initial_customers):
             engine.push(first_customer_us + index, ItemKind.INITIAL_CUSTOMER)
-        if config.volumes.customers_per_day > 0:
+        if volumes.customers_per_day > 0:
             engine.push(config.start_us + engine._customer_gap(), ItemKind.CUSTOMER_ARRIVAL)
+        if volumes.products_per_day > 0:
+            engine.push(config.start_us + engine._product_gap(), ItemKind.PRODUCT_ARRIVAL)
         return engine
 
     @classmethod
@@ -79,6 +93,11 @@ class Engine:
         mean_gap_us = clock.US_PER_DAY // self.config.volumes.customers_per_day
         return self.state.streams[StreamName.CUSTOMERS].between(1, 2 * mean_gap_us)
 
+    def _product_gap(self) -> int:
+        """A uniform gap in [1, 2 * mean] microseconds from the products stream (D-03)."""
+        mean_gap_us = clock.US_PER_DAY // self.config.volumes.products_per_day
+        return self.state.streams[StreamName.PRODUCTS].between(1, 2 * mean_gap_us)
+
     def run_until(self, until_us: int) -> Iterator[Tick]:
         """Yield every tick whose timestamp is before `until_us`, in order."""
         state = self.state
@@ -95,8 +114,13 @@ class Engine:
                 yield tick
 
     def _dispatch(self, kind: int, due_us: int, ts_us: int) -> Tick | None:
+        if kind == ItemKind.INITIAL_PRODUCT:
+            return self._insert_product(ts_us)
         if kind == ItemKind.INITIAL_CUSTOMER:
             return self._insert_customer(ts_us)
+        if kind == ItemKind.PRODUCT_ARRIVAL:
+            self.push(due_us + self._product_gap(), ItemKind.PRODUCT_ARRIVAL)
+            return self._insert_product(ts_us)
         if kind == ItemKind.CUSTOMER_ARRIVAL:
             self.push(due_us + self._customer_gap(), ItemKind.CUSTOMER_ARRIVAL)
             return self._insert_customer(ts_us)
@@ -115,5 +139,21 @@ class Engine:
             OpKind.INSERT,
             {"customer_id": customer_id},
             customers.row(record, ts_us),
+        )
+        return Tick(state.tick_seq + 1, ts_us, (op,))
+
+    def _insert_product(self, ts_us: int) -> Tick:
+        state = self.state
+        draws = products.draw_new_product(state.streams, self.config.prices)
+        product_id = state.next_ids[PRODUCT]
+        state.next_ids[PRODUCT] = product_id + 1
+        record = products.new_record(product_id, ts_us, draws)
+        state.world.products[product_id] = record
+        self.live_products.append(product_id)
+        op = Op(
+            Table.PRODUCTS,
+            OpKind.INSERT,
+            {"product_id": product_id},
+            products.row(record, ts_us),
         )
         return Tick(state.tick_seq + 1, ts_us, (op,))

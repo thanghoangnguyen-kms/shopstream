@@ -41,6 +41,7 @@ from .rng import Stream, StreamName
 HeapItem = tuple[int, int, int, int, int]
 
 CUSTOMER = "customer"
+PRODUCT = "product"
 
 FORMAT = 1
 _HEAP_FIELDS = 5
@@ -71,10 +72,24 @@ class CustomerRec:
 
 
 @dataclass
+class ProductRec:
+    """A product as ints and None; the price is integer euro cents (D-10)."""
+
+    product_id: int
+    created_us: int
+    deleted_us: int | None
+    adjective_idx: int
+    noun_idx: int
+    category_idx: int
+    list_price_cents: int
+
+
+@dataclass
 class World:
     """The live business: ids and integers only."""
 
     customers: dict[int, CustomerRec] = field(default_factory=dict)
+    products: dict[int, ProductRec] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,7 +112,7 @@ class EngineState:
             last_ts_us=config.start_us - 1,
             tick_seq=0,
             heap_seq=0,
-            next_ids={CUSTOMER: 1},
+            next_ids={CUSTOMER: 1, PRODUCT: 1},
             streams={name: Stream(config.seed, name) for name in StreamName},
             cdc=[],
             events=[],
@@ -138,6 +153,8 @@ class EngineState:
         if meta["model_sha256"] != config.model_sha256():
             raise StateError("meta.model_sha256: the state belongs to a different model")
         ids = _section_any(meta["next_ids"], "meta.next_ids")
+        if set(ids) != {CUSTOMER, PRODUCT}:
+            raise StateError(f"meta.next_ids: expected exactly the keys {CUSTOMER}, {PRODUCT}")
         next_ids = {name: _int(value, f"meta.next_ids.{name}") for name, value in ids.items()}
         rng = _section(top["rng"], "rng", {name.value for name in StreamName})
         streams: dict[StreamName, Stream] = {}

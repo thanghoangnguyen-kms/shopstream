@@ -193,6 +193,14 @@ def float_counter(parsed: dict[str, Any]) -> None:
     parsed["meta"]["tick_seq"] = 2.0
 
 
+def missing_id_counter(parsed: dict[str, Any]) -> None:
+    del parsed["meta"]["next_ids"]["product"]
+
+
+def unknown_id_counter(parsed: dict[str, Any]) -> None:
+    parsed["meta"]["next_ids"]["ghost"] = 1
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -210,6 +218,8 @@ def float_counter(parsed: dict[str, Any]) -> None:
         short_mt,
         missing_stream,
         float_counter,
+        missing_id_counter,
+        unknown_id_counter,
     ],
 )
 def test_a_malformed_state_raises_state_error_and_never_echoes_a_value(change: Any) -> None:
