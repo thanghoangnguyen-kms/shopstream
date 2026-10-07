@@ -1,11 +1,157 @@
 {
+  "business_ppm": {
+    "cancel": 80000,
+    "line_delete": 150000,
+    "moderation": 80000,
+    "refund": 100000,
+    "review": 300000
+  },
+  "canary_token": "test-canary",
+  "horizons_us": {
+    "edit_horizon": 259200000000,
+    "late_order_max": 86400000000,
+    "late_product_max": 600000000
+  },
+  "knobs": {
+    "beyond_watermark_max_delay_us": 3600000000,
+    "beyond_watermark_min_delay_us": 900000000,
+    "beyond_watermark_ppm": 5000,
+    "canary_customers": 1,
+    "duplicate_ppm": 20000,
+    "hot_customer_share_ppm": 200000,
+    "hot_product_share_ppm": 200000,
+    "injection_reviews": 1,
+    "late_order_ppm": 20000,
+    "late_product_ppm": 10000,
+    "malformed_ppm": 5000,
+    "out_of_order_max_delay_us": 90000000,
+    "out_of_order_ppm": 10000,
+    "schema_drift_at": "2025-07-01T00:00:00.000000Z"
+  },
+  "lifecycle_us": {
+    "deliver_after_ship": [
+      3600000000,
+      57600000000
+    ],
+    "moderation_after_review": [
+      3600000000,
+      259200000000
+    ],
+    "pay_after": [
+      1000000,
+      43200000000
+    ],
+    "refund_after_delivery": [
+      3600000000,
+      259200000000
+    ],
+    "review_after_delivery": [
+      3600000000,
+      259200000000
+    ],
+    "ship_after_pay": [
+      3600000000,
+      64800000000
+    ]
+  },
+  "orders": {
+    "discount_percent_weights": [
+      [
+        0,
+        60
+      ],
+      [
+        5,
+        15
+      ],
+      [
+        10,
+        12
+      ],
+      [
+        15,
+        8
+      ],
+      [
+        20,
+        5
+      ]
+    ],
+    "max_lines": 4,
+    "max_quantity": 3
+  },
+  "payments": {
+    "method_weights": {
+      "bank_transfer": 1,
+      "card": 6,
+      "gift_card": 1,
+      "paypal": 2
+    },
+    "refund_percent_weights": [
+      [
+        25,
+        1
+      ],
+      [
+        50,
+        1
+      ],
+      [
+        100,
+        2
+      ]
+    ]
+  },
+  "prices": {
+    "list_price_max_cents": 50000,
+    "list_price_min_cents": 500
+  },
   "range": {
     "end": "2025-07-05T00:00:00.000000Z",
     "start": "2025-06-28T00:00:00.000000Z"
   },
+  "reviews": {
+    "rating_weights": [
+      [
+        1,
+        1
+      ],
+      [
+        2,
+        1
+      ],
+      [
+        3,
+        2
+      ],
+      [
+        4,
+        4
+      ],
+      [
+        5,
+        6
+      ]
+    ]
+  },
   "seed": 3,
+  "speed": 60,
+  "update_kind_weights": {
+    "customer_email": 3,
+    "customer_move": 3,
+    "customer_name": 3,
+    "customer_soft_delete": 1,
+    "product_category": 2,
+    "product_discontinue": 1,
+    "product_name": 2,
+    "product_price": 2
+  },
   "volumes": {
     "customers_per_day": 10,
-    "initial_customers": 30
+    "initial_customers": 30,
+    "initial_products": 40,
+    "orders_per_day": 60,
+    "products_per_day": 2,
+    "updates_per_day": 24
   }
 }
