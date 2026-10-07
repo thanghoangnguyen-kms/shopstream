@@ -25,7 +25,7 @@ from .config import ModelConfig
 from .ops import Op, OpKind, Table, Tick
 from .rng import StreamName
 from .state import CUSTOMER, PRODUCT, EngineState
-from .world import customers, products
+from .world import customers, products, updates
 
 
 class ItemKind(IntEnum):
@@ -35,6 +35,7 @@ class ItemKind(IntEnum):
     INITIAL_CUSTOMER = 2
     CUSTOMER_ARRIVAL = 3
     PRODUCT_ARRIVAL = 4
+    UPDATE_ARRIVAL = 5
 
 
 class Engine:
@@ -42,8 +43,8 @@ class Engine:
         self.config = config
         self.state = state
         # Derived, never serialized: ascending ids of the live customers and products, rebuilt
-        # from the records here and kept up to date on insert (and, from a later plan, soft
-        # delete). The kill/resume property proves the rebuild.
+        # from the records here and kept up to date on insert, soft delete and discontinuation.
+        # The kill/resume property proves the rebuild.
         self.live_customers: list[int] = sorted(
             record.customer_id
             for record in state.world.customers.values()
@@ -61,8 +62,8 @@ class Engine:
 
         The world starts empty at t0 and the catalogue comes first (D-14): the initial products
         are due 1 microsecond apart from the range start, the initial customers follow them, and
-        the first sign-up and product launch are one drawn gap after the start. A zero rate
-        draws no gap and schedules nothing.
+        the first sign-up, product launch and update are one drawn gap after the start. A zero
+        rate draws no gap and schedules nothing.
         """
         engine = cls(config, EngineState.new(config))
         volumes = config.volumes
@@ -75,6 +76,8 @@ class Engine:
             engine.push(config.start_us + engine._customer_gap(), ItemKind.CUSTOMER_ARRIVAL)
         if volumes.products_per_day > 0:
             engine.push(config.start_us + engine._product_gap(), ItemKind.PRODUCT_ARRIVAL)
+        if volumes.updates_per_day > 0:
+            engine.push(config.start_us + engine._update_gap(), ItemKind.UPDATE_ARRIVAL)
         return engine
 
     @classmethod
@@ -97,6 +100,11 @@ class Engine:
         """A uniform gap in [1, 2 * mean] microseconds from the products stream (D-03)."""
         mean_gap_us = clock.US_PER_DAY // self.config.volumes.products_per_day
         return self.state.streams[StreamName.PRODUCTS].between(1, 2 * mean_gap_us)
+
+    def _update_gap(self) -> int:
+        """A uniform gap in [1, 2 * mean] microseconds from the lifecycle stream (D-03)."""
+        mean_gap_us = clock.US_PER_DAY // self.config.volumes.updates_per_day
+        return self.state.streams[StreamName.LIFECYCLE].between(1, 2 * mean_gap_us)
 
     def run_until(self, until_us: int) -> Iterator[Tick]:
         """Yield every tick whose timestamp is before `until_us`, in order."""
@@ -124,6 +132,9 @@ class Engine:
         if kind == ItemKind.CUSTOMER_ARRIVAL:
             self.push(due_us + self._customer_gap(), ItemKind.CUSTOMER_ARRIVAL)
             return self._insert_customer(ts_us)
+        if kind == ItemKind.UPDATE_ARRIVAL:
+            self.push(due_us + self._update_gap(), ItemKind.UPDATE_ARRIVAL)
+            return self._apply_update(ts_us)
         raise ValueError(f"no handler for item kind {kind}")
 
     def _insert_customer(self, ts_us: int) -> Tick:
@@ -156,4 +167,15 @@ class Engine:
             {"product_id": product_id},
             products.row(record, ts_us),
         )
+        return Tick(state.tick_seq + 1, ts_us, (op,))
+
+    def _apply_update(self, ts_us: int) -> Tick | None:
+        """Draw every update number, then apply it; a missing target is a no-op, not a tick."""
+        state = self.state
+        draws = updates.draw_update(
+            state.streams, self.config, len(self.live_customers), len(self.live_products)
+        )
+        op = updates.apply_update(state, self.live_customers, self.live_products, ts_us, draws)
+        if op is None:
+            return None
         return Tick(state.tick_seq + 1, ts_us, (op,))

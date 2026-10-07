@@ -27,6 +27,7 @@ from .strategies import CANARY, START, tiny_configs
 CUSTOMER_KINDS = (1, 1, 1, 1, 0, 0, 0, 0)
 PRODUCT_KINDS = (0, 0, 0, 0, 1, 1, 1, 1)
 TS = START + 5_000_000
+BEFORE_US = TS - 1_000_000
 
 CUSTOMER_GROUPS = {
     "move": {"city", "country"},
@@ -326,7 +327,7 @@ def changed_columns(before: Mapping[str, object], after: Mapping[str, object]) -
 
 def test_a_move_changes_city_and_country_together_and_nothing_else() -> None:
     state, live_c, live_p = small_world()
-    before = customers.row(state.world.customers[2], TS)
+    before = customers.row(state.world.customers[2], BEFORE_US)
     cities = countries.countries()[1].cities
     op = updates.apply_update(
         state,
@@ -347,7 +348,7 @@ def test_a_move_changes_city_and_country_together_and_nothing_else() -> None:
 def test_an_email_edit_changes_only_the_email_and_bumps_its_version() -> None:
     state, live_c, live_p = small_world()
     state.world.customers[2] = customer_rec(2, first_idx=3, last_idx=4)
-    before = customers.row(state.world.customers[2], TS)
+    before = customers.row(state.world.customers[2], BEFORE_US)
     op = updates.apply_update(state, live_c, live_p, TS, draws_for(UpdateKind.CUSTOMER_EMAIL))
     assert op is not None
     assert changed_columns(before, row_of(op)) == {"email", "updated_at"}
@@ -357,7 +358,7 @@ def test_an_email_edit_changes_only_the_email_and_bumps_its_version() -> None:
 
 def test_a_name_edit_changes_only_the_full_name() -> None:
     state, live_c, live_p = small_world()
-    before = customers.row(state.world.customers[2], TS)
+    before = customers.row(state.world.customers[2], BEFORE_US)
     op = updates.apply_update(
         state, live_c, live_p, TS, draws_for(UpdateKind.CUSTOMER_NAME, first_idx=5, last_idx=6)
     )
@@ -368,7 +369,7 @@ def test_a_name_edit_changes_only_the_full_name() -> None:
 
 def test_a_soft_delete_sets_deleted_at_to_the_tick_and_leaves_the_live_list() -> None:
     state, live_c, live_p = small_world()
-    before = customers.row(state.world.customers[2], TS)
+    before = customers.row(state.world.customers[2], BEFORE_US)
     op = updates.apply_update(state, live_c, live_p, TS, draws_for(UpdateKind.CUSTOMER_SOFT_DELETE))
     assert op is not None
     assert changed_columns(before, row_of(op)) == {"deleted_at", "updated_at"}
@@ -386,7 +387,7 @@ def test_product_edits_change_one_column_each() -> None:
     }
     for kind, (column, overrides) in expected.items():
         state, live_c, live_p = small_world()
-        before = products.row(state.world.products[2], TS)
+        before = products.row(state.world.products[2], BEFORE_US)
         op = updates.apply_update(state, live_c, live_p, TS, draws_for(kind, **overrides))
         assert op is not None, kind
         assert (op.table, dict(op.key)) == (Table.PRODUCTS, {"product_id": 2}), kind
