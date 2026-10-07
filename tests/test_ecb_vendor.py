@@ -132,7 +132,7 @@ def test_the_json_checksum_covers_the_canonical_quotes() -> None:
         document["quotes"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
     assert document["meta"]["sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
-    assert document["meta"]["count"] == "30"
+    assert document["meta"]["count"] == 30
     assert document["meta"]["date"] == D3
     assert document["meta"]["cut"] == "2026-10-02"
     assert document["meta"]["fetched"] == "2026-10-07"
@@ -178,6 +178,18 @@ def test_rows_after_the_cut_are_dropped_first() -> None:
 def test_a_row_dated_on_the_cut_is_kept() -> None:
     built = ecb_vendor.build(day_rows("2026-10-02"), date(2026, 10, 7))
     assert json.loads(built.latest_json)["meta"]["date"] == "2026-10-02"
+
+
+def test_a_row_before_the_window_is_refused() -> None:
+    rows = [*three_days(), row("2024-11-29", "USD", "1.0563")]
+    with pytest.raises(ecb_vendor.VendorError, match="window"):
+        ecb_vendor.build(rows, date(2026, 10, 7))
+
+
+def test_eur_must_be_one_on_every_publication() -> None:
+    rows = [*three_days(), row("2025-01-07", "EUR", "1.01")]
+    with pytest.raises(ecb_vendor.VendorError, match="EUR"):
+        ecb_vendor.build(rows, date(2026, 10, 7))
 
 
 def test_a_base_other_than_eur_is_refused() -> None:

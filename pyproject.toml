@@ -81,6 +81,8 @@ ignore = ["E501"]
 "scripts/gold_switch_probe.py" = ["S608"]
 # Origin-allowlisted Frankfurter GETs (S310), the container's /tmp tmpfs (S108), and SQL over the loader's own table (S608).
 "scripts/fx_load.py" = ["S108", "S310", "S608"]
+# Origin-allowlisted Frankfurter GETs through fx_load.check_url (S310).
+"scripts/ecb_vendor.py" = ["S310"]
 # urllib calls to the origin-allowlisted in-network Connect and Karapace only (S310); SECRET_KEY holds the env var's name, not a secret (S105).
 "scripts/connect_admin.py" = ["S105", "S310"]
 # SQL built from the script's constant table names through identifier(); values are parameters.
