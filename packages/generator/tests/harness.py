@@ -9,14 +9,30 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from shopstream_generator import canon
 from shopstream_generator.config import ModelConfig
 from shopstream_generator.engine import Engine
-from shopstream_generator.manifest import StreamHasher
+from shopstream_generator.manifest import Manifest, StreamHasher
 from shopstream_generator.ops import STREAMS, Tick
+from shopstream_generator.sinks.memory import MemoryCdcSink
 
 Signature = list[tuple[int, int, list[bytes]]]
+
+
+@dataclass(frozen=True)
+class World:
+    """A finished run: its ticks, every stream's canonical lines, its manifest and its sink."""
+
+    ticks: list[Tick]
+    lines: dict[str, list[bytes]]
+    manifest: Manifest
+    sink: MemoryCdcSink
+
+
+def run_world(config: ModelConfig, until: int | None = None) -> World:
+    raise NotImplementedError
 
 
 def run_ticks(config: ModelConfig, until: int | None = None) -> list[Tick]:
