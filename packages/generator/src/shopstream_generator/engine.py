@@ -43,7 +43,7 @@ class Engine:
     @classmethod
     def new(cls, config: ModelConfig) -> Engine:
         """A fresh engine with its initial customers and the first sign-up scheduled (D-14)."""
-        engine = cls(config, EngineState.new(config.seed, config.start_us))
+        engine = cls(config, EngineState.new(config))
         for index in range(config.volumes.initial_customers):
             engine.push(config.start_us + index, ItemKind.INITIAL_CUSTOMER)
         if config.volumes.customers_per_day > 0:
@@ -52,7 +52,8 @@ class Engine:
 
     @classmethod
     def resume(cls, config: ModelConfig, data: object) -> Engine:
-        raise NotImplementedError("RED stub")
+        """An engine over a serialized state; raises StateError for another model's state (D-24)."""
+        return cls(config, EngineState.from_json(data, config))
 
     def push(self, due_us: int, kind: ItemKind, a: int = 0, b: int = 0) -> None:
         """Add a CDC item; its monotonic `seq` breaks ties in push order."""

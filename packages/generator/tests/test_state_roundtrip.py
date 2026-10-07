@@ -55,7 +55,9 @@ def leaves(obj: object) -> list[object]:
 @given(config=tiny_configs(), data=st.data())
 def test_state_round_trips_through_json_text(config: ModelConfig, data: st.DataObject) -> None:
     state = killed_at(config, data).state
-    restored = EngineState.from_json(through_text(state), config)
+    parsed = through_text(state)
+    assert parsed["cdc"] == sorted(parsed["cdc"])
+    restored = EngineState.from_json(parsed, config)
     assert restored.to_json() == state.to_json()
     for name in StreamName:
         assert restored.streams[name].words == state.streams[name].words
