@@ -72,3 +72,25 @@ def test_the_country_table_loads_through_importlib_resources() -> None:
     assert data.startswith(b"country,currency,weight,cities\n")
     assert countries.countries() == countries.parse_countries(data.decode("ascii"))
     assert len(countries.country_weights()) == len(countries.countries())
+
+
+@pytest.mark.parametrize(("name", "at_least"), [("product_adjectives", 25), ("product_nouns", 25)])
+def test_the_product_lists_are_capitalised_letters_only_and_long_enough(
+    name: str, at_least: int
+) -> None:
+    entries = textgen.words(name)
+    assert len(entries) >= at_least
+    assert all(NAME_ONLY_LETTERS.fullmatch(entry) for entry in entries)
+
+
+def test_there_are_eight_single_entry_categories() -> None:
+    entries = textgen.words("categories")
+    assert len(entries) == 8
+    assert all(entry.isascii() and entry == entry.strip() and entry for entry in entries)
+
+
+def test_a_product_name_is_an_adjective_and_a_noun_joined_by_one_space() -> None:
+    adjectives, nouns = textgen.words("product_adjectives"), textgen.words("product_nouns")
+    assert textgen.product_name(0, 0) == f"{adjectives[0]} {nouns[0]}"
+    assert textgen.product_name(len(adjectives) - 1, len(nouns) - 1).count(" ") == 1
+    assert textgen.category(3) == textgen.words("categories")[3]

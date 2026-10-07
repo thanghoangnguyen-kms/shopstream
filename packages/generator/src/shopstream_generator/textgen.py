@@ -74,3 +74,11 @@ def email(first_idx: int, last_idx: int, customer_id: int, version: int) -> str:
     if version:
         local = f"{local}.{version}"
     return f"{local.lower()}@example.com"
+
+
+def product_name(adjective_idx: int, noun_idx: int) -> str:
+    raise NotImplementedError
+
+
+def category(idx: int) -> str:
+    raise NotImplementedError
