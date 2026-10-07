@@ -15,6 +15,10 @@ tools:
 test: tools
     uv run pytest
 
+# Write the committed determinism manifest (a count and a SHA-256 per stream) and print the run hash
+generator-golden:
+    uv run python -m shopstream_generator.golden --config packages/generator/tests/golden/config.json --out packages/generator/tests/golden/manifest.json
+
 # One-time setup after cloning: sync the venv, install gitleaks, install the git hooks
 setup:
     uv sync --locked

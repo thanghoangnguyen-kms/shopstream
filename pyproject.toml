@@ -127,7 +127,9 @@ ignore = ["E501"]
 python_version = "3.13"
 strict = true
 files = ["packages", "scripts", "tests"]
-mypy_path = ["scripts"]
+mypy_path = ["scripts", "packages/generator/src"]
+# Without this, the generator src files get two module names: one from the crawl, one from the editable install.
+explicit_package_bases = true
 
 # The spike probe clients and readers (uv group `spike`) and PySpark (uv group `spark`) ship no
 # stubs and are not installed in CI.

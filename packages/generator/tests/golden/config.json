@@ -1,0 +1,11 @@
+{
+  "range": {
+    "end": "2025-07-05T00:00:00.000000Z",
+    "start": "2025-06-28T00:00:00.000000Z"
+  },
+  "seed": 3,
+  "volumes": {
+    "customers_per_day": 10,
+    "initial_customers": 30
+  }
+}
