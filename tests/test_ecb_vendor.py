@@ -352,6 +352,54 @@ def test_fetch_refuses_an_incomplete_backfill(monkeypatch: pytest.MonkeyPatch) -
     assert seen == [ecb_vendor.CUT]
 
 
+def stale_check(*, start: str, end: str, missed: object) -> dict[str, object]:
+    """providers_check's answer for a volume that is only stale against the wall clock."""
+    return {
+        "complete": False,
+        "reason": f"publishes_missed is {missed}",
+        "ecb": {"start_date": start, "end_date": end, "publishes_missed": missed},
+    }
+
+
+FROZEN_START = fx_load.FIRST_ECB_DATE.isoformat()
+
+
+def test_a_volume_frozen_at_the_cut_is_not_stale_for_the_fetch() -> None:
+    """publishes_missed counts publish days after end_date up to the wall clock, so a volume
+    seeded on the cut reads 2 five days later; coverage ending exactly at the cut is complete."""
+    check = stale_check(start=FROZEN_START, end="2026-10-02", missed=2)
+    assert ecb_vendor.frozen_at_cut(check, today=date(2026, 10, 7))
+    assert ecb_vendor.frozen_at_cut(check, today=date(2026, 10, 4))  # 2 <= 2 calendar days
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        stale_check(start=FROZEN_START, end="2026-10-01", missed=2),  # data stops before the cut
+        stale_check(start=FROZEN_START, end="2026-10-05", missed=0),  # data runs past the cut
+        stale_check(
+            start="2000-01-03", end="2026-10-02", missed=2
+        ),  # history does not start in 1999
+        stale_check(start=FROZEN_START, end="2026-10-02", missed=None),  # no count at all
+        stale_check(start=FROZEN_START, end="2026-10-02", missed=-1),
+        stale_check(start=FROZEN_START, end="2026-10-02", missed=9),  # more than calendar days
+        {"complete": False, "reason": "no ECB entry in /v2/providers", "ecb": None},
+    ],
+)
+def test_only_staleness_against_the_wall_clock_is_excused(check: dict[str, object]) -> None:
+    assert not ecb_vendor.frozen_at_cut(check, today=date(2026, 10, 7))
+
+
+def test_fetch_accepts_a_volume_frozen_at_the_cut(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        fx_load,
+        "providers_check",
+        lambda today=None: stale_check(start=FROZEN_START, end="2026-10-02", missed=2),
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout: FakeResponse(b"[]"))
+    assert ecb_vendor.fetch() == []
+
+
 def test_fetch_asks_one_range_per_year_and_keeps_only_rows_inside_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -211,10 +211,34 @@ def build(rows: Sequence[Mapping[str, str]], fetched: date) -> Vendored:
     return Vendored(rates_csv, latest_json, stats)
 
 
+def frozen_at_cut(check: Mapping[str, object], today: date | None = None) -> bool:
+    """True when providers_check failed only on Frankfurter's wall-clock staleness count.
+
+    `publishes_missed` counts the publish days after the volume's end_date up to the real date
+    (Frankfurter's `Provider#publishes_missed(reference_date: Date.today)`), so a volume seeded on
+    the cut reads 2 five days later although it holds every publication up to the cut. This
+    accepts that count only when coverage is exactly the window: history from 1999-01-04, end_date
+    the cut, and a non-negative integer no larger than the calendar days since the cut. Whether
+    every publication inside the window is present is proved by `build` and by P7's coverage test.
+    """
+    entry = check.get("ecb")
+    if not isinstance(entry, Mapping):
+        return False
+    missed = entry.get("publishes_missed")
+    since_cut = ((today or date.today()) - CUT).days
+    return (
+        entry.get("start_date") == fx_load.FIRST_ECB_DATE.isoformat()
+        and entry.get("end_date") == CUT.isoformat()
+        and isinstance(missed, int)
+        and not isinstance(missed, bool)
+        and 0 <= missed <= since_cut
+    )
+
+
 def fetch() -> list[dict[str, str]]:
     """Container side: the ECB rows of the window, read through the offline service."""
     check = fx_load.providers_check(today=CUT)
-    if not check["complete"]:
+    if not check["complete"] and not frozen_at_cut(check):
         raise VendorError(f"the Frankfurter backfill is not complete: {check.get('reason')}")
     base = fx_load.base_url()
     rows: list[dict[str, str]] = []
