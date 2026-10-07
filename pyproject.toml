@@ -9,6 +9,7 @@ dependencies = ["shopstream-generator"]
 
 [dependency-groups]
 dev = [
+  "hypothesis==6.168.1",
   "mypy==2.3.1",
   "prek==0.5.3",
   "pytest==9.1.1",
@@ -51,11 +52,13 @@ target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PT"]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PT", "TID251"]
 # The formatter owns line length; E501 would only flag long strings it can't wrap.
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+# The generator-only bans (TID251) apply nowhere else: the spike scripts read the clock on purpose.
+"!packages/generator/**" = ["TID251"]
 "tests/**" = ["S101", "S603", "S607"]
 "packages/*/tests/**" = ["S101", "S603", "S607"]
 # REPO_TOKEN and HOME_TOKEN hold the <repo> and <home> placeholders, not secrets.
@@ -78,6 +81,8 @@ ignore = ["E501"]
 "scripts/gold_switch_probe.py" = ["S608"]
 # Origin-allowlisted Frankfurter GETs (S310), the container's /tmp tmpfs (S108), and SQL over the loader's own table (S608).
 "scripts/fx_load.py" = ["S108", "S310", "S608"]
+# Origin-allowlisted Frankfurter GETs through fx_load.check_url (S310).
+"scripts/ecb_vendor.py" = ["S310"]
 # urllib calls to the origin-allowlisted in-network Connect and Karapace only (S310); SECRET_KEY holds the env var's name, not a secret (S105).
 "scripts/connect_admin.py" = ["S105", "S310"]
 # SQL built from the script's constant table names through identifier(); values are parameters.
@@ -101,11 +106,32 @@ ignore = ["E501"]
 # SQL built from the script's constant table and column names; the canary is a bound parameter (S608).
 "scripts/throughput_check.py" = ["S608"]
 
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.now".msg = "Wall-clock read: use the simulated clock (ADR-004 C1)."
+"datetime.datetime.utcnow".msg = "Wall-clock read: use the simulated clock (ADR-004 C1)."
+"datetime.date.today".msg = "Wall-clock read: use the simulated clock (ADR-004 C1)."
+"time.time".msg = "Wall-clock read: use the simulated clock (ADR-004 C1)."
+"uuid.uuid4".msg = "Unseeded: use uuid.UUID(int=rng.getrandbits(128), version=4)."
+"random.random".msg = "Module-level RNG: take a stream from rng.py."
+"random.randrange".msg = "Module-level RNG: take a stream from rng.py."
+"random.randint".msg = "Module-level RNG: take a stream from rng.py."
+"random.choice".msg = "Module-level RNG: take a stream from rng.py."
+"random.choices".msg = "Module-level RNG: take a stream from rng.py."
+"random.shuffle".msg = "Module-level RNG: take a stream from rng.py."
+"random.sample".msg = "Module-level RNG: take a stream from rng.py."
+"random.uniform".msg = "Module-level RNG: take a stream from rng.py."
+"random.getrandbits".msg = "Module-level RNG: take a stream from rng.py."
+"random.seed".msg = "Module-level RNG: take a stream from rng.py."
+"random.gauss".msg = "Module-level RNG: take a stream from rng.py."
+"random.expovariate".msg = "Module-level RNG: take a stream from rng.py."
+
 [tool.mypy]
 python_version = "3.13"
 strict = true
 files = ["packages", "scripts", "tests"]
-mypy_path = ["scripts"]
+mypy_path = ["scripts", "packages/generator/src"]
+# Without this, the generator src files get two module names: one from the crawl, one from the editable install.
+explicit_package_bases = true
 
 # The spike probe clients and readers (uv group `spike`) and PySpark (uv group `spark`) ship no
 # stubs and are not installed in CI.

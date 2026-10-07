@@ -1,0 +1,114 @@
+"""Shared run helpers for P12 and the later property suite.
+
+Every helper drives a real `Engine`, commits each tick to a `MemoryCdcSink` as the engine yields
+it, and returns plain data, so every P12 example is checked like Postgres would check it and a
+defect raises `CdcViolation` at the tick that caused it.
+
+`run_resumed` serializes the engine through JSON *text* and reads it back, never a shared object,
+so it proves the text form and not just that two references agree. Its sink is one object for both
+legs: the sink stands for Postgres, which outlives a generator kill, so the resumed engine's first
+tick is judged against the tables the first leg left behind (the seq, the clock and every key).
+The uninterrupted run is fully checked either way.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+
+from shopstream_generator import canon
+from shopstream_generator.config import ModelConfig
+from shopstream_generator.engine import Engine
+from shopstream_generator.manifest import Manifest, StreamHasher
+from shopstream_generator.ops import STREAMS, Tick
+from shopstream_generator.sinks.memory import MemoryCdcSink
+
+Signature = list[tuple[int, int, list[bytes]]]
+
+
+@dataclass(frozen=True)
+class World:
+    """A finished run: its ticks, every stream's canonical lines, its manifest and its sink."""
+
+    ticks: list[Tick]
+    lines: dict[str, list[bytes]]
+    manifest: Manifest
+    sink: MemoryCdcSink
+
+
+def commit_all(sink: MemoryCdcSink, ticks: Iterable[Tick]) -> list[Tick]:
+    """Commit each tick to `sink` as it is yielded, and return them all."""
+    committed: list[Tick] = []
+    for tick in ticks:
+        sink.commit(tick)
+        committed.append(tick)
+    return committed
+
+
+def run_world(config: ModelConfig, until: int | None = None) -> World:
+    """A run of `[start, until)` through the sink and the hasher, with everything it produced."""
+    sink = MemoryCdcSink()
+    hasher = StreamHasher(keep_lines=True)
+    ticks = commit_all(
+        sink, Engine.new(config).run_until(config.end_us if until is None else until)
+    )
+    for tick in ticks:
+        hasher.add_tick(tick)
+    lines = {name: hasher.lines(name) for name in STREAMS}
+    return World(ticks, lines, hasher.manifest(config.config_sha256()), sink)
+
+
+def run_ticks(config: ModelConfig, until: int | None = None) -> list[Tick]:
+    """Every tick of `[start, until)`; `until` defaults to the range end."""
+    engine = Engine.new(config)
+    return commit_all(MemoryCdcSink(), engine.run_until(config.end_us if until is None else until))
+
+
+def lines_by_stream(ticks: Sequence[Tick]) -> dict[str, list[bytes]]:
+    """Each stream's canonical lines in emission order, over all seven streams."""
+    hasher = StreamHasher(keep_lines=True)
+    for tick in ticks:
+        hasher.add_tick(tick)
+    return {name: hasher.lines(name) for name in STREAMS}
+
+
+def signature(ticks: Sequence[Tick]) -> Signature:
+    """`(seq, ts, canonical lines)` per tick: what two runs must agree on."""
+    return [(tick.seq, tick.ts_us, [canon.line(tick.seq, op) for op in tick.ops]) for tick in ticks]
+
+
+def run_chunked(config: ModelConfig, untils: Sequence[int]) -> list[Tick]:
+    """A fake pacer: `run_until` over each of `untils` in order, then to the range end."""
+    engine = Engine.new(config)
+    sink = MemoryCdcSink()
+    ticks: list[Tick] = []
+    for until in untils:
+        ticks.extend(commit_all(sink, engine.run_until(until)))
+    ticks.extend(commit_all(sink, engine.run_until(config.end_us)))
+    return ticks
+
+
+def run_resumed(
+    config: ModelConfig, kill_at: int, until: int | None = None
+) -> tuple[list[Tick], dict[str, object]]:
+    """Run to `kill_at`, serialize to JSON text, resume from that text, and continue to `until`.
+
+    Returns the ticks of both halves and the resumed engine's final serialized state.
+    """
+    sink = MemoryCdcSink()
+    first = Engine.new(config)
+    ticks = commit_all(sink, first.run_until(kill_at))
+    text = json.dumps(first.state.to_json())
+    second = Engine.resume(config, json.loads(text))
+    ticks.extend(commit_all(sink, second.run_until(config.end_us if until is None else until)))
+    return ticks, second.state.to_json()
+
+
+def run_with_state(
+    config: ModelConfig, until: int | None = None
+) -> tuple[list[Tick], dict[str, object]]:
+    """An uninterrupted run and its final serialized state."""
+    engine = Engine.new(config)
+    ticks = commit_all(MemoryCdcSink(), engine.run_until(config.end_us if until is None else until))
+    return ticks, engine.state.to_json()
