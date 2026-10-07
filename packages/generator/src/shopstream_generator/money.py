@@ -6,8 +6,9 @@ and every rounding goes through `MONEY`, a local context with ROUND_HALF_UP and 
 digits. Nothing in this package reads or sets the global decimal context, so another module,
 a test or a dependency changing it can't change an amount.
 
-`half_up_div` is the integer form of the same rounding, for a later conversion that must stay
-in integers: it divides two non-negative ints and rounds a half up.
+`half_up_div` is the integer form of the same rounding, for a conversion that must stay in
+integers: it divides two non-negative ints and rounds a half up. `convert_cents` is the one
+fixed-factor currency conversion, through the local context.
 """
 
 from __future__ import annotations
@@ -32,5 +33,14 @@ def half_up_div(numerator: int, denominator: int) -> int:
 
 
 def convert_cents(cents: int, factor: Decimal) -> int:
-    """Stub until the GREEN commit: `cents` times `factor`, rounded half up to a whole cent."""
-    raise NotImplementedError("convert_cents")
+    """`cents` times `factor`, rounded half up to a whole cent: a fixed-factor conversion (D-11).
+
+    It goes through `MONEY` only, so it is the same on every machine. The quantized value has
+    exponent -2 by construction, so scaling it by 100 is an exact integer.
+    """
+    if cents < 0:
+        raise ValueError("convert_cents needs cents >= 0")
+    if not factor.is_finite() or factor <= 0:
+        raise ValueError("convert_cents needs a finite factor above 0")
+    quantized = MONEY.quantize(MONEY.multiply(cents_to_decimal(cents), factor), CENT)
+    return int(MONEY.scaleb(quantized, 2))

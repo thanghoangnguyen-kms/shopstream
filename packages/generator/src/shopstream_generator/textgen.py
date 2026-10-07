@@ -24,6 +24,9 @@ WORD_LISTS = (
     "product_adjectives",
     "product_nouns",
     "categories",
+    "review_openers",
+    "review_details",
+    "review_closers",
 )
 
 

@@ -20,7 +20,8 @@ A sorted list is a valid heap and `(due, seq)` is unique, so the pop order of a 
 the same as the original's. The world is serialized by one generic rule, so a field a later plan
 adds to `World` or to a record is covered without touching this module: each `World` field is a
 dict of id to a record dataclass whose first field is its id, and a record is the list of its
-field values in declaration order. A value is an int, or None where the field allows it.
+field values in declaration order. A value is an int, or None where the field allows it, or a
+tuple of ints (a JSON list of ints, read back as a tuple).
 
 `from_json` never trusts its input: anything off raises `StateError` naming the section, and the
 message never carries a value. The state of a different model (another seed, volume or rate) is
@@ -33,7 +34,7 @@ import dataclasses
 import heapq
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, get_args, get_type_hints
+from typing import Any, get_args, get_origin, get_type_hints
 
 from .config import ModelConfig
 from .rng import Stream, StreamName
@@ -42,6 +43,9 @@ HeapItem = tuple[int, int, int, int, int]
 
 CUSTOMER = "customer"
 PRODUCT = "product"
+ORDER = "order"
+PAYMENT = "payment"
+_ID_COUNTERS = frozenset({CUSTOMER, PRODUCT, ORDER, PAYMENT})
 
 FORMAT = 1
 _HEAP_FIELDS = 5
@@ -85,11 +89,50 @@ class ProductRec:
 
 
 @dataclass
+class OrderRec:
+    """An open order lifecycle as ints, None and tuples of ints (C9, D-15).
+
+    The record is made at placement and holds every number drawn there, so nothing is drawn
+    later. `pending` counts the heap items that still name the order; at 0 the record is dropped.
+    The line tuples hold one entry per placed line, in line order: `line_deleted` is 1 for a
+    deleted line, whose `line_number` (its index plus one) is never reused. `capture_cents` is
+    None until the order is paid; `review_id` and `review_created_us` until its review lands.
+    """
+
+    order_id: int
+    customer_id: int
+    currency_idx: int
+    ordered_us: int
+    discount_pct: int
+    status: int
+    discount_cents: int
+    capture_cents: int | None
+    method_idx: int
+    line_products: tuple[int, ...]
+    line_quantities: tuple[int, ...]
+    line_unit_cents: tuple[int, ...]
+    line_deleted: tuple[int, ...]
+    refund_flag: int
+    refund_percent: int
+    review_flag: int
+    review_line: int
+    rating: int
+    opener_idx: int
+    detail_idx: int
+    closer_idx: int
+    moderation_flag: int
+    review_id: int | None
+    review_created_us: int | None
+    pending: int
+
+
+@dataclass
 class World:
     """The live business: ids and integers only."""
 
     customers: dict[int, CustomerRec] = field(default_factory=dict)
     products: dict[int, ProductRec] = field(default_factory=dict)
+    orders: dict[int, OrderRec] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,7 +155,7 @@ class EngineState:
             last_ts_us=config.start_us - 1,
             tick_seq=0,
             heap_seq=0,
-            next_ids={CUSTOMER: 1, PRODUCT: 1},
+            next_ids={name: 1 for name in sorted(_ID_COUNTERS)},
             streams={name: Stream(config.seed, name) for name in StreamName},
             cdc=[],
             events=[],
@@ -153,8 +196,10 @@ class EngineState:
         if meta["model_sha256"] != config.model_sha256():
             raise StateError("meta.model_sha256: the state belongs to a different model")
         ids = _section_any(meta["next_ids"], "meta.next_ids")
-        if set(ids) != {CUSTOMER, PRODUCT}:
-            raise StateError(f"meta.next_ids: expected exactly the keys {CUSTOMER}, {PRODUCT}")
+        if set(ids) != _ID_COUNTERS:
+            raise StateError(
+                f"meta.next_ids: expected exactly the keys {', '.join(sorted(_ID_COUNTERS))}"
+            )
         next_ids = {name: _int(value, f"meta.next_ids.{name}") for name, value in ids.items()}
         rng = _section(top["rng"], "rng", {name.value for name in StreamName})
         streams: dict[StreamName, Stream] = {}
@@ -219,15 +264,22 @@ def _record_types() -> dict[str, Any]:
     return {f.name: get_args(hints[f.name])[1] for f in dataclasses.fields(World)}
 
 
-def _records_to_json(records: Mapping[int, Any]) -> list[list[int | None]]:
-    """Records sorted by id (their first field), each as its field values in order."""
-    rows: list[list[int | None]] = []
+def _records_to_json(records: Mapping[int, Any]) -> list[list[Any]]:
+    """Records sorted by id (their first field), each as its field values in order.
+
+    A tuple becomes a list, so the form is the same before and after a trip through JSON text.
+    """
+    rows: list[list[Any]] = []
     for record in records.values():
-        rows.append([getattr(record, f.name) for f in dataclasses.fields(record)])
+        rows.append([_cell(getattr(record, f.name)) for f in dataclasses.fields(record)])
     return sorted(rows, key=_row_id)
 
 
-def _row_id(row: list[int | None]) -> int:
+def _cell(value: object) -> object:
+    return list(value) if isinstance(value, tuple) else value
+
+
+def _row_id(row: list[Any]) -> int:
     first = row[0]
     return first if first is not None else 0
 
@@ -240,6 +292,7 @@ def _world_from_json(value: object) -> World:
         hints = get_type_hints(record_type)
         fields = dataclasses.fields(record_type)
         nullable = {f.name: type(None) in get_args(hints[f.name]) for f in fields}
+        sequence = {f.name: get_origin(hints[f.name]) is tuple for f in fields}
         rows = section[name]
         if not isinstance(rows, list):
             raise StateError(f"world.{name}: expected a list")
@@ -248,12 +301,17 @@ def _world_from_json(value: object) -> World:
             path = f"world.{name}[{index}]"
             if not isinstance(row, list) or len(row) != len(fields):
                 raise StateError(f"{path}: expected {len(fields)} values")
+            values: list[object] = []
             for f, cell in zip(fields, row, strict=True):
-                if cell is None and nullable[f.name]:
+                if sequence[f.name]:
+                    if not isinstance(cell, list) or any(type(item) is not int for item in cell):
+                        raise StateError(f"{path}.{f.name}: expected a list of integers")
+                    values.append(tuple(cell))
                     continue
-                if type(cell) is not int:
+                if (cell is not None or not nullable[f.name]) and type(cell) is not int:
                     raise StateError(f"{path}.{f.name}: expected an integer")
-            record = record_type(*row)
+                values.append(cell)
+            record = record_type(*values)
             record_id = row[0]
             if record_id in table:
                 raise StateError(f"{path}: a record id is listed twice")
