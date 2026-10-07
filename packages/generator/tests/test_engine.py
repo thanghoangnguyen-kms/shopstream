@@ -11,6 +11,7 @@ from shopstream_generator.config import ModelConfig
 from shopstream_generator.engine import Engine, ItemKind
 from shopstream_generator.ops import Tick
 from shopstream_generator.rng import Stream, StreamName
+from shopstream_generator.world import customers
 
 from .strategies import CANARY
 
@@ -109,20 +110,32 @@ def test_heap_items_are_tuples_of_ints_with_a_unique_increasing_seq() -> None:
     assert sorted(seqs) == list(range(1, len(seqs) + 1))
 
 
-def test_a_zero_rate_schedules_no_arrival_and_draws_nothing() -> None:
+def test_a_zero_rate_schedules_no_arrival_and_draws_only_the_attributes() -> None:
     engine = Engine.new(config(initial=3, per_day=0))
     assert len(engine.state.cdc) == 3
     assert list(engine.run_until(END))
-    assert all(stream.words == 0 for stream in engine.state.streams.values())
+    # Nothing beyond the three customers' attribute draws: a zero rate draws no gap.
+    replica = {name: Stream(3, name) for name in StreamName}
+    for _ in range(3):
+        customers.draw_new_customer(replica)
+    assert {n: s.words for n, s in engine.state.streams.items()} == {
+        n: s.words for n, s in replica.items()
+    }
     assert engine.state.cdc == []
 
 
 def test_an_arrival_reschedules_from_its_due_time_not_its_tick() -> None:
     # One sign-up a day: the natural first arrival is a day or more away, far from the pair below.
     engine = Engine.new(config(per_day=1))
-    replica = Stream(3, StreamName.CUSTOMERS)
+    replica = {name: Stream(3, name) for name in StreamName}
     mean_gap = clock.US_PER_DAY
-    natural, second, third = (replica.between(1, 2 * mean_gap) for _ in range(3))
+    natural = replica[StreamName.CUSTOMERS].between(1, 2 * mean_gap)
+    # Each handled arrival draws its next gap first, then the new customer's attributes.
+    gaps: list[int] = []
+    for _ in range(2):
+        gaps.append(replica[StreamName.CUSTOMERS].between(1, 2 * mean_gap))
+        customers.draw_new_customer(replica)
+    second, third = gaps
     # Two arrivals due at the same microsecond: the second ticks 1 us later but reschedules from due.
     engine.push(START + 100, ItemKind.CUSTOMER_ARRIVAL)
     engine.push(START + 100, ItemKind.CUSTOMER_ARRIVAL)

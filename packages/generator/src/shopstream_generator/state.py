@@ -52,9 +52,22 @@ class StateError(ValueError):
 
 @dataclass
 class CustomerRec:
+    """A customer as ints and None: text is rebuilt from the word lists at the row boundary.
+
+    The email has its own indices and version, so a later name edit does not change it
+    (Type 1 columns change independently).
+    """
+
     customer_id: int
     created_us: int
     deleted_us: int | None
+    first_idx: int
+    last_idx: int
+    email_first_idx: int
+    email_last_idx: int
+    email_version: int
+    country_idx: int
+    city_idx: int
 
 
 @dataclass

@@ -119,6 +119,9 @@ def test_the_first_customer_follows_the_draw_table() -> None:
     config = golden()
     customers = Stream(config.seed, StreamName.CUSTOMERS)
     text = Stream(config.seed, StreamName.TEXT)
+    # `Engine.new` draws the first sign-up's gap before any tick runs.
+    mean_gap = clock.US_PER_DAY // config.volumes.customers_per_day
+    customers.between(1, 2 * mean_gap)
     table = countries.countries()
     country = table[customers.choice_index(countries.country_weights())]
     city_pick = customers.pick(len(country.cities))

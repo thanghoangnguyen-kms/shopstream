@@ -24,7 +24,8 @@ from . import clock
 from .config import ModelConfig
 from .ops import Op, OpKind, Table, Tick
 from .rng import StreamName
-from .state import CUSTOMER, CustomerRec, EngineState
+from .state import CUSTOMER, EngineState
+from .world import customers
 
 
 class ItemKind(IntEnum):
@@ -39,13 +40,25 @@ class Engine:
     def __init__(self, config: ModelConfig, state: EngineState) -> None:
         self.config = config
         self.state = state
+        # Derived, never serialized: ascending ids of the live customers, rebuilt from the
+        # records here and kept up to date on insert (and, from a later plan, soft delete).
+        self.live_customers: list[int] = sorted(
+            record.customer_id
+            for record in state.world.customers.values()
+            if record.deleted_us is None
+        )
 
     @classmethod
     def new(cls, config: ModelConfig) -> Engine:
-        """A fresh engine with its initial customers and the first sign-up scheduled (D-14)."""
+        """A fresh engine with its initial customers and the first sign-up scheduled (D-14).
+
+        The catalogue comes first: the initial customers follow the initial products, one
+        microsecond apart, and the first tick of the range is at or after its start.
+        """
         engine = cls(config, EngineState.new(config))
+        first_customer_us = config.start_us + config.volumes.initial_products
         for index in range(config.volumes.initial_customers):
-            engine.push(config.start_us + index, ItemKind.INITIAL_CUSTOMER)
+            engine.push(first_customer_us + index, ItemKind.INITIAL_CUSTOMER)
         if config.volumes.customers_per_day > 0:
             engine.push(config.start_us + engine._customer_gap(), ItemKind.CUSTOMER_ARRIVAL)
         return engine
@@ -91,19 +104,16 @@ class Engine:
 
     def _insert_customer(self, ts_us: int) -> Tick:
         state = self.state
+        draws = customers.draw_new_customer(state.streams)
         customer_id = state.next_ids[CUSTOMER]
         state.next_ids[CUSTOMER] = customer_id + 1
-        state.world.customers[customer_id] = CustomerRec(customer_id, ts_us, None)
-        moment = clock.to_datetime(ts_us)
+        record = customers.new_record(customer_id, ts_us, draws)
+        state.world.customers[customer_id] = record
+        self.live_customers.append(customer_id)
         op = Op(
             Table.CUSTOMERS,
             OpKind.INSERT,
             {"customer_id": customer_id},
-            {
-                "customer_id": customer_id,
-                "created_at": moment,
-                "updated_at": moment,
-                "deleted_at": None,
-            },
+            customers.row(record, ts_us),
         )
         return Tick(state.tick_seq + 1, ts_us, (op,))
