@@ -18,6 +18,8 @@ possible later.
 from __future__ import annotations
 
 import random
+import uuid
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 
 
@@ -73,3 +75,23 @@ class Stream:
         if b < a:
             raise ValueError("between(a, b) needs a <= b")
         return a + self.below(b - a + 1)
+
+    # RED stubs: the next commit replaces these with the real primitives.
+    def pick(self, n: int) -> int | None:
+        raise NotImplementedError
+
+    def choice_index(self, weights: Sequence[int]) -> int:
+        raise NotImplementedError
+
+    def bernoulli_ppm(self, ppm: int) -> bool:
+        raise NotImplementedError
+
+    def uuid4(self) -> uuid.UUID:
+        raise NotImplementedError
+
+    def dump(self) -> dict[str, object]:
+        raise NotImplementedError
+
+    @classmethod
+    def load(cls, seed: int, name: StreamName, data: Mapping[str, object]) -> Stream:
+        raise NotImplementedError
