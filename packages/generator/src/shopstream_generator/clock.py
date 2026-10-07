@@ -41,7 +41,10 @@ def parse(text: str) -> int:
     """The inverse of `render`; any other spelling of a time raises ValueError."""
     if _RENDERED.fullmatch(text) is None:
         raise ValueError("time must be YYYY-MM-DDTHH:MM:SS.ffffffZ")
-    moment = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    try:
+        moment = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    except ValueError:
+        raise ValueError("time must be a real YYYY-MM-DDTHH:MM:SS.ffffffZ instant") from None
     return (moment - EPOCH) // _MICROSECOND
 
 
