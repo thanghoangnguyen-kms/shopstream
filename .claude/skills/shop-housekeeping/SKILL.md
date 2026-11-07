@@ -37,7 +37,7 @@ Emit this before any scan:
 SCOPE:  <resolved path(s)>
 DOCS:   <count> .md files
 DIMS:   lint · vocab · status · ssot · freshness
-AGENTS: <N scan> + 1 triage + <M fix> + 1 gate
+AGENTS: <N scan> + <M fix>
 ```
 
 **Agent strategy:** parallel Agent calls, one scan agent per domain folder that exists, or a single agent for 15 docs or fewer. Don't use the Workflow tool unless the user explicitly asks for a workflow.
@@ -58,7 +58,7 @@ No fixes in Phase 1.
 
 ## Phase 2 — Triage
 
-One agent merges every Phase 1 result and emits one line per finding:
+Merge the Phase 1 results yourself (no agent: it's a deterministic merge) and emit one line per finding:
 
 ```
 BLOCK  docs/specs/platform/ref-architecture.md:42  — banned term "MinIO"
@@ -72,7 +72,7 @@ NOTE   docs/adr/adr-001-feasibility-spike.md           — updated: older than t
 
 ## Phase 3 — Fix
 
-Spawn fix agents in parallel, one per severity bucket:
+Group the findings by file, so that no two agents edit the same file. Run the fixes yourself for a small set, or spawn one fix agent per group of files. Each finding type uses:
 
 | Agent       | Handles                                                    | Source                                                                  |
 | ----------- | ---------------------------------------------------------- | ----------------------------------------------------------------------- |
@@ -109,7 +109,7 @@ For each changed doc:
 
 SCOPE:  docs/specs/platform/
 DOCS:   1 file
-AGENTS: 1 scan + 1 triage + 1 fix (block) + 1 gate
+AGENTS: 1 scan + 1 fix
 
 Phase 1 scan…   ✓  (1 BLOCK, 0 WARN, 0 NOTE)
 Phase 2 triage… ✓

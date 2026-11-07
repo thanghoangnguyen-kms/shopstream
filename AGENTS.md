@@ -5,7 +5,7 @@ Shopstream is a public, 23-week data engineering capstone: an open lakehouse on 
 ## 1. Gates
 
 - Run `just check` before proposing a change. It runs the same hooks, tests and secret scan as CI.
-- Never bypass hooks (`--no-verify`, `SKIP=`). The one exception is the documented Week 1 planted-secret proof.
+- Never bypass hooks (`--no-verify`, `SKIP=`). `tests/test_secret_gate.py` proves the secret gate without a bypass.
 - Never hand-edit generated files: `uv.lock` (use `uv add` / `uv lock`), anything under `.tools/`, dbt `target/`.
 - Commit messages and PR titles follow Conventional Commits. PRs are squash-merged.
 - A new dependency, service or tool needs an ADR first: `just adr-new "<title>" [owner]`.

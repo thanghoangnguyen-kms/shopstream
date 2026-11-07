@@ -11,7 +11,7 @@
 
 ## How to run it
 
-Run the three critics as **independent subagents**, dispatched in parallel with one Agent call each. Give each critic only:
+Run the three critics as **independent subagents**, dispatched in parallel with one Agent call each, each with `model: "opus"` so the gate doesn't depend on the session's default subagent model. Give each critic only:
 
 1. the path of the document under review
 2. this file, and the name of its critic section

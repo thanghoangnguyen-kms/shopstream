@@ -1,6 +1,6 @@
 # Contract Writing and Compression
 
-Read this reference when structuring normative content, normalizing contracts, removing review residue, or reducing a long design document. Read `references/style-and-tone.md` for sentence style, professional tone, and copyediting.
+Read this reference when structuring normative content, normalizing contracts, removing review residue, or reducing a long design document. Read `style-and-tone.md` for sentence style, professional tone, and copyediting.
 
 ## Contents
 
