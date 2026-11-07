@@ -1,0 +1,50 @@
+country,currency,weight,cities
+AT,EUR,5,Vienna|Graz|Salzburg
+AU,AUD,4,Sydney|Melbourne|Brisbane
+BE,EUR,6,Brussels|Antwerp|Ghent
+BR,BRL,3,Sao Paulo|Rio de Janeiro|Brasilia
+CA,CAD,5,Toronto|Vancouver|Montreal
+CH,CHF,5,Zurich|Geneva|Basel
+CN,CNY,3,Shanghai|Beijing|Shenzhen
+CY,EUR,1,Nicosia|Limassol
+CZ,CZK,2,Prague|Brno|Ostrava
+DE,EUR,30,Berlin|Munich|Hamburg
+DK,DKK,2,Copenhagen|Aarhus|Odense
+EE,EUR,1,Tallinn|Tartu
+ES,EUR,15,Madrid|Barcelona|Valencia
+FI,EUR,3,Helsinki|Espoo|Tampere
+FR,EUR,25,Paris|Lyon|Marseille
+GB,GBP,15,London|Manchester|Edinburgh
+GR,EUR,3,Athens|Thessaloniki|Patras
+HK,HKD,2,Hong Kong|Kowloon
+HR,EUR,2,Zagreb|Split|Rijeka
+HU,HUF,1,Budapest|Debrecen|Szeged
+ID,IDR,1,Jakarta|Surabaya|Bandung
+IE,EUR,4,Dublin|Cork|Galway
+IL,ILS,1,Tel Aviv|Haifa|Jerusalem
+IN,INR,3,Mumbai|Delhi|Bengaluru
+IS,ISK,1,Reykjavik|Akureyri
+IT,EUR,18,Rome|Milan|Naples
+JP,JPY,8,Tokyo|Osaka|Kyoto
+KR,KRW,3,Seoul|Busan|Incheon
+LT,EUR,2,Vilnius|Kaunas
+LU,EUR,2,Luxembourg|Esch-sur-Alzette
+LV,EUR,1,Riga|Daugavpils
+MT,EUR,1,Valletta|Sliema
+MX,MXN,2,Mexico City|Guadalajara|Monterrey
+MY,MYR,1,Kuala Lumpur|Penang|Johor Bahru
+NL,EUR,10,Amsterdam|Rotterdam|Utrecht
+NO,NOK,2,Oslo|Bergen|Trondheim
+NZ,NZD,1,Auckland|Wellington|Christchurch
+PH,PHP,1,Manila|Cebu|Davao
+PL,PLN,3,Warsaw|Krakow|Gdansk
+PT,EUR,4,Lisbon|Porto|Braga
+RO,RON,1,Bucharest|Cluj-Napoca|Timisoara
+SE,SEK,3,Stockholm|Gothenburg|Malmo
+SG,SGD,2,Singapore|Jurong East
+SI,EUR,2,Ljubljana|Maribor
+SK,EUR,2,Bratislava|Kosice
+TH,THB,1,Bangkok|Chiang Mai|Phuket
+TR,TRY,1,Istanbul|Ankara|Izmir
+US,USD,30,New York|Los Angeles|Chicago
+ZA,ZAR,1,Johannesburg|Cape Town|Durban

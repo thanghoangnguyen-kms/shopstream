@@ -4,6 +4,8 @@ CI runs dbt as one added step in the existing required `test` job, on the offlin
 with no dbt login, no secret and no Compose stack. These tests go red if a fifth job, a
 `pull_request_target` trigger, a `secrets.` expression, a docker step, a tracked dbt_cloud.yml
 or catalogs.yml, or a dbt command off the ci target or without telemetry opted out appears.
+They also go red if the contract-lint step leaves the test job or the `check` recipe, or the
+`contract-lint` recipe stops syncing the contracts/ project or linting every contract.
 They read files only and use no network.
 """
 
@@ -21,7 +23,12 @@ REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / ".github" / "workflows"
 JUSTFILE = REPO / "justfile"
 REQUIRED_CHECKS = {"lint", "test", "secrets", "pr-title"}
-TEST_JOB_RUN_STEPS = ["uv sync --locked", "uv run just test", "uv run just dbt-ci"]
+TEST_JOB_RUN_STEPS = [
+    "uv sync --locked",
+    "uv run just test",
+    "uv run just dbt-ci",
+    "uv run just contract-lint",
+]
 
 
 def workflow_files() -> list[Path]:
@@ -98,7 +105,7 @@ def test_no_workflow_references_a_secret_or_a_dbt_cloud_variable() -> None:
         assert not any(str(key).upper().startswith("DBT_CLOUD") for key in step.get("env", {}))
 
 
-def test_the_test_job_runs_the_dbt_recipe_after_the_tests() -> None:
+def test_the_test_job_runs_the_dbt_and_contract_recipes_after_the_tests() -> None:
     steps = load(WORKFLOWS / "ci.yml")["jobs"]["test"]["steps"]
     assert [step["run"] for step in steps if "run" in step] == TEST_JOB_RUN_STEPS
 
@@ -114,6 +121,20 @@ def test_check_lists_the_dbt_recipe_after_test() -> None:
     check = next(line for line in justfile_lines() if line.startswith("check:"))
     dependencies = check.removeprefix("check:").split()
     assert dependencies.index("dbt-ci") == dependencies.index("test") + 1
+
+
+def test_check_lists_the_contract_recipe_after_the_dbt_recipe() -> None:
+    check = next(line for line in justfile_lines() if line.startswith("check:"))
+    dependencies = check.removeprefix("check:").split()
+    assert dependencies.index("contract-lint") == dependencies.index("dbt-ci") + 1
+
+
+def test_the_contract_recipe_lints_every_contract_from_the_contracts_project() -> None:
+    body = recipe_body("contract-lint")
+    assert body[0] == "uv sync --locked --project contracts"
+    loop = body[1]
+    assert "contracts/*/*.odcs.yaml" in loop
+    assert "uv run --frozen --project contracts datacontract lint" in loop
 
 
 def test_every_dbt_command_in_the_recipe_is_offline_and_opted_out_of_telemetry() -> None:
