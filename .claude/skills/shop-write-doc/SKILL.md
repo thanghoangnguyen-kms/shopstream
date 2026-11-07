@@ -1,6 +1,6 @@
 ---
 name: shop-write-doc
-description: Analyzes, plans, writes, rewrites, reviews, and validates Shopstream design documents (PRDs, TRDs, ADRs, REFs, GUIDEs, GLOSSARY) under docs/specs/ and docs/adr/. Use for evidence-first document creation, focused review, style and tone cleanup, AI-like prose removal, contract and naming consistency, structural compression, Mermaid diagrams, status or version changes, and repository-grounded design updates. Do not use for general prose outside Shopstream design documentation or for implementation work that only happens to mention a document.
+description: Rewrites, reviews, updates and validates existing Shopstream design documents (PRDs, TRDs, ADRs, REFs, GUIDEs, GLOSSARY) under docs/specs/ and docs/adr/. Use for evidence-first rewrites, focused review, style and tone cleanup, AI-like prose removal, contract and naming consistency, structural compression, Mermaid diagrams, status or version changes, and repository-grounded design updates. Do not use for general prose outside Shopstream design documentation or for implementation work that only happens to mention a document. A new document starts with /shop-spec.
 ---
 
 # Shopstream Design Document Writer
@@ -14,13 +14,13 @@ Invoke this skill when:
 - Rewriting or substantially revising an existing doc in `docs/specs/` or `docs/adr/`; for a new doc, prefer `/shop-spec`
 - Doing a focused review: style cleanup, AI-prose removal, naming normalisation, compression
 - Updating doc status, version, or relationship keys after an implementation change
-- User says "write a spec", "update this doc", "review this PRD", "clean up this TRD", "add diagrams", "fix the doc"
+- User says "update this doc", "review this PRD", "clean up this TRD", "add diagrams", "fix the doc"
 
 **Example invocations:**
 
 ```
 /shop-write-doc
-Write a TRD for the CDC-to-bronze pipeline
+Update docs/specs/platform/ref-architecture.md after the CDC pipeline change
 
 /shop-write-doc
 Review and clean up docs/specs/platform/ref-architecture.md — remove AI prose, compress

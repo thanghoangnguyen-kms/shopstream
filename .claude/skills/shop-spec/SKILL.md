@@ -56,7 +56,7 @@ Use the templates in [references/templates.md](references/templates.md):
 
 ### Phase 3: writing_plan
 
-Present the required sections for the chosen type (from `docs/CONTRIBUTING.md`). Ask for content inputs per section before writing.
+Take the required sections for the chosen type from `docs/CONTRIBUTING.md`, and fill each one from the input brief, the repository and accepted docs. Ask the owner only for a choice the evidence can't settle and that changes scope, ownership or acceptance, one question at a time, with a recommendation.
 
 ### Phase 4: writing
 

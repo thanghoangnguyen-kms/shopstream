@@ -14,7 +14,7 @@ Canonical documentation lives in `docs/`. Operational READMEs and agent instruct
 | `adr/`        | Architecture Decision Records, `adr-NNN-<topic>.md`; numbers unique repository-wide                    |
 | `claude/`     | Agent-facing pages linked from `AGENTS.md`                                                             |
 | `tooling/`    | `frontmatter-schema.yaml` (the field schema the lint reads) and `adr-template.md`                      |
-| `evidence/`   | Prove-step evidence (hook output, CI run links, measured results). Kept permanently. Created in W1 PR #4 |
+| `evidence/`   | Prove-step evidence (hook output, CI run links, measured results). Kept permanently                     |
 | `benchmarks/` | Kafka (W7) and Spark (W14) benchmark reports. Kept permanently                                         |
 | `eval/`       | Text-to-SQL evaluation reports (W22). Kept permanently                                                 |
 
